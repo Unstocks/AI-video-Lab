@@ -19,6 +19,29 @@ Per AGENT_GUIDE.md → "Present Both Composition Runtimes (HARD RULE)": do NOT s
 
 ## Process
 
+### Source Acquisition Protocol (Remote Video URL vs Local Media)
+
+When the user provides a video URL (YouTube, Vimeo) rather than a local file path:
+
+1. **Acquire Source Media via URL Intake Adapter**:
+   Invoke `lib/url_ingest.py` to acquire and normalize the media into `projects/<project-id>/source/`:
+   ```python
+   from lib.url_ingest import URLIntakeAdapter
+   adapter = URLIntakeAdapter()
+   result = adapter.ingest_url(url, project_id, max_duration_seconds=3600)
+   ```
+   This performs protocol validation, SSRF checks, disk headroom verification, media acquisition via `video_downloader`, container normalization to `source_video.mp4`, audio verification with FFmpeg fallback to `source_audio.wav`, native caption extraction to `transcript.json`, and writes `source_manifest.json`.
+
+2. **Run Source Media Review**:
+   Immediately hand off the materialized `source_video.mp4` to `lib.source_media_review`:
+   ```python
+   review_artifact = adapter.review_ingested_media(result)
+   ```
+   Verify duration, resolution, audio track, and usability before proceeding with clip planning.
+
+3. **When Local Media is Provided**:
+   Place local footage in `projects/<project-id>/source/` and run `review_source_media([path], {"project_dir": project_dir})` directly.
+
 ### 1. Understand The Source And The Goal
 
 Capture the source shape:

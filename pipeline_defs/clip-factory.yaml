@@ -50,7 +50,9 @@ stages:
     produces:
       - brief
       - decision_log
-    tools_available: []
+    tools_available:
+      - video_downloader
+      - transcript_fetcher
     checkpoint_required: true
     human_approval_default: true
     review_focus:
