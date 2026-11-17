@@ -10,7 +10,7 @@ You are planning how each selected clip will be framed and packaged for its dest
 |-------|----------|---------|
 | Schema | `schemas/artifacts/scene_plan.schema.json` | Artifact validation |
 | Prior artifacts | `state.artifacts["script"]["script"]`, `state.artifacts["idea"]["brief"]` | Selected clips and platform goals |
-| Tools | `frame_sampler`, `scene_detect` | Visual checks and boundary inspection |
+| Tools | `frame_sampler`, `scene_detect`, `auto_reframe` | Visual checks, shot boundaries, and vertical framing |
 | Playbook | Active style playbook | Layout language and safe zones |
 
 ## Process
@@ -25,7 +25,13 @@ Use:
 - `1:1` when speaker plus context both matter,
 - `16:9` when slides, demos, or multi-speaker width are essential.
 
-OpenMontage does not yet have first-class auto-reframe. If a vertical crop is weak, plan a safer aspect ratio instead of pretending the crop will work.
+OpenMontage provides `auto_reframe` for vertical production. Choose its layout honestly:
+
+- `single_crop` for a clear speaker-centered crop,
+- `blurred_pillarbox` for slides, demos, or wide shots where preserving the full frame matters,
+- `stacked_split` for two speakers positioned across a wide frame.
+
+Pass `shot_cuts` when scene boundaries are known so crop smoothing resets at edits. Pass pluggable `speaker_tracks` when an upstream diarization/active-speaker source provides them; do not infer active speaker identity from face size alone. If a crop weakens important context, use a layout that preserves it or plan a safer aspect ratio.
 
 ### 2. Plan First-Second Composition
 

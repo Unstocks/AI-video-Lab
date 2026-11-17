@@ -1,17 +1,14 @@
-"""Subtitle generation tool.
-
-Converts word-level timestamps from the transcriber into SRT, VTT,
-or caption JSON formats. Pure Python — no external dependencies beyond
-the standard library.
-"""
+"""Offline transcript-to-subtitle tool for SRT, VTT, JSON, and ASS outputs."""
 
 from __future__ import annotations
 
 import json
+import math
 from html import escape
 import time
+import copy
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from tools.base_tool import (
     BaseTool,
@@ -24,9 +21,99 @@ from tools.base_tool import (
 )
 
 
+def rebase_segments_to_clip(
+    segments: Sequence[dict[str, Any]], clip_start_seconds: float,
+    clip_end_seconds: float | None = None,
+) -> list[dict[str, Any]]:
+    """Return transcript segments clipped and rebased onto a clip's zero PTS."""
+    def finite(value: Any, field: str, *, minimum: float | None = None) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{field} must be a finite number")
+        if minimum is not None and value < minimum:
+            raise ValueError(f"{field} must be >= {minimum}")
+        return float(value)
+
+    clip_start = finite(clip_start_seconds, "clip_start_seconds", minimum=0)
+    clip_end = None
+    if clip_end_seconds is not None:
+        clip_end = finite(clip_end_seconds, "clip_end_seconds", minimum=0)
+        if clip_end <= clip_start:
+            raise ValueError("clip_end_seconds must be greater than clip_start_seconds")
+    clip_duration = clip_end - clip_start if clip_end is not None else None
+    if not isinstance(segments, Sequence) or isinstance(segments, (str, bytes)):
+        raise TypeError("segments must be a sequence of objects")
+
+    result: list[dict[str, Any]] = []
+    for index, original in enumerate(segments):
+        if not isinstance(original, dict):
+            raise ValueError(f"segments[{index}] must be an object")
+        segment = copy.deepcopy(original)
+        words = segment.get("words") or []
+        if words:
+            word_intervals = []
+            for word_index, word in enumerate(words):
+                if not isinstance(word, dict):
+                    raise ValueError(f"segments[{index}].words[{word_index}] must be an object")
+                start = finite(word.get("start"), "word.start", minimum=0)
+                end = finite(word.get("end"), "word.end", minimum=0)
+                if end <= start:
+                    raise ValueError("word.end must be greater than word.start")
+                word_intervals.append((start, end, word))
+            seg_start = min(row[0] for row in word_intervals)
+            seg_end = max(row[1] for row in word_intervals)
+        else:
+            seg_start = finite(segment.get("start"), "segment.start", minimum=0)
+            if "end" in segment:
+                seg_end = finite(segment["end"], "segment.end", minimum=0)
+            elif "duration" in segment:
+                duration = finite(segment["duration"], "segment.duration", minimum=0)
+                seg_end = seg_start + duration
+            else:
+                raise ValueError(f"segments[{index}] requires end or duration")
+            if seg_end <= seg_start:
+                continue
+            word_intervals = []
+
+        if seg_end <= clip_start or (clip_end is not None and seg_start >= clip_end):
+            continue
+        if word_intervals:
+            rebased_words = []
+            for start, end, word in word_intervals:
+                if end <= clip_start or (clip_end is not None and start >= clip_end):
+                    continue
+                new_start = max(0.0, start - clip_start)
+                new_end = end - clip_start
+                if clip_duration is not None:
+                    new_end = min(clip_duration, new_end)
+                if new_end <= new_start:
+                    continue
+                word["start"], word["end"] = new_start, new_end
+                rebased_words.append(word)
+            if not rebased_words:
+                continue
+            segment["words"] = rebased_words
+            segment["start"] = min(word["start"] for word in rebased_words)
+            segment["end"] = max(word["end"] for word in rebased_words)
+            segment["text"] = " ".join(
+                str(word.get("word", word.get("text", ""))).strip()
+                for word in rebased_words if str(word.get("word", word.get("text", ""))).strip()
+            )
+        else:
+            new_start = max(0.0, seg_start - clip_start)
+            new_end = seg_end - clip_start
+            if clip_duration is not None:
+                new_end = min(clip_duration, new_end)
+            if new_end <= new_start:
+                continue
+            segment["start"], segment["end"] = new_start, new_end
+            segment.pop("duration", None)
+        result.append(segment)
+    return result
+
+
 class SubtitleGen(BaseTool):
     name = "subtitle_gen"
-    version = "0.1.0"
+    version = "0.2.0"
     tier = ToolTier.CORE
     capability = "subtitle"
     provider = "openmontage"
@@ -38,7 +125,7 @@ class SubtitleGen(BaseTool):
     install_instructions = "No external dependencies required."
     agent_skills = ["remotion-best-practices"]
 
-    capabilities = ["generate_srt", "generate_vtt", "generate_caption_json"]
+    capabilities = ["generate_srt", "generate_vtt", "generate_caption_json", "generate_ass"]
 
     input_schema = {
         "type": "object",
@@ -50,9 +137,18 @@ class SubtitleGen(BaseTool):
             },
             "format": {
                 "type": "string",
-                "enum": ["srt", "vtt", "json"],
+                "enum": ["srt", "vtt", "json", "ass"],
                 "default": "srt",
             },
+            "clip_start_seconds": {"type": "number", "minimum": 0},
+            "clip_end_seconds": {"type": "number", "exclusiveMinimum": 0},
+            "play_res_x": {"type": "integer", "default": 1080},
+            "play_res_y": {"type": "integer", "default": 1920},
+            "font_name": {"type": "string", "default": "Noto Sans Devanagari"},
+            "font_size": {"type": "integer", "default": 64},
+            "margin_v": {"type": "integer", "default": 320},
+            "margin_l": {"type": "integer", "default": 80},
+            "margin_r": {"type": "integer", "default": 120},
             "output_path": {"type": "string"},
             "max_chars_per_line": {"type": "integer", "default": 42},
             "max_words_per_cue": {"type": "integer", "default": 8},
@@ -74,7 +170,11 @@ class SubtitleGen(BaseTool):
     }
 
     resource_profile = ResourceProfile(cpu_cores=1, ram_mb=128, vram_mb=0, disk_mb=10)
-    idempotency_key_fields = ["segments", "format", "max_words_per_cue"]
+    idempotency_key_fields = [
+        "segments", "format", "max_words_per_cue", "max_chars_per_line", "highlight_style",
+        "clip_start_seconds", "clip_end_seconds", "play_res_x", "play_res_y", "font_name",
+        "font_size", "margin_v", "margin_l", "margin_r", "corrections",
+    ]
     side_effects = ["writes subtitle file to output_path"]
     user_visible_verification = [
         "Play video with generated subtitles and verify timing",
@@ -88,6 +188,7 @@ class SubtitleGen(BaseTool):
         highlight_style = inputs.get("highlight_style", "none")
         output_path = inputs.get("output_path")
         corrections = inputs.get("corrections")
+        warnings: list[str] = []
 
         start = time.time()
 
@@ -95,18 +196,38 @@ class SubtitleGen(BaseTool):
         if corrections:
             segments = self._apply_corrections(segments, corrections)
 
+        if ("clip_start_seconds" in inputs or "clip_end_seconds" in inputs
+                or any("duration" in segment for segment in segments)):
+            segments = rebase_segments_to_clip(
+                segments, inputs.get("clip_start_seconds", 0.0), inputs.get("clip_end_seconds"))
+
+        has_word_timings = any(bool(segment.get("words")) for segment in segments)
+        effective_highlight_style = highlight_style
+        if highlight_style in ("word_by_word", "karaoke") and not has_word_timings:
+            effective_highlight_style = "none"
+            warnings.append("highlight_style downgraded to 'none': word-level timestamps unavailable")
+
         # Build cues from word-level timestamps
         cues = self._build_cues(segments, max_words, max_chars)
 
         if fmt == "srt":
-            content = self._render_srt(cues, highlight_style)
+            content = self._render_srt(cues, effective_highlight_style)
             ext = ".srt"
         elif fmt == "vtt":
-            content = self._render_vtt(cues, highlight_style)
+            content = self._render_vtt(cues, effective_highlight_style)
             ext = ".vtt"
         elif fmt == "json":
-            content = json.dumps({"cues": cues, "highlight_style": highlight_style}, indent=2)
+            content = json.dumps({"cues": cues, "highlight_style": effective_highlight_style}, indent=2, ensure_ascii=False)
             ext = ".caption.json"
+        elif fmt == "ass":
+            content = self._render_ass(
+                cues, effective_highlight_style,
+                play_res_x=inputs.get("play_res_x", 1080), play_res_y=inputs.get("play_res_y", 1920),
+                font_name=inputs.get("font_name", "Noto Sans Devanagari"),
+                font_size=inputs.get("font_size", 64), margin_v=inputs.get("margin_v", 320),
+                margin_l=inputs.get("margin_l", 80), margin_r=inputs.get("margin_r", 120),
+            )
+            ext = ".ass"
         else:
             return ToolResult(success=False, error=f"Unknown format: {fmt}")
 
@@ -114,7 +235,7 @@ class SubtitleGen(BaseTool):
             output_path = f"subtitles{ext}"
         out = Path(output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(content, encoding="utf-8")
+        out.write_text(content, encoding="utf-8", newline="\n")
 
         elapsed = time.time() - start
 
@@ -124,6 +245,8 @@ class SubtitleGen(BaseTool):
                 "format": fmt,
                 "cue_count": len(cues),
                 "output": str(out),
+                "warnings": warnings,
+                "effective_highlight_style": effective_highlight_style,
             },
             artifacts=[str(out)],
             duration_seconds=round(elapsed, 2),
@@ -308,6 +431,75 @@ class SubtitleGen(BaseTool):
                 lines.append(escape(cue["text"], quote=False))
                 lines.append("")
         return "\n".join(lines)
+
+    @staticmethod
+    def _ts_ass(seconds: float) -> str:
+        """ASS timestamp format H:MM:SS.cc (centiseconds, rounded with carry)."""
+        total_cs = int(round(max(0.0, seconds) * 100))
+        hours, remaining = divmod(total_cs, 360_000)
+        minutes, remaining = divmod(remaining, 6_000)
+        whole_seconds, centiseconds = divmod(remaining, 100)
+        return f"{hours}:{minutes:02d}:{whole_seconds:02d}.{centiseconds:02d}"
+
+    @staticmethod
+    def _escape_ass_text(value: str) -> str:
+        return (str(value).replace("\\", "\\\\").replace("{", r"\{").replace("}", r"\}")
+                .replace("\r\n", "\n").replace("\r", "\n").replace("\n", r"\N"))
+
+    def _render_ass(
+        self, cues: list[dict], highlight_style: str = "none", *,
+        play_res_x: int = 1080, play_res_y: int = 1920,
+        font_name: str = "Noto Sans Devanagari", font_size: int = 64,
+        margin_v: int = 320, margin_l: int = 80, margin_r: int = 120,
+    ) -> str:
+        values = (play_res_x, play_res_y, font_size, margin_v, margin_l, margin_r)
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            raise ValueError("ASS resolution, font size, and margins must be integers")
+        if play_res_x <= 0 or play_res_y <= 0 or font_size <= 0 or min(margin_v, margin_l, margin_r) < 0:
+            raise ValueError("ASS resolution/font size must be positive and margins nonnegative")
+        if highlight_style not in ("none", "word_by_word", "karaoke"):
+            raise ValueError("unsupported ASS highlight_style")
+        safe_font = str(font_name).replace(",", " ").replace("\n", " ").replace("\r", " ")
+        lines = [
+            "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {play_res_x}",
+            f"PlayResY: {play_res_y}", "WrapStyle: 0", "ScaledBorderAndShadow: yes", "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+            "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding",
+            f"Style: Default,{safe_font},{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
+            f"-1,0,0,0,100,100,0,0,1,4,2,2,{margin_l},{margin_r},{margin_v},1",
+            "", "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        ]
+
+        def dialogue(start: float, end: float, text: str) -> str:
+            if end <= start:
+                return ""
+            return (f"Dialogue: 0,{self._ts_ass(start)},{self._ts_ass(end)},Default,,0,0,0,,{text}")
+
+        for cue in cues:
+            words = cue.get("words") or []
+            if highlight_style == "word_by_word" and words:
+                for word in words:
+                    text = self._escape_ass_text(word.get("word", ""))
+                    row = dialogue(word["start"], word["end"], text)
+                    if row:
+                        lines.append(row)
+                continue
+            if highlight_style == "karaoke" and words:
+                pieces = []
+                for word in words:
+                    word_text = self._escape_ass_text(word.get("word", ""))
+                    duration_cs = max(0, int(round((word["end"] - word["start"]) * 100)))
+                    pieces.append(f"{{\\kf{duration_cs}}}{word_text}")
+                text = " ".join(pieces)
+            else:
+                text = self._escape_ass_text(cue.get("text", ""))
+            row = dialogue(cue["start"], cue["end"], text)
+            if row:
+                lines.append(row)
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _hmsms(seconds: float) -> tuple[int, int, int, int]:

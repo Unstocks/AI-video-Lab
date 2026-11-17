@@ -6,7 +6,7 @@ Render each clip and platform variant independently. The important behaviors her
 
 ## Runtime Routing (HARD CONSTRAINT — Remotion or FFmpeg only)
 
-This pipeline is Phase 1 deferred from the HyperFrames adoption schedule. `edit_decisions.render_runtime` must be `"remotion"` (default) or `"ffmpeg"` (pure-concat clip jobs with no composition). HyperFrames is NOT a valid runtime here — clip-factory depends on Remotion word-level caption burn, and HyperFrames caption parity is deferred work.
+This pipeline uses the approved Remotion or FFmpeg routes. For vertical clip production, Milestone 4's `VerticalClipComposer` uses FFmpeg trim, reframe, and clip-relative ASS/SRT burn; this route works offline and keeps the output 1080x1920, `yuv420p`, and fast-start. Remotion's `TalkingHead.tsx` remains the optional kinetic-caption runtime when its supported Node runtime is installed. HyperFrames is NOT an approved clip-factory runtime; its caption parity remains deferred.
 
 - If `edit_decisions.render_runtime == "hyperframes"`, stop. Re-open the idea stage so the user can be presented the real constraint and lock `remotion` with a `render_runtime_selection` decision that records `hyperframes` as `rejected_because: "caption-burn parity deferred on clip-factory"`.
 - Per AGENT_GUIDE.md → "Present Both Composition Runtimes (HARD RULE)": the constraint is NOT an excuse to skip the conversation. The user still gets to see that HyperFrames exists and why it isn't viable here.
@@ -20,6 +20,8 @@ This pipeline is Phase 1 deferred from the HyperFrames adoption schedule. `edit_
 | Prior artifacts | `state.artifacts["edit"]["edit_decisions"]`, `state.artifacts["assets"]["asset_manifest"]` | Clip edits and assets |
 | Tools | `video_trimmer`, `video_compose`, `audio_mixer`, `color_grade` | Render pipeline |
 | Media profiles | `lib/media_profiles.py` | Platform targets |
+
+Before rendering approved clip sections, require `verify_script_plan_sync(..., require_approved=True)` to pass. Prefer a valid `proxy_video_path` from `source_manifest.json` while preserving the master file. Generate clip-rebased subtitles with `subtitle_gen` and burn them via FFmpeg's `ass` or `subtitles` filter. Render each clip independently, probe its final dimensions/codec/duration, and continue after a per-clip failure.
 
 ## Process
 

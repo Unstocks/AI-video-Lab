@@ -14,7 +14,9 @@ Approach: MediaPipe/OpenCV face detection → smoothed bounding box trajectory
 from __future__ import annotations
 
 import json
+import math
 from fractions import Fraction
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -44,7 +46,7 @@ ASPECT_PRESETS = {
 
 class AutoReframe(BaseTool):
     name = "auto_reframe"
-    version = "0.1.1"
+    version = "0.2.0"
     tier = ToolTier.CORE
     capability = "video_post"
     provider = "ffmpeg"
@@ -65,6 +67,10 @@ class AutoReframe(BaseTool):
         "face_tracked_crop",
         "smart_reframe",
         "center_crop",
+        "shot_cut_reset",
+        "speaker_track_crop",
+        "blurred_pillarbox",
+        "stacked_split",
     ]
 
     input_schema = {
@@ -111,7 +117,34 @@ class AutoReframe(BaseTool):
             },
             "codec": {"type": "string", "default": "libx264"},
             "crf": {"type": "integer", "default": 18},
+            "layout_mode": {"type": "string", "enum": ["single_crop", "blurred_pillarbox", "stacked_split"], "default": "single_crop"},
+            "shot_cuts": {"type": "array", "items": {"type": "number", "minimum": 0}},
+            "speaker_tracks": {
+                "type": "array",
+                "items": {
+                    "oneOf": [
+                        {"type": "object", "required": ["timestamp_seconds", "bbox"],
+                         "properties": {"timestamp_seconds": {"type": "number", "minimum": 0},
+                                        "bbox": {"$ref": "#/$defs/bbox"},
+                                        "active": {"type": "boolean"},
+                                        "speaker": {"type": ["string", "null"]}}},
+                        {"type": "object", "required": ["start_seconds", "end_seconds", "bbox"],
+                         "properties": {"start_seconds": {"type": "number", "minimum": 0},
+                                        "end_seconds": {"type": "number", "minimum": 0},
+                                        "bbox": {"$ref": "#/$defs/bbox"},
+                                        "active": {"type": "boolean"},
+                                        "speaker": {"type": ["string", "null"]}}},
+                    ]
+                },
+            },
+            "active_speaker_json": {"type": "string"},
+            "split_left_center_x": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.25},
+            "split_right_center_x": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.75},
         },
+        "$defs": {"bbox": {"type": "object", "required": ["x", "y", "width", "height"],
+                            "properties": {"x": {"type": "number"}, "y": {"type": "number"},
+                                           "width": {"type": "number", "exclusiveMinimum": 0},
+                                           "height": {"type": "number", "exclusiveMinimum": 0}}}},
     }
 
     resource_profile = ResourceProfile(
@@ -122,7 +155,8 @@ class AutoReframe(BaseTool):
     idempotency_key_fields = [
         "input_path", "target_aspect", "target_width", "target_height",
         "smoothing_window", "face_padding", "face_tracking_json", "sample_fps",
-        "codec", "crf",
+        "codec", "crf", "layout_mode", "shot_cuts", "speaker_tracks",
+        "active_speaker_json", "split_left_center_x", "split_right_center_x",
     ]
     side_effects = ["writes reframed video to output_path"]
     user_visible_verification = [
@@ -136,6 +170,24 @@ class AutoReframe(BaseTool):
             return ToolResult(success=False, error=f"Input not found: {input_path}")
 
         start = time.time()
+        layout_mode = inputs.get("layout_mode", "single_crop")
+        if layout_mode not in {"single_crop", "blurred_pillarbox", "stacked_split"}:
+            return ToolResult(success=False, error=f"Unknown layout_mode: {layout_mode}")
+        try:
+            shot_cuts = self._validated_shot_cuts(inputs.get("shot_cuts", []))
+            self._validate_split_centers(inputs)
+            if "smoothing_window" in inputs:
+                value = inputs["smoothing_window"]
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError("smoothing_window must be a positive integer")
+            if "sample_fps" in inputs:
+                self._finite_number(inputs["sample_fps"], "sample_fps", minimum=0.1)
+            if "face_padding" in inputs:
+                padding = self._finite_number(inputs["face_padding"], "face_padding", minimum=0)
+                if padding > 1:
+                    raise ValueError("face_padding must be between 0 and 1")
+        except (TypeError, ValueError) as exc:
+            return ToolResult(success=False, error=str(exc))
 
         # Get source video dimensions
         src_w, src_h, src_fps, src_sar = self._get_video_info(input_path)
@@ -150,7 +202,12 @@ class AutoReframe(BaseTool):
         needs_crop = target_w != src_w or target_h != src_h
         explicit_size = "target_width" in inputs and "target_height" in inputs
         if (
-            not needs_crop
+            layout_mode == "single_crop"
+            and not shot_cuts
+            and not inputs.get("speaker_tracks")
+            and not inputs.get("active_speaker_json")
+            and not inputs.get("face_tracking_json")
+            and not needs_crop
             and src_sar == 1.0
             and (not explicit_size or (out_w, out_h) == (src_w, src_h))
         ):
@@ -159,24 +216,6 @@ class AutoReframe(BaseTool):
                 data={"message": "Source already matches target aspect ratio", "output": str(input_path)},
                 artifacts=[str(input_path)],
             )
-
-        # Get face tracking data
-        face_data = self._get_face_data(inputs, input_path, src_fps) if needs_crop else []
-
-        # Compute per-frame crop positions
-        if face_data and len(face_data) > 0:
-            crop_x, crop_y = self._compute_face_tracked_crop(
-                face_data, src_w, src_h, target_w, target_h,
-                src_fps,
-                inputs.get("smoothing_window", 15),
-                inputs.get("face_padding", 0.4),
-            )
-            method = "face_tracked"
-        else:
-            # Fallback: center crop
-            crop_x = (src_w - target_w) // 2
-            crop_y = (src_h - target_h) // 2
-            method = "center_crop"
 
         # Build output path
         aspect_name = inputs.get("target_aspect", "portrait")
@@ -189,25 +228,50 @@ class AutoReframe(BaseTool):
         codec = inputs.get("codec", "libx264")
         crf = inputs.get("crf", 18)
 
-        if method == "face_tracked" and isinstance(crop_x, list):
-            # Dynamic crop: write crop coordinates to a file and use sendcmd
-            result = self._render_dynamic_crop(
-                input_path, output_path, crop_x, crop_y,
-                target_w, target_h, out_w, out_h,
-                src_fps, codec, crf,
-            )
+        if layout_mode == "blurred_pillarbox":
+            method = layout_mode
+            result = self._render_blurred_pillarbox(
+                input_path, output_path, out_w, out_h, codec, crf)
+        elif layout_mode == "stacked_split":
+            method = layout_mode
+            result = self._render_stacked_split(
+                input_path, output_path, src_w, src_h, src_sar, out_w, out_h,
+                inputs.get("split_left_center_x", 0.25),
+                inputs.get("split_right_center_x", 0.75), codec, crf)
         else:
-            # Static crop
-            result = self._render_static_crop(
-                input_path, output_path,
-                crop_x, crop_y, target_w, target_h,
-                out_w, out_h, codec, crf,
-            )
+            timestamps, crop_xs, crop_ys = self._get_tracking_samples(
+                inputs, input_path, src_fps, src_w, src_h, target_w, target_h, shot_cuts)
+            if len(crop_xs) >= 3:
+                method = "face_tracked"
+                crop_x, crop_y = crop_xs, crop_ys
+                result = self._render_dynamic_crop(
+                    input_path, output_path, crop_x, crop_y, timestamps,
+                    target_w, target_h, out_w, out_h, src_fps, codec, crf,
+                )
+            elif crop_xs:
+                method = "face_tracked" if timestamps else "center_crop"
+                crop_x = int(sum(crop_xs) / len(crop_xs))
+                crop_y = int(sum(crop_ys) / len(crop_ys))
+                result = self._render_static_crop(
+                    input_path, output_path, crop_x, crop_y, target_w, target_h,
+                    out_w, out_h, codec, crf,
+                )
+            else:
+                method = "center_crop"
+                crop_x = (src_w - target_w) // 2
+                crop_y = (src_h - target_h) // 2
+                result = self._render_static_crop(
+                    input_path, output_path, crop_x, crop_y, target_w, target_h,
+                    out_w, out_h, codec, crf,
+                )
 
         if not result.success:
             return result
 
         elapsed = time.time() - start
+        warnings = []
+        if result.data and result.data.get("fallback"):
+            warnings.append(result.data["fallback"])
 
         return ToolResult(
             success=True,
@@ -219,6 +283,7 @@ class AutoReframe(BaseTool):
                 "output_resolution": f"{out_w}x{out_h}",
                 "method": method,
                 "target_aspect": inputs.get("target_aspect", "portrait"),
+                "warnings": warnings,
             },
             artifacts=[str(output_path)],
             duration_seconds=round(elapsed, 2),
@@ -233,7 +298,7 @@ class AutoReframe(BaseTool):
             "-of", "json", str(path),
         ]
         try:
-            result = self.run_command(cmd)
+            result = self.run_command(cmd, timeout=30)
             data = json.loads(result.stdout)
             stream = data["streams"][0]
             w = int(stream["width"])
@@ -316,14 +381,34 @@ class AutoReframe(BaseTool):
     def _get_face_data(
         self, inputs: dict[str, Any], input_path: Path, src_fps: float
     ) -> list[dict]:
-        """Get face tracking data — from pre-computed JSON or by running detection."""
-        # Check for pre-computed tracking data
+        """Resolve pluggable active-speaker/face tracks without ML dependencies."""
+        sample_fps = inputs.get("sample_fps", 5)
+        tracks = inputs.get("speaker_tracks")
+        if tracks is not None:
+            normalized = self._normalize_tracks(tracks, sample_fps)
+            if normalized:
+                return normalized
+
+        active_path = inputs.get("active_speaker_json")
+        if active_path and Path(active_path).is_file():
+            try:
+                payload = json.loads(Path(active_path).read_text(encoding="utf-8"))
+                rows = payload.get("tracks", payload.get("faces", []))
+                normalized = self._normalize_tracks(rows, sample_fps)
+                if normalized:
+                    return normalized
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+
         tracking_json = inputs.get("face_tracking_json")
-        if tracking_json:
-            p = Path(tracking_json)
-            if p.exists():
-                data = json.loads(p.read_text(encoding="utf-8"))
-                return data.get("faces", [])
+        if tracking_json and Path(tracking_json).is_file():
+            try:
+                data = json.loads(Path(tracking_json).read_text(encoding="utf-8"))
+                normalized = self._normalize_tracks(data.get("faces", []), sample_fps)
+                if normalized:
+                    return normalized
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
 
         # Try to run face_tracker internally
         try:
@@ -331,7 +416,6 @@ class AutoReframe(BaseTool):
             tracker = FaceTracker()
             if tracker.get_status().name == "UNAVAILABLE":
                 return []
-            sample_fps = inputs.get("sample_fps", 5)
             result = tracker.execute({
                 "input_path": str(input_path),
                 "sample_fps": sample_fps,
@@ -341,11 +425,91 @@ class AutoReframe(BaseTool):
                 output_file = result.data.get("output")
                 if output_file:
                     data = json.loads(Path(output_file).read_text(encoding="utf-8"))
-                    return data.get("faces", [])
+                    return self._normalize_tracks(data.get("faces", []), sample_fps)
         except Exception:
             pass
 
         return []
+
+    @staticmethod
+    def _finite_number(value: Any, name: str, *, minimum: float | None = None) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite number")
+        if minimum is not None and value < minimum:
+            raise ValueError(f"{name} must be >= {minimum}")
+        return float(value)
+
+    @classmethod
+    def _validated_shot_cuts(cls, values: Any) -> list[float]:
+        if not isinstance(values, (list, tuple)):
+            raise TypeError("shot_cuts must be a list of timestamps")
+        cuts = [cls._finite_number(value, "shot_cuts item", minimum=0) for value in values]
+        if cuts != sorted(cuts) or len(set(cuts)) != len(cuts):
+            raise ValueError("shot_cuts must be strictly increasing")
+        return cuts
+
+    @classmethod
+    def _validate_split_centers(cls, inputs: dict[str, Any]) -> None:
+        for name, default in (("split_left_center_x", 0.25), ("split_right_center_x", 0.75)):
+            value = cls._finite_number(inputs.get(name, default), name, minimum=0)
+            if value > 1:
+                raise ValueError(f"{name} must be between 0 and 1")
+
+    @classmethod
+    def _normalize_tracks(cls, tracks: Any, sample_fps: float) -> list[dict]:
+        if not isinstance(tracks, list):
+            return []
+        try:
+            fps = cls._finite_number(sample_fps, "sample_fps", minimum=0.1)
+        except ValueError:
+            fps = 5.0
+        active = [row for row in tracks if isinstance(row, dict) and row.get("active") is True]
+        rows = active or [row for row in tracks if isinstance(row, dict)]
+        result: list[dict] = []
+        for row in rows:
+            bbox = row.get("bbox")
+            if not isinstance(bbox, dict):
+                continue
+            try:
+                normalized_bbox = {key: cls._finite_number(bbox.get(key), f"bbox.{key}")
+                                   for key in ("x", "y", "width", "height")}
+                if normalized_bbox["width"] <= 0 or normalized_bbox["height"] <= 0:
+                    continue
+                if "timestamp_seconds" in row:
+                    timestamp = cls._finite_number(row["timestamp_seconds"], "timestamp_seconds", minimum=0)
+                    result.append({"timestamp_seconds": timestamp, "bbox": normalized_bbox})
+                elif "start_seconds" in row and "end_seconds" in row:
+                    start = cls._finite_number(row["start_seconds"], "start_seconds", minimum=0)
+                    end = cls._finite_number(row["end_seconds"], "end_seconds", minimum=0)
+                    if end < start:
+                        continue
+                    step = 1.0 / fps
+                    count = max(1, int(math.floor((end - start) / step)) + 1)
+                    result.extend({"timestamp_seconds": min(end, start + i * step), "bbox": normalized_bbox}
+                                  for i in range(count))
+                    if result and result[-1]["timestamp_seconds"] < end:
+                        result.append({"timestamp_seconds": end, "bbox": normalized_bbox})
+            except (TypeError, ValueError):
+                continue
+        result.sort(key=lambda item: item["timestamp_seconds"])
+        return result
+
+    def _get_tracking_samples(
+        self, inputs: dict[str, Any], input_path: Path, src_fps: float,
+        src_w: int, src_h: int, crop_w: int, crop_h: int,
+        shot_cuts: list[float],
+    ) -> tuple[list[float], list[int], list[int]]:
+        faces = self._get_face_data(inputs, input_path, src_fps)
+        if not faces:
+            return [], [], []
+        crop_x, crop_y = self._compute_face_tracked_crop(
+            faces, src_w, src_h, crop_w, crop_h, src_fps,
+            inputs.get("smoothing_window", 15), inputs.get("face_padding", 0.4), shot_cuts,
+        )
+        timestamps = [float(face["timestamp_seconds"]) for face in faces]
+        if isinstance(crop_x, list):
+            return timestamps, crop_x, crop_y
+        return timestamps[:1], [crop_x], [crop_y]
 
     def _compute_face_tracked_crop(
         self,
@@ -355,6 +519,7 @@ class AutoReframe(BaseTool):
         fps: float,
         smoothing_window: int,
         face_padding: float,
+        shot_cuts: list[float] | None = None,
     ) -> tuple[list[int], list[int]]:
         """Compute smoothed crop positions from face tracking data.
 
@@ -400,8 +565,14 @@ class AutoReframe(BaseTool):
             return crop_x, crop_y
 
         # Dynamic crop: smooth the trajectory
-        smoothed_x = self._smooth_positions(face_centers_x, smoothing_window)
-        smoothed_y = self._smooth_positions(face_centers_y, smoothing_window)
+        if shot_cuts:
+            smoothed_x = self._smooth_positions_segmented(
+                face_centers_x, face_timestamps, shot_cuts, smoothing_window)
+            smoothed_y = self._smooth_positions_segmented(
+                face_centers_y, face_timestamps, shot_cuts, smoothing_window)
+        else:
+            smoothed_x = self._smooth_positions(face_centers_x, smoothing_window)
+            smoothed_y = self._smooth_positions(face_centers_y, smoothing_window)
 
         # Convert to crop positions (top-left corner), clamped
         crop_xs = []
@@ -425,6 +596,25 @@ class AutoReframe(BaseTool):
             smoothed.append(sum(values[start:end]) / (end - start))
         return smoothed
 
+    def _smooth_positions_segmented(
+        self, values: list[float], timestamps: list[float], shot_cuts: list[float], window: int,
+    ) -> list[float]:
+        """Smooth independently inside each shot so a hard cut never bleeds."""
+        if len(values) != len(timestamps):
+            raise ValueError("timestamps and positions must have equal length")
+        if not shot_cuts:
+            return self._smooth_positions(values, window)
+        groups: dict[int, list[int]] = {}
+        for index, timestamp in enumerate(timestamps):
+            shot_index = sum(timestamp >= cut for cut in shot_cuts)
+            groups.setdefault(shot_index, []).append(index)
+        result = list(values)
+        for indexes in groups.values():
+            smoothed = self._smooth_positions([values[i] for i in indexes], window)
+            for index, value in zip(indexes, smoothed):
+                result[index] = value
+        return result
+
     def _render_static_crop(
         self,
         input_path: Path, output_path: Path,
@@ -439,9 +629,11 @@ class AutoReframe(BaseTool):
         cmd = [
             "ffmpeg", "-y",
             "-i", str(input_path),
+            "-map", "0:v:0", "-map", "0:a?",
             "-vf", vf,
             "-c:v", codec, "-crf", str(crf), "-preset", "fast",
             "-c:a", "aac", "-b:a", "192k",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             str(output_path),
         ]
 
@@ -456,6 +648,7 @@ class AutoReframe(BaseTool):
         self,
         input_path: Path, output_path: Path,
         crop_xs: list[int], crop_ys: list[int],
+        timestamps: list[float],
         crop_w: int, crop_h: int,
         out_w: int, out_h: int,
         fps: float,
@@ -481,63 +674,106 @@ class AutoReframe(BaseTool):
                 crop_w, crop_h, out_w, out_h, codec, crf,
             )
 
-        # Build sendcmd script for crop filter position updates
-        # Each command sets the crop x,y at the corresponding timestamp
-        temp_dir = output_path.parent / ".reframe_tmp"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        sendcmd_path = temp_dir / "crop_commands.txt"
-
-        # Approximate timestamps from the face tracking sample rate
-        # The face data was sampled at sample_fps intervals
-        sample_interval = 1.0 / (fps / max(1, int(fps / 5)))  # Approximate
-
-        lines = []
-        for i, (cx, cy) in enumerate(zip(crop_xs, crop_ys)):
-            ts = i * sample_interval
-            lines.append(f"{ts:.3f} [enter] crop x {cx};")
-            lines.append(f"{ts:.3f} [enter] crop y {cy};")
-
-        sendcmd_path.write_text("\n".join(lines), encoding="utf-8")
-
-        # Use crop with sendcmd for dynamic positioning
-        vf = (
-            f"sendcmd=f='{str(sendcmd_path).replace(chr(92), '/')}':flags=enter,"
-            f"crop={crop_w}:{crop_h}:{crop_xs[0]}:{crop_ys[0]},"
-            f"scale={out_w}:{out_h},setsar=1"
-        )
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_path),
-            "-vf", vf,
-            "-c:v", codec, "-crf", str(crf), "-preset", "fast",
-            "-c:a", "aac", "-b:a", "192k",
-            str(output_path),
-        ]
-
+        if len(timestamps) != len(crop_xs) or len(crop_xs) != len(crop_ys):
+            return ToolResult(success=False, error="Tracking timestamps and crop positions must have equal length")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            self.run_command(cmd, timeout=600)
+            with tempfile.TemporaryDirectory(prefix=".reframe-", dir=output_path.parent) as workspace:
+                sendcmd_path = Path(workspace) / "crop_commands.txt"
+                lines = []
+                for ts, cx, cy in zip(timestamps, crop_xs, crop_ys):
+                    lines.append(f"{ts:.6f} [enter] crop x {cx};")
+                    lines.append(f"{ts:.6f} [enter] crop y {cy};")
+                sendcmd_path.write_text("\n".join(lines), encoding="utf-8")
+                escaped = self._escape_ffmpeg_filter_path(sendcmd_path)
+                vf = (
+                    f"sendcmd=f='{escaped}':flags=enter,"
+                    f"crop={crop_w}:{crop_h}:{crop_xs[0]}:{crop_ys[0]},"
+                    f"scale={out_w}:{out_h},setsar=1"
+                )
+                cmd = [
+                    "ffmpeg", "-y", "-i", str(input_path),
+                    "-map", "0:v:0", "-map", "0:a?", "-vf", vf,
+                    "-c:v", codec, "-crf", str(crf), "-preset", "fast",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path),
+                ]
+                self.run_command(cmd, timeout=600)
         except Exception:
-            # sendcmd can be finicky — fall back to static crop with average position
             avg_x = int(sum(crop_xs) / len(crop_xs))
             avg_y = int(sum(crop_ys) / len(crop_ys))
-            result = self._render_static_crop(
-                input_path, output_path, avg_x, avg_y,
-                crop_w, crop_h, out_w, out_h, codec, crf,
-            )
+            result = self._render_static_crop(input_path, output_path, avg_x, avg_y,
+                                              crop_w, crop_h, out_w, out_h, codec, crf)
             if result.success:
                 result.data = result.data or {}
                 result.data["fallback"] = "sendcmd failed, used static average crop"
             return result
-        finally:
-            # Clean up
-            if sendcmd_path.exists():
-                sendcmd_path.unlink()
-            try:
-                temp_dir.rmdir()
-            except OSError:
-                pass
 
+        return ToolResult(success=True)
+
+    @staticmethod
+    def _escape_ffmpeg_filter_path(path: Path) -> str:
+        normalized = str(path.resolve()).replace("\\", "/")
+        return normalized.replace(":", r"\:").replace("'", r"\'")
+
+    def _render_blurred_pillarbox(
+        self, input_path: Path, output_path: Path, out_w: int, out_h: int,
+        codec: str, crf: int,
+    ) -> ToolResult:
+        vf = (
+            f"[0:v]split=2[bg][fg];[bg]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+            f"crop={out_w}:{out_h},boxblur=20:5[bgb];"
+            f"[fg]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease[fgs];"
+            "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1[vout]"
+        )
+        return self._render_filter_layout(input_path, output_path, vf, codec, crf)
+
+    def _render_stacked_split(
+        self, input_path: Path, output_path: Path, src_w: int, src_h: int, src_sar: float,
+        out_w: int, out_h: int, left_center: float, right_center: float,
+        codec: str, crf: int,
+    ) -> ToolResult:
+        half_h = (out_h // 2) - ((out_h // 2) % 2)
+        display_ratio = (out_w / half_h) / src_sar
+        if src_w / src_h > display_ratio:
+            crop_h = src_h - (src_h % 2)
+            crop_w = int(crop_h * display_ratio)
+        else:
+            crop_w = src_w - (src_w % 2)
+            crop_h = int(crop_w / display_ratio)
+        crop_w -= crop_w % 2
+        crop_h -= crop_h % 2
+        if crop_w < 2 or crop_h < 2:
+            return ToolResult(success=False, error="Source is too small for stacked_split crop")
+
+        def x_for(center: float) -> int:
+            x = int(center * src_w - crop_w / 2)
+            x = max(0, min(x, src_w - crop_w))
+            return x - (x % 2)
+
+        y = max(0, (src_h - crop_h) // 2)
+        y -= y % 2
+        vf = (
+            f"[0:v]split=2[left][right];"
+            f"[left]crop={crop_w}:{crop_h}:{x_for(left_center)}:{y},scale={out_w}:{half_h}[top];"
+            f"[right]crop={crop_w}:{crop_h}:{x_for(right_center)}:{y},scale={out_w}:{half_h}[bot];"
+            "[top][bot]vstack=inputs=2,setsar=1[vout]"
+        )
+        return self._render_filter_layout(input_path, output_path, vf, codec, crf)
+
+    def _render_filter_layout(
+        self, input_path: Path, output_path: Path, vf: str, codec: str, crf: int,
+    ) -> ToolResult:
+        cmd = [
+            "ffmpeg", "-y", "-i", str(input_path), "-filter_complex", vf,
+            "-map", "[vout]", "-map", "0:a?", "-c:v", codec, "-crf", str(crf), "-preset", "fast",
+            "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            str(output_path),
+        ]
+        try:
+            self.run_command(cmd, timeout=600)
+        except Exception as exc:
+            return ToolResult(success=False, error=f"FFmpeg render failed: {exc}")
         return ToolResult(success=True)
 
     def estimate_runtime(self, inputs: dict[str, Any]) -> float:

@@ -14,6 +14,12 @@ This stage turns the approved clips into independent mini-edits. Each clip must 
 
 ## Process
 
+### Vertical captions and render handoff (OD-04 / ADR-009)
+
+For clip-factory vertical deliverables, use the offline FFmpeg ASS/SRT path first. Generate clip-relative captions with `subtitle_gen` (`format="ass"` or `"srt"`); use the `VerticalClipComposer` service for trim → reframe → subtitle burn after the approved script and `clip_selection_plan` pass `verify_script_plan_sync(require_approved=True)`. Keep the 9:16 safe zones (`MarginV=320`, `MarginR=120`) so captions clear mobile UI. The composer prefers the H.264 editing proxy when the source manifest has a valid proxy and records which source it used.
+
+Keep Remotion's `TalkingHead.tsx` path available as the optional kinetic-caption runtime when the supported Node runtime is installed. Do not route this pipeline through HyperFrames; that runtime remains outside the approved clip-factory render choices.
+
 ### 1. Build A Shared Edit Template
 
 Lock the batch defaults first:

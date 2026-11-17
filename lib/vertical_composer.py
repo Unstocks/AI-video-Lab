@@ -1,0 +1,398 @@
+"""Layer 2 service for deterministic, approval-gated vertical clip rendering."""
+
+from __future__ import annotations
+
+import json
+import hashlib
+import math
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal, Optional, Sequence
+
+from lib.media_profiles import MediaProfile, get_profile
+from lib.models.clip_plan import ClipSelectionPlan
+
+
+@dataclass(frozen=True)
+class VerticalRenderConfig:
+    profile_name: str = "youtube_shorts"
+    layout_mode: Literal["single_crop", "blurred_pillarbox", "stacked_split"] = "single_crop"
+    burn_subtitles: bool = True
+    subtitle_format: Literal["ass", "srt"] = "ass"
+    highlight_style: Literal["none", "word_by_word", "karaoke"] = "karaoke"
+    font_name: str = "Noto Sans Devanagari"
+    font_size: int = 64
+    margin_v: int = 320
+    margin_l: int = 80
+    margin_r: int = 120
+    max_words_per_cue: int = 6
+    max_chars_per_line: int = 32
+    crf: int = 20
+    codec: str = "libx264"
+
+    def __post_init__(self) -> None:
+        get_profile(self.profile_name)
+        if self.layout_mode not in ("single_crop", "blurred_pillarbox", "stacked_split"):
+            raise ValueError("unsupported layout_mode")
+        if self.subtitle_format not in ("ass", "srt"):
+            raise ValueError("subtitle_format must be ass or srt")
+        if self.highlight_style not in ("none", "word_by_word", "karaoke"):
+            raise ValueError("unsupported highlight_style")
+        for name in ("font_size", "max_words_per_cue", "max_chars_per_line"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        for name in ("margin_v", "margin_l", "margin_r"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        if isinstance(self.crf, bool) or not isinstance(self.crf, int) or not 0 <= self.crf <= 51:
+            raise ValueError("crf must be an integer from 0 to 51")
+        if not self.codec.strip() or not self.font_name.strip():
+            raise ValueError("codec and font_name must be non-empty")
+        if not isinstance(self.burn_subtitles, bool):
+            raise ValueError("burn_subtitles must be a boolean")
+
+
+@dataclass(frozen=True)
+class ClipRenderResult:
+    candidate_id: str
+    success: bool
+    output_video_path: Optional[str]
+    subtitle_path: Optional[str]
+    source_video_used: str
+    layout_mode: str
+    duration_seconds: Optional[float]
+    width: Optional[int]
+    height: Optional[int]
+    subtitle_cue_count: int = 0
+    effective_highlight_style: str = "none"
+    error: Optional[str] = None
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VerticalBatchRenderResult:
+    project_id: str
+    plan_sha256: str
+    profile_name: str
+    clips: tuple[ClipRenderResult, ...]
+    succeeded_count: int
+    failed_count: int
+    warnings: tuple[str, ...] = ()
+
+
+class VerticalClipComposer:
+    """Compose approved clips through existing trim, reframe, and subtitle tools."""
+
+    def __init__(self, *, trimmer=None, reframer=None, subtitle_gen=None) -> None:
+        self._trimmer = trimmer
+        self._reframer = reframer
+        self._subtitle_gen = subtitle_gen
+
+    @staticmethod
+    def select_editing_source(
+        source_video_path: str | Path, *, source_manifest: Optional[dict[str, Any]] = None,
+    ) -> Path:
+        if source_manifest:
+            proxy = source_manifest.get("proxy_video_path")
+            if isinstance(proxy, str) and proxy.strip() and Path(proxy).is_file():
+                return Path(proxy)
+        master = Path(source_video_path)
+        if not master.is_file():
+            raise FileNotFoundError(f"source video not found: {master}")
+        return master
+
+    @staticmethod
+    def _finite_time(value: Any, name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite number")
+        if value < 0:
+            raise ValueError(f"{name} must be nonnegative")
+        return float(value)
+
+    @staticmethod
+    def _output_stem(candidate_id: str) -> str:
+        """Keep familiar IDs readable and safely encode unusual schema-valid IDs."""
+        if re.fullmatch(r"[A-Za-z0-9_-]+", candidate_id):
+            return candidate_id
+        readable = re.sub(r"[^A-Za-z0-9_-]+", "_", candidate_id).strip("_")[:64] or "clip"
+        digest = hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()[:10]
+        return f"{readable}-{digest}"
+
+    @staticmethod
+    def _rebase_shot_cuts(cuts: Optional[Sequence[float]], start: float, end: float) -> list[float]:
+        result = []
+        for cut in cuts or ():
+            value = VerticalClipComposer._finite_time(cut, "shot cut")
+            if start < value < end:
+                result.append(value - start)
+        return result
+
+    @staticmethod
+    def _rebase_speaker_tracks(
+        tracks: Optional[Sequence[dict[str, Any]]], start: float, end: float,
+    ) -> list[dict[str, Any]]:
+        result = []
+        for item in tracks or ():
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            if "timestamp_seconds" in row:
+                timestamp = VerticalClipComposer._finite_time(row["timestamp_seconds"], "speaker timestamp")
+                if start <= timestamp <= end:
+                    row["timestamp_seconds"] = timestamp - start
+                    result.append(row)
+            elif "start_seconds" in row and "end_seconds" in row:
+                track_start = VerticalClipComposer._finite_time(row["start_seconds"], "speaker start")
+                track_end = VerticalClipComposer._finite_time(row["end_seconds"], "speaker end")
+                if track_end < track_start:
+                    raise ValueError("speaker track end must be >= start")
+                clipped_start, clipped_end = max(start, track_start), min(end, track_end)
+                if clipped_end > clipped_start:
+                    row["start_seconds"] = clipped_start - start
+                    row["end_seconds"] = clipped_end - start
+                    result.append(row)
+        return result
+
+    def _get_trimmer(self):
+        if self._trimmer is None:
+            from tools.video.video_trimmer import VideoTrimmer
+            tool = VideoTrimmer()
+            original_run_command = tool.run_command
+
+            def timed_run_command(command, *, timeout=None, cwd=None):
+                return original_run_command(command, timeout=timeout or 600, cwd=cwd)
+
+            tool.run_command = timed_run_command
+            self._trimmer = tool
+        return self._trimmer
+
+    def _get_reframer(self):
+        if self._reframer is None:
+            from tools.video.auto_reframe import AutoReframe
+            self._reframer = AutoReframe()
+        return self._reframer
+
+    def _get_subtitle_gen(self):
+        if self._subtitle_gen is None:
+            from tools.subtitle.subtitle_gen import SubtitleGen
+            self._subtitle_gen = SubtitleGen()
+        return self._subtitle_gen
+
+    def render_clip(
+        self, *, candidate_id: str, source_video_path: str | Path,
+        start_seconds: float, end_seconds: float, output_dir: str | Path,
+        transcript_segments: Sequence[dict[str, Any]] = (),
+        config: Optional[VerticalRenderConfig] = None,
+        shot_cuts: Optional[Sequence[float]] = None,
+        speaker_tracks: Optional[Sequence[dict[str, Any]]] = None,
+        source_manifest: Optional[dict[str, Any]] = None,
+    ) -> ClipRenderResult:
+        config = config or VerticalRenderConfig()
+        source_used = str(source_video_path)
+        output_path: Optional[Path] = None
+        subtitle_path: Optional[Path] = None
+        cue_count = 0
+        effective_style = "none"
+        warnings: list[str] = []
+        profile: MediaProfile = get_profile(config.profile_name)
+        try:
+            if not isinstance(candidate_id, str) or not candidate_id:
+                raise ValueError("candidate_id must be a non-empty string")
+            start = self._finite_time(start_seconds, "start_seconds")
+            end = self._finite_time(end_seconds, "end_seconds")
+            if end <= start:
+                raise ValueError("end_seconds must be greater than start_seconds")
+            duration = end - start
+            if profile.max_duration_seconds is not None and duration > profile.max_duration_seconds:
+                warnings.append(
+                    f"clip duration {duration:.3f}s exceeds {profile.name} maximum "
+                    f"{profile.max_duration_seconds:.0f}s"
+                )
+            source = self.select_editing_source(source_video_path, source_manifest=source_manifest)
+            source_used = str(source)
+            destination = Path(output_dir)
+            destination.mkdir(parents=True, exist_ok=True)
+            output_stem = self._output_stem(candidate_id)
+            output_path = destination / f"{output_stem}.mp4"
+            subtitle_path = destination / f"{output_stem}.{config.subtitle_format}"
+            protected_sources = [Path(source_video_path), source]
+            if source_manifest:
+                for key in ("master_video_path", "proxy_video_path"):
+                    value = source_manifest.get(key)
+                    if isinstance(value, str) and value:
+                        protected_sources.append(Path(value))
+            resolved_output = output_path.resolve()
+            if any(path.resolve() == resolved_output for path in protected_sources):
+                raise ValueError("output path would overwrite master or proxy source media")
+
+            with tempfile.TemporaryDirectory(prefix=f".{output_stem}-", dir=destination) as workspace:
+                work = Path(workspace)
+                trimmed = work / "trimmed.mp4"
+                reframed = work / "reframed.mp4"
+                trim_result = self._get_trimmer().execute({
+                    "operation": "cut", "input_path": str(source), "output_path": str(trimmed),
+                    "start_seconds": start, "end_seconds": end, "codec": "libx264",
+                })
+                if not trim_result.success or not trimmed.is_file() or trimmed.stat().st_size <= 0:
+                    raise RuntimeError(trim_result.error or "VideoTrimmer did not produce a non-empty clip")
+
+                reframed_result = self._get_reframer().execute({
+                    "input_path": str(trimmed), "output_path": str(reframed),
+                    "target_width": profile.width, "target_height": profile.height,
+                    "layout_mode": config.layout_mode,
+                    "shot_cuts": self._rebase_shot_cuts(shot_cuts, start, end),
+                    "speaker_tracks": self._rebase_speaker_tracks(speaker_tracks, start, end),
+                    "codec": config.codec, "crf": config.crf,
+                })
+                if not reframed_result.success:
+                    raise RuntimeError(reframed_result.error or "AutoReframe failed")
+                warnings.extend(reframed_result.data.get("warnings", []))
+                reframed_source = Path(reframed_result.data.get("output", reframed))
+                if not reframed_source.is_file() or reframed_source.stat().st_size <= 0:
+                    raise RuntimeError("AutoReframe did not produce a non-empty clip")
+
+                subtitle_result = None
+                if transcript_segments:
+                    subtitle_inputs: dict[str, Any] = {
+                        "segments": list(transcript_segments), "format": config.subtitle_format,
+                        "clip_start_seconds": start, "clip_end_seconds": end,
+                        "output_path": str(subtitle_path), "highlight_style": config.highlight_style,
+                        "max_words_per_cue": config.max_words_per_cue,
+                        "max_chars_per_line": config.max_chars_per_line,
+                    }
+                    if config.subtitle_format == "ass":
+                        subtitle_inputs.update({
+                            "play_res_x": profile.width, "play_res_y": profile.height,
+                            "font_name": config.font_name, "font_size": config.font_size,
+                            "margin_v": config.margin_v, "margin_l": config.margin_l,
+                            "margin_r": config.margin_r,
+                        })
+                    subtitle_result = self._get_subtitle_gen().execute(subtitle_inputs)
+                    if not subtitle_result.success:
+                        raise RuntimeError(subtitle_result.error or "SubtitleGen failed")
+                    cue_count = int(subtitle_result.data.get("cue_count", 0))
+                    effective_style = subtitle_result.data.get("effective_highlight_style", "none")
+                    warnings.extend(subtitle_result.data.get("warnings", []))
+                elif config.burn_subtitles:
+                    warnings.append("no transcript segments supplied; subtitle burn skipped")
+
+                if config.burn_subtitles and cue_count > 0 and subtitle_path.is_file():
+                    escaped_subtitle = self._escape_filter_path(subtitle_path)
+                    filter_name = "ass" if config.subtitle_format == "ass" else "subtitles"
+                    vf = f"{filter_name}='{escaped_subtitle}'"
+                    render_tmp = work / "final.mp4"
+                    command = [
+                        "ffmpeg", "-y", "-i", str(reframed_source),
+                        "-map", "0:v:0", "-map", "0:a?", "-vf", vf,
+                        "-c:v", config.codec, "-crf", str(config.crf), "-preset", "fast",
+                        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                        "-c:a", "aac", "-b:a", "192k", str(render_tmp),
+                    ]
+                    self._run_ffmpeg(command, timeout=600)
+                    if not render_tmp.is_file() or render_tmp.stat().st_size <= 0:
+                        raise RuntimeError("subtitle burn produced no output file")
+                    os.replace(render_tmp, output_path)
+                else:
+                    intermediate = work / "final.mp4"
+                    shutil.copy2(reframed_source, intermediate)
+                    os.replace(intermediate, output_path)
+
+            probe = self._probe_output(output_path)
+            video = next((stream for stream in probe.get("streams", [])
+                          if stream.get("codec_type") == "video"), None)
+            if video is None:
+                raise RuntimeError("ffprobe found no video stream in rendered output")
+            width, height = int(video["width"]), int(video["height"])
+            if (width, height) != (profile.width, profile.height):
+                raise RuntimeError(f"unexpected output size {width}x{height}; expected {profile.width}x{profile.height}")
+            if video.get("pix_fmt") != "yuv420p":
+                raise RuntimeError(f"unexpected pixel format {video.get('pix_fmt')!r}; expected 'yuv420p'")
+            video_codec = video.get("codec_name")
+            if config.codec == "libx264" and video_codec != "h264":
+                raise RuntimeError(f"unexpected video codec {video_codec!r}; expected h264")
+            media_duration = float(probe.get("format", {}).get("duration", 0))
+            if not math.isfinite(media_duration) or media_duration <= 0:
+                raise RuntimeError("ffprobe returned an invalid output duration")
+            if abs(media_duration - duration) > max(0.35, duration * 0.05):
+                warnings.append(
+                    f"rendered duration {media_duration:.3f}s differs from requested {duration:.3f}s"
+                )
+            audio_streams = [stream for stream in probe.get("streams", []) if stream.get("codec_type") == "audio"]
+            if audio_streams and audio_streams[0].get("codec_name") != "aac":
+                warnings.append(f"audio codec is {audio_streams[0].get('codec_name')}, expected aac")
+            if not audio_streams:
+                warnings.append("rendered clip contains no audio stream")
+            return ClipRenderResult(
+                candidate_id, True, str(output_path), str(subtitle_path) if subtitle_result else None,
+                source_used, config.layout_mode, media_duration, width, height,
+                cue_count, effective_style, warnings=tuple(warnings),
+            )
+        except Exception as exc:
+            return ClipRenderResult(
+                candidate_id, False, None, str(subtitle_path) if subtitle_path and subtitle_path.is_file() else None,
+                source_used, config.layout_mode, None, None, None, cue_count, effective_style,
+                error=str(exc), warnings=tuple(warnings),
+            )
+
+    def render_approved_batch(
+        self, *, script: dict[str, Any], plan: ClipSelectionPlan | dict[str, Any],
+        source_video_path: str | Path, output_dir: str | Path,
+        transcript_segments: Sequence[dict[str, Any]] = (),
+        config: Optional[VerticalRenderConfig] = None,
+        shot_cuts: Optional[Sequence[float]] = None,
+        speaker_tracks: Optional[Sequence[dict[str, Any]]] = None,
+        source_manifest: Optional[dict[str, Any]] = None,
+    ) -> VerticalBatchRenderResult:
+        from tools.analysis.clip_selector import verify_script_plan_sync
+
+        # Governance check happens before source probing, directory creation, or FFmpeg.
+        verify_script_plan_sync(script, plan, require_approved=True)
+        normalized_plan = plan if isinstance(plan, ClipSelectionPlan) else ClipSelectionPlan.from_dict(plan)
+        cfg = config or VerticalRenderConfig()
+        candidate_map = {item.candidate_id: item for item in normalized_plan.candidates}
+        clips: list[ClipRenderResult] = []
+        for section in script["sections"]:
+            candidate = candidate_map[section["id"]]
+            clips.append(self.render_clip(
+                candidate_id=candidate.candidate_id, source_video_path=source_video_path,
+                start_seconds=section["start_seconds"], end_seconds=section["end_seconds"],
+                output_dir=output_dir, transcript_segments=transcript_segments, config=cfg,
+                shot_cuts=shot_cuts, speaker_tracks=speaker_tracks, source_manifest=source_manifest,
+            ))
+        succeeded = sum(clip.success for clip in clips)
+        failed = len(clips) - succeeded
+        batch_warnings = tuple(warning for clip in clips for warning in clip.warnings)
+        return VerticalBatchRenderResult(
+            normalized_plan.project_id, normalized_plan.compute_plan_sha256(), cfg.profile_name,
+            tuple(clips), succeeded, failed, batch_warnings,
+        )
+
+    @staticmethod
+    def _escape_filter_path(path: Path) -> str:
+        normalized = str(path.resolve()).replace("\\", "/")
+        return (normalized.replace("\\", r"\\").replace(":", r"\:")
+                .replace("'", r"\'").replace(",", r"\,"))
+
+    @staticmethod
+    def _run_ffmpeg(command: list[str], *, timeout: int) -> None:
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=timeout)
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "FFmpeg exited with a non-zero status").strip()
+            raise RuntimeError(details[-4000:])
+
+    @staticmethod
+    def _probe_output(path: Path) -> dict[str, Any]:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or "ffprobe failed").strip())
+        return json.loads(result.stdout)
