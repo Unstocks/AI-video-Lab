@@ -51,6 +51,7 @@ stages:
       - brief
       - decision_log
     tools_available:
+      - url_intake
       - video_downloader
       - transcript_fetcher
     checkpoint_required: true
@@ -69,22 +70,29 @@ stages:
       - brief
     produces:
       - script
+      - clip_selection_plan
     required_tools:
       - transcriber
     optional_tools:
       - scene_detect
+      - clip_selector
+      - silence_cutter
+      - audio_energy
     tools_available:
       - transcriber
       - scene_detect
+      - clip_selector
+      - silence_cutter
+      - audio_energy
     checkpoint_required: true
     human_approval_default: true
     review_focus:
-      - Full transcription with accurate timestamps
-      - Clip-worthy segments identified and ranked
-      - Each candidate clip is self-contained (makes sense without context)
+      - Verbatim spoken-hook provenance is grounded in the transcript
+      - Every selected candidate passes the five-point cold-viewer audit
+      - Provisional script and clip_selection_plan hashes are synchronized
+      - Zero quota padding; report an honest rejection dossier when no candidate qualifies
     success_criteria:
-      - Schema-valid script artifact
-      - At least N candidate clips identified (where N >= brief target)
+      - Schema-valid script and clip_selection_plan artifacts
 
   - name: scene_plan
     skill: pipelines/clip-factory/scene-director
@@ -97,8 +105,12 @@ stages:
     required_tools: []
     optional_tools:
       - frame_sampler
+      - auto_reframe
+      - scene_detect
     tools_available:
       - frame_sampler
+      - auto_reframe
+      - scene_detect
     checkpoint_required: true
     human_approval_default: true
     review_focus:
@@ -143,7 +155,14 @@ stages:
       - script
     produces:
       - edit_decisions
-    tools_available: []
+    optional_tools:
+      - auto_reframe
+      - subtitle_gen
+      - video_trimmer
+    tools_available:
+      - auto_reframe
+      - subtitle_gen
+      - video_trimmer
     checkpoint_required: true
     human_approval_default: false
     review_focus:
@@ -171,12 +190,20 @@ stages:
     optional_tools:
       - audio_enhance
       - color_grade
+      - auto_reframe
+      - subtitle_gen
+      - audio_probe
+      - frame_sampler
     tools_available:
       - video_compose
       - video_trimmer
+      - auto_reframe
+      - subtitle_gen
       - audio_mixer
       - audio_enhance
       - color_grade
+      - audio_probe
+      - frame_sampler
     checkpoint_required: true
     human_approval_default: false
     review_focus:
@@ -196,7 +223,10 @@ stages:
       - brief
     produces:
       - publish_log
-    tools_available: []
+    optional_tools:
+      - export_bundle
+    tools_available:
+      - export_bundle
     checkpoint_required: true
     human_approval_default: true
     review_focus:

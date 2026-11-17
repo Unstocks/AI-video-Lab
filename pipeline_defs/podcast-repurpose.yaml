@@ -51,7 +51,8 @@ stages:
     produces:
       - brief
       - decision_log
-    tools_available: []
+    tools_available:
+      - url_intake
     checkpoint_required: true
     human_approval_default: true
     review_focus:
@@ -68,13 +69,20 @@ stages:
       - brief
     produces:
       - script
+      - clip_selection_plan
     required_tools:
       - transcriber
     optional_tools:
       - audio_enhance
+      - clip_selector
+      - silence_cutter
+      - audio_energy
     tools_available:
       - transcriber
       - audio_enhance
+      - clip_selector
+      - silence_cutter
+      - audio_energy
     checkpoint_required: true
     human_approval_default: true
     review_focus:

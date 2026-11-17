@@ -35,18 +35,24 @@ Each platform needs its own tone and packaging:
 
 ### 3. Package The Batch Cleanly
 
-Group by platform and include ready-to-paste text assets, not just video files.
+Use `export_bundle` batch mode with `clips=[...]` to group by platform and include ready-to-paste text assets, not just video files. Rank determines posting order; packages are laid out as `clips/01_<clip_id>/`, `clips/02_<clip_id>/`, and so on, with a root `manifest.json` linking each clip to its package.
 
-### 4. Preserve Batch Truth
+### 4. Enforce The Automated QA Gate
 
-Store in `publish_log.metadata`:
+Read `final_review.json` before packaging. A clip listed in `metadata.failed_clip_ids` or marked `qa_passed: false` must never be copied into the export folder. Record it as `status: "failed"` with the QA reason in `publish_log.json`; continue exporting other QA-passed clips. If no clips pass QA, stop and surface that result.
+
+### 5. Preserve Batch Truth
+
+Store in `publish_log.metadata` and the export `manifest.json`:
 
 - `clip_catalog`
 - `posting_order`
-- `platform_copy_map`
-- `schedule_notes`
+- `skipped_failed_clips`
+- `plan_sha256`
 
-### 5. Quality Gate
+The schema-valid `publish_log.json` contains one `exported` or `failed` entry per clip, with per-clip metadata and export paths for successful packages.
+
+### 6. Quality Gate
 
 - strongest clips lead the rollout,
 - captions are platform-specific,
