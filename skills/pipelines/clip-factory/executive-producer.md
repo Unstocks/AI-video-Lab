@@ -33,6 +33,7 @@ EP_STATE:
   artifacts:
     idea: null
     script: null
+    clip_selection_plan: null
     scene_plan: null
     assets: null
     edit: null
@@ -56,11 +57,13 @@ CHECK: Source and targets
 
 ### After SCRIPT stage:
 ```
-CHECK: Transcript and ranking
-  - Full transcription with accurate timestamps?
-  - At least N candidate clips where N >= clip_count_target?
-  - Each candidate is self-contained (standalone test)?
-  - Clips ranked by quality/engagement potential?
+CHECK: Evidence, review gate, and dual-artifact integrity
+  - Spoken hooks are verbatim and traceable to transcript source spans?
+  - Every selected candidate passes the five-point cold-viewer audit?
+  - clip_selection_plan and provisional script hashes, transcript revision, IDs, and boundaries are in sync?
+  - If awaiting_human, were both artifacts written and the turn ended for explicit review?
+  - After review, is script approval_status="approved" and synchronized to the updated plan before scene_plan?
+  - Is the rejection dossier honest when no candidate passes, with zero quota padding?
 ```
 
 ### After SCENE_PLAN stage:
@@ -109,7 +112,7 @@ CHECK: Batch render validation
 | Gate | After Stage | What's Checked | Fail Action |
 |------|-------------|---------------|-------------|
 | G1 | idea | Source assessment, clip targets | Revise |
-| G2 | script | Transcript quality, clip ranking | Revise |
+| G2 | script | Verbatim hook provenance, five-point cold-viewer pass, synchronized plan/script hash, human approval before scene_plan, zero quota padding | Revise or await human review |
 | G3 | scene_plan | Clip boundaries, batch diversity | Revise |
 | G4 | assets | Batch consistency, audio normalization | Revise |
 | G5 | edit | Hook placement, completeness | Revise |

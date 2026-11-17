@@ -1,110 +1,27 @@
 # Script Director - Clip Factory Pipeline
 
-## When To Use
+## Purpose and contracts
 
-This stage converts the long-form source into a ranked candidate list and then into the final clip selections. You are mining for standout moments, not summarizing the entire source.
+This stage turns the source transcript into an evidence-backed candidate dossier and a script view. Read and emit both `schemas/artifacts/clip_selection_plan.schema.json` and `schemas/artifacts/script.schema.json`. Use `transcriber`, `clip_selector`, and the available `scene_detect`, `silence_cutter`, and `audio_energy` tools as appropriate.
 
-## Prerequisites
+The `clip_selection_plan` is the authoritative editorial record. The `script` is a downstream-facing projection whose metadata must carry the plan SHA-256 and transcript revision. Never invent timestamps, hook wording, evidence, or candidate quality to meet a requested clip count.
 
-| Layer | Resource | Purpose |
-|-------|----------|---------|
-| Schema | `schemas/artifacts/script.schema.json` | Artifact validation |
-| Prior artifact | `state.artifacts["idea"]["brief"]` | Batch goals and platform targets |
-| Tools | `transcriber`, `scene_detect` | Transcript-first selection and visual checks |
+## Four-pass process
 
-## Process
+1. **Transcribe and normalize.** Transcribe the full source, retain the source transcript revision and timing evidence, and use scene detection only to check promising boundaries.
+2. **Find and validate moments.** Build candidates from transcript evidence. Every spoken hook must match verbatim source text and carry source spans. Run the five-point cold-viewer audit: subject grounded, entities resolved, pronouns resolved, premise-to-payoff complete, and qualifiers preserved. Consider acoustic and silence evidence without fabricating certainty.
+3. **Evaluate and select.** Rank valid, eligible candidates for editorial value and diversity. Apply duplicate and duration rules. A target count is a goal, never a reason to pad weak or invalid clips. If none pass, return the honest rejection/deferred dossier and no dummy script.
+4. **Emit synchronized provisional artifacts.** Use `clip_selector` to create `clip_selection_plan.json` and a provisional `script.json`. Verify the script's `clip_selection_plan_sha256`, transcript revision, selected IDs, and section timestamps match the plan.
 
-### 1. Transcribe The Full Source
+## Dual-artifact human gate lifecycle (ADR-002)
 
-Use `transcriber` first. The transcript is the search surface for hooks, not an afterthought.
+At `awaiting_human` with `human_approved=False`, write both artifacts: the authoritative plan and the provisional script (`metadata.approval_status="provisional"`). Present the selected, rejected, and deferred candidates and explain any zero-quota result. Then **end the turn** and wait for explicit human decisions.
 
-Use `scene_detect` only to sanity-check visual boundaries, speaker changes, or slide changes near promising moments.
+After explicit approval or edits, call `finalize_approved_selection()` with the user's decisions. Approve only valid and eligible candidates; for boundary revisions, preserve the prior boundary in provenance, set `transformation="human_adjusted"`, and mark provenance human-reviewed. Rejects must remain out of the approved script. Verify the resulting hash and section-to-plan sync, write the updated plan and approved script, then write the script checkpoint as `completed` with `human_approved=True`. Only then may the pipeline advance to `scene_plan`.
 
-### 2. Score Candidate Moments
+## Quality gate
 
-Use the brief's ranking criteria and evaluate each moment on:
-
-- `hook`
-- `coherence`
-- `value`
-- `energy`
-- `platform_fit`
-
-This mirrors the way modern clipping products talk about virality and clip quality, while keeping the judgment transparent.
-
-### 3. Apply The Standalone Test
-
-Every approved clip must make sense to a cold viewer.
-
-Reject or widen clips that contain:
-
-- unresolved pronouns,
-- references to earlier context,
-- long lead-ins before the point lands,
-- endings that stop before the payoff.
-
-### 4. Select The Final Batch
-
-Pick the smallest set that best satisfies the batch goal.
-
-Maintain diversity across:
-
-- source sections,
-- speakers,
-- clip families,
-- energy levels.
-
-### 5. Use Metadata For Ranking Truth
-
-The script schema is small, so store the richer batch analysis in `script.metadata`.
-
-Recommended metadata keys:
-
-- `candidate_clips`
-- `selected_clip_ids`
-- `ranking_model`
-- `rejected_candidates`
-- `source_coverage_map`
-- `platform_assignments`
-
-Each candidate should record:
-
-- source in/out,
-- hook text,
-- reason selected or rejected,
-- scoring dimensions,
-- likely crop viability.
-
-### 6. Quality Gate
-
-- the top-ranked clips are genuinely the strongest, not just the earliest found,
-- every selected clip passes the standalone test,
-- the set covers the source deliberately instead of clustering in one section,
-- low-quality candidates are rejected honestly.
-
-### Mid-Production Fact Verification
-
-If you encounter uncertainty during script writing:
-- Use `web_search` to verify factual claims before committing them to the script
-- Use `web_search` to find reference images for visual accuracy
-- Log verification in the decision log: `category="visual_accuracy_check"`
-
-Every factual claim in the script should be traceable to the `research_brief`.
-If you make a claim that isn't in the research, do additional research and
-add the source. Do not invent statistics, dates, or attributions.
-
-## Common Pitfalls
-
-- Trusting first-pass candidate timestamps without transcript-level review.
-- Selecting too many calm, same-energy clips.
-- Preserving chronological order instead of ranking by quality.
-- Treating transcript quality issues as minor when they affect selection accuracy.
-
----
-
-## Gate Reminder (Binding)
-
-This stage gates on human approval (`human_approval_default: true`). After review passes:
-checkpoint with `status="awaiting_human"`, present the summary (the Backlot board renders
-the artifact), and **END YOUR TURN**. Do not start the next stage in the same response.
-Approval is per-gate — an earlier "go ahead" does not cover this gate.
+- Spoken-hook evidence is verbatim, source-spanned, and inside the candidate window.
+- Each selected moment passes all five cold-viewer checks.
+- Script sections and plan candidate IDs, boundaries, transcript revision, and SHA-256 agree.
+- No quota padding, invented evidence, or fabricated timing confidence.

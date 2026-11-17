@@ -233,6 +233,7 @@ ARTIFACT_FILES = {
     "brief": "brief.json",
     "proposal_packet": "proposal_packet.json",
     "script": "script.json",
+    "clip_selection_plan": "clip_selection_plan.json",
     "scene_plan": "scene_plan.json",
     "asset_manifest": "asset_manifest.json",
     "edit_decisions": "edit_decisions.json",
