@@ -16,6 +16,7 @@ from typing import Any, Literal, Optional, Sequence
 
 from lib.media_profiles import MediaProfile, get_profile
 from lib.models.clip_plan import ClipSelectionPlan
+from lib.subtitle_styles import get_subtitle_style
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,8 @@ class VerticalRenderConfig:
     max_chars_per_line: int = 32
     crf: int = 20
     codec: str = "libx264"
+    style_preset: Optional[str] = None
+    fonts_dir: Optional[str] = None
 
     def __post_init__(self) -> None:
         get_profile(self.profile_name)
@@ -57,6 +60,10 @@ class VerticalRenderConfig:
             raise ValueError("codec and font_name must be non-empty")
         if not isinstance(self.burn_subtitles, bool):
             raise ValueError("burn_subtitles must be a boolean")
+        if self.style_preset is not None:
+            get_subtitle_style(self.style_preset)
+        if self.fonts_dir is not None and (not isinstance(self.fonts_dir, str) or not self.fonts_dir.strip()):
+            raise ValueError("fonts_dir must be a non-empty path string when provided")
 
 
 @dataclass(frozen=True)
@@ -209,6 +216,11 @@ class VerticalClipComposer:
             end = self._finite_time(end_seconds, "end_seconds")
             if end <= start:
                 raise ValueError("end_seconds must be greater than start_seconds")
+            fonts_directory: Optional[Path] = None
+            if config.fonts_dir is not None:
+                fonts_directory = Path(config.fonts_dir).expanduser()
+                if not fonts_directory.is_dir():
+                    raise ValueError(f"fonts_dir is not an existing directory: {fonts_directory}")
             duration = end - start
             if profile.max_duration_seconds is not None and duration > profile.max_duration_seconds:
                 warnings.append(
@@ -264,16 +276,37 @@ class VerticalClipComposer:
                         "segments": list(transcript_segments), "format": config.subtitle_format,
                         "clip_start_seconds": start, "clip_end_seconds": end,
                         "output_path": str(subtitle_path), "highlight_style": config.highlight_style,
-                        "max_words_per_cue": config.max_words_per_cue,
-                        "max_chars_per_line": config.max_chars_per_line,
                     }
+                    if config.style_preset is None:
+                        subtitle_inputs.update({
+                            "max_words_per_cue": config.max_words_per_cue,
+                            "max_chars_per_line": config.max_chars_per_line,
+                        })
+                    else:
+                        subtitle_inputs["style_preset"] = config.style_preset
+                        # The config's historical values are its defaults; omit them so the preset
+                        # supplies its designer values. Non-default caller choices remain explicit.
+                        for key, current, default in (
+                            ("max_words_per_cue", config.max_words_per_cue, 6),
+                            ("max_chars_per_line", config.max_chars_per_line, 32),
+                            ("font_name", config.font_name, "Noto Sans Devanagari"),
+                            ("font_size", config.font_size, 64),
+                            ("margin_v", config.margin_v, 320),
+                            ("margin_l", config.margin_l, 80),
+                            ("margin_r", config.margin_r, 120),
+                        ):
+                            if current != default:
+                                subtitle_inputs[key] = current
                     if config.subtitle_format == "ass":
                         subtitle_inputs.update({
                             "play_res_x": profile.width, "play_res_y": profile.height,
-                            "font_name": config.font_name, "font_size": config.font_size,
-                            "margin_v": config.margin_v, "margin_l": config.margin_l,
-                            "margin_r": config.margin_r,
                         })
+                        if config.style_preset is None:
+                            subtitle_inputs.update({
+                                "font_name": config.font_name, "font_size": config.font_size,
+                                "margin_v": config.margin_v, "margin_l": config.margin_l,
+                                "margin_r": config.margin_r,
+                            })
                     subtitle_result = self._get_subtitle_gen().execute(subtitle_inputs)
                     if not subtitle_result.success:
                         raise RuntimeError(subtitle_result.error or "SubtitleGen failed")
@@ -287,6 +320,9 @@ class VerticalClipComposer:
                     escaped_subtitle = self._escape_filter_path(subtitle_path)
                     filter_name = "ass" if config.subtitle_format == "ass" else "subtitles"
                     vf = f"{filter_name}='{escaped_subtitle}'"
+                    if fonts_directory is not None and config.subtitle_format == "ass":
+                        escaped_fonts = self._escape_filter_path(fonts_directory)
+                        vf = f"ass='{escaped_subtitle}':fontsdir='{escaped_fonts}'"
                     render_tmp = work / "final.mp4"
                     command = [
                         "ffmpeg", "-y", "-i", str(reframed_source),

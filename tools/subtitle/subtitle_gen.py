@@ -10,6 +10,8 @@ import copy
 from pathlib import Path
 from typing import Any, Sequence
 
+from lib.subtitle_styles import SubtitleStylePreset, get_subtitle_style, list_subtitle_styles
+
 from tools.base_tool import (
     BaseTool,
     Determinism,
@@ -166,6 +168,10 @@ class SubtitleGen(BaseTool):
                     "Example: {\"cloud\": \"Claude\", \"co-pilot\": \"Copilot\"}."
                 ),
             },
+            "style_preset": {
+                "type": "string", "enum": list(list_subtitle_styles()),
+                "description": "Optional offline ASS designer style preset.",
+            },
         },
     }
 
@@ -173,7 +179,7 @@ class SubtitleGen(BaseTool):
     idempotency_key_fields = [
         "segments", "format", "max_words_per_cue", "max_chars_per_line", "highlight_style",
         "clip_start_seconds", "clip_end_seconds", "play_res_x", "play_res_y", "font_name",
-        "font_size", "margin_v", "margin_l", "margin_r", "corrections",
+        "font_size", "margin_v", "margin_l", "margin_r", "corrections", "style_preset",
     ]
     side_effects = ["writes subtitle file to output_path"]
     user_visible_verification = [
@@ -189,6 +195,14 @@ class SubtitleGen(BaseTool):
         output_path = inputs.get("output_path")
         corrections = inputs.get("corrections")
         warnings: list[str] = []
+        style_preset_name = inputs.get("style_preset")
+        try:
+            preset = get_subtitle_style(style_preset_name) if style_preset_name is not None else None
+        except ValueError as exc:
+            return ToolResult(success=False, error=str(exc))
+        if preset is not None:
+            max_words = inputs.get("max_words_per_cue", preset.max_words_per_cue)
+            max_chars = inputs.get("max_chars_per_line", preset.max_chars_per_line)
 
         start = time.time()
 
@@ -223,9 +237,12 @@ class SubtitleGen(BaseTool):
             content = self._render_ass(
                 cues, effective_highlight_style,
                 play_res_x=inputs.get("play_res_x", 1080), play_res_y=inputs.get("play_res_y", 1920),
-                font_name=inputs.get("font_name", "Noto Sans Devanagari"),
-                font_size=inputs.get("font_size", 64), margin_v=inputs.get("margin_v", 320),
-                margin_l=inputs.get("margin_l", 80), margin_r=inputs.get("margin_r", 120),
+                font_name=inputs.get("font_name", preset.font_name if preset else "Noto Sans Devanagari"),
+                font_size=inputs.get("font_size", preset.font_size if preset else 64),
+                margin_v=inputs.get("margin_v", preset.margin_v if preset else 320),
+                margin_l=inputs.get("margin_l", preset.margin_l if preset else 80),
+                margin_r=inputs.get("margin_r", preset.margin_r if preset else 120),
+                preset=preset,
             )
             ext = ".ass"
         else:
@@ -239,15 +256,18 @@ class SubtitleGen(BaseTool):
 
         elapsed = time.time() - start
 
+        data = {
+            "format": fmt,
+            "cue_count": len(cues),
+            "output": str(out),
+            "warnings": warnings,
+            "effective_highlight_style": effective_highlight_style,
+        }
+        if style_preset_name is not None:
+            data["style_preset"] = style_preset_name
         return ToolResult(
             success=True,
-            data={
-                "format": fmt,
-                "cue_count": len(cues),
-                "output": str(out),
-                "warnings": warnings,
-                "effective_highlight_style": effective_highlight_style,
-            },
+            data=data,
             artifacts=[str(out)],
             duration_seconds=round(elapsed, 2),
         )
@@ -451,6 +471,7 @@ class SubtitleGen(BaseTool):
         play_res_x: int = 1080, play_res_y: int = 1920,
         font_name: str = "Noto Sans Devanagari", font_size: int = 64,
         margin_v: int = 320, margin_l: int = 80, margin_r: int = 120,
+        preset: SubtitleStylePreset | None = None,
     ) -> str:
         values = (play_res_x, play_res_y, font_size, margin_v, margin_l, margin_r)
         if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
@@ -467,8 +488,13 @@ class SubtitleGen(BaseTool):
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
             "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
             "Alignment, MarginL, MarginR, MarginV, Encoding",
-            f"Style: Default,{safe_font},{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
-            f"-1,0,0,0,100,100,0,0,1,4,2,2,{margin_l},{margin_r},{margin_v},1",
+            (f"Style: Default,{safe_font},{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
+             f"-1,0,0,0,100,100,0,0,1,4,2,2,{margin_l},{margin_r},{margin_v},1")
+            if preset is None else
+            (f"Style: Default,{safe_font},{font_size},{preset.primary_color},{preset.secondary_color},"
+             f"{preset.outline_color},{preset.back_color},{-1 if preset.bold else 0},{-1 if preset.italic else 0},"
+             f"0,0,100,100,0,0,{preset.border_style},{preset.outline:g},{preset.shadow:g},"
+             f"{preset.alignment},{margin_l},{margin_r},{margin_v},1"),
             "", "[Events]",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
         ]
@@ -478,24 +504,60 @@ class SubtitleGen(BaseTool):
                 return ""
             return (f"Dialogue: 0,{self._ts_ass(start)},{self._ts_ass(end)},Default,,0,0,0,,{text}")
 
+        def display(value: Any) -> str:
+            raw = str(value)
+            if preset is not None and preset.uppercase:
+                raw = raw.upper()
+            return self._escape_ass_text(raw)
+
+        def with_glow(text: str) -> str:
+            if preset is not None and preset.glow_blur > 0:
+                return f"{{\\blur{preset.glow_blur:g}}}{text}"
+            return text
+
         for cue in cues:
             words = cue.get("words") or []
             if highlight_style == "word_by_word" and words:
                 for word in words:
-                    text = self._escape_ass_text(word.get("word", ""))
+                    text = with_glow(display(word.get("word", "")))
                     row = dialogue(word["start"], word["end"], text)
                     if row:
                         lines.append(row)
                 continue
             if highlight_style == "karaoke" and words:
+                if preset is not None and preset.active_word_mode == "none":
+                    row = dialogue(cue["start"], cue["end"], with_glow(display(cue.get("text", ""))))
+                    if row:
+                        lines.append(row)
+                    continue
+                if preset is not None and preset.active_word_mode in ("active_pop", "active_color"):
+                    active_bgr = f"&H{preset.secondary_color[4:]}"
+                    reset_tag = f"{{\\r\\blur{preset.glow_blur:g}}}" if preset.glow_blur > 0 else "{\\r}"
+                    for active_index, active_word in enumerate(words):
+                        pieces = []
+                        for word_index, word in enumerate(words):
+                            word_text = display(word.get("word", ""))
+                            if word_index == active_index:
+                                tag = f"{{\\c{active_bgr}&"
+                                if preset.active_word_mode == "active_pop":
+                                    tag += (f"\\t(0,80,\\fscx{preset.pop_scale_percent}\\fscy{preset.pop_scale_percent})"
+                                            "\\t(80,180,\\fscx100\\fscy100)")
+                                if preset.glow_blur > 0:
+                                    tag += f"\\blur{preset.glow_blur:g}"
+                                word_text = f"{tag}}}{word_text}{reset_tag}"
+                            pieces.append(word_text)
+                        row = dialogue(active_word["start"], active_word["end"], with_glow(" ".join(pieces)))
+                        if row:
+                            lines.append(row)
+                    continue
                 pieces = []
                 for word in words:
-                    word_text = self._escape_ass_text(word.get("word", ""))
+                    word_text = display(word.get("word", ""))
                     duration_cs = max(0, int(round((word["end"] - word["start"]) * 100)))
                     pieces.append(f"{{\\kf{duration_cs}}}{word_text}")
-                text = " ".join(pieces)
+                text = with_glow(" ".join(pieces))
             else:
-                text = self._escape_ass_text(cue.get("text", ""))
+                text = with_glow(display(cue.get("text", "")))
             row = dialogue(cue["start"], cue["end"], text)
             if row:
                 lines.append(row)
