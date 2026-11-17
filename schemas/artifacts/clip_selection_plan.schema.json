@@ -1,0 +1,503 @@
+{
+  "$defs": {
+    "CandidateClip": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_id": {
+          "title": "Candidate Id",
+          "type": "string"
+        },
+        "start_seconds": {
+          "minimum": 0,
+          "title": "Start Seconds",
+          "type": "number"
+        },
+        "end_seconds": {
+          "minimum": 0,
+          "title": "End Seconds",
+          "type": "number"
+        },
+        "duration_seconds": {
+          "minimum": 0,
+          "title": "Duration Seconds",
+          "type": "number"
+        },
+        "start_provenance": {
+          "$ref": "#/$defs/TimestampProvenance"
+        },
+        "end_provenance": {
+          "$ref": "#/$defs/TimestampProvenance"
+        },
+        "validation_state": {
+          "default": "VALID",
+          "enum": [
+            "VALID",
+            "INVALID_TIMESTAMPS",
+            "INVALID_HOOK_PROVENANCE",
+            "SCHEMA_ERROR"
+          ],
+          "title": "Validation State",
+          "type": "string"
+        },
+        "eligibility_state": {
+          "default": "ELIGIBLE",
+          "enum": [
+            "ELIGIBLE",
+            "REJECTED_COLD_VIEWER",
+            "REJECTED_INCOMPLETE_THOUGHT",
+            "REJECTED_DURATION_OUT_OF_BOUNDS",
+            "REJECTED_MEDIA_QUALITY",
+            "DEFERRED_DUPLICATE"
+          ],
+          "title": "Eligibility State",
+          "type": "string"
+        },
+        "review_state": {
+          "default": "PENDING_REVIEW",
+          "enum": [
+            "PENDING_REVIEW",
+            "SELECTED_FOR_REVIEW",
+            "AWAITING_HUMAN",
+            "HUMAN_APPROVED",
+            "HUMAN_REJECTED",
+            "HUMAN_REVISED"
+          ],
+          "title": "Review State",
+          "type": "string"
+        },
+        "production_state": {
+          "default": "NOT_STARTED",
+          "enum": [
+            "NOT_STARTED",
+            "PLANNED",
+            "ASSETS_READY",
+            "RENDERED",
+            "QA_PASSED",
+            "QA_FAILED",
+            "EXPORTED"
+          ],
+          "title": "Production State",
+          "type": "string"
+        },
+        "original_spoken_dialogue": {
+          "title": "Original Spoken Dialogue",
+          "type": "string"
+        },
+        "spoken_opening": {
+          "title": "Spoken Opening",
+          "type": "string"
+        },
+        "spoken_opening_spans": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SourceSpan"
+          },
+          "title": "Spoken Opening Spans",
+          "type": "array"
+        },
+        "spoken_hook": {
+          "$ref": "#/$defs/SpokenHookEvidence"
+        },
+        "editorial_title": {
+          "title": "Editorial Title",
+          "type": "string"
+        },
+        "editorial_framing": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Editorial Framing"
+        },
+        "cold_viewer_audit": {
+          "$ref": "#/$defs/ColdViewerAudit"
+        },
+        "editorial_scores": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EditorialCriterionScore"
+          },
+          "title": "Editorial Scores",
+          "type": "array"
+        },
+        "human_reviewed_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Human Reviewed At"
+        },
+        "review_metadata": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Review Metadata"
+        },
+        "rejection_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rejection Reason"
+        },
+        "duplicate_of_candidate_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duplicate Of Candidate Id"
+        }
+      },
+      "required": [
+        "candidate_id",
+        "start_seconds",
+        "end_seconds",
+        "duration_seconds",
+        "original_spoken_dialogue",
+        "spoken_opening",
+        "spoken_hook",
+        "editorial_title",
+        "cold_viewer_audit"
+      ],
+      "title": "CandidateClip",
+      "type": "object"
+    },
+    "ColdViewerAudit": {
+      "additionalProperties": false,
+      "properties": {
+        "subject_grounded": {
+          "title": "Subject Grounded",
+          "type": "boolean"
+        },
+        "entities_resolved": {
+          "title": "Entities Resolved",
+          "type": "boolean"
+        },
+        "pronouns_resolved": {
+          "title": "Pronouns Resolved",
+          "type": "boolean"
+        },
+        "premise_to_payoff_complete": {
+          "title": "Premise To Payoff Complete",
+          "type": "boolean"
+        },
+        "qualifiers_preserved": {
+          "title": "Qualifiers Preserved",
+          "type": "boolean"
+        },
+        "passed": {
+          "title": "Passed",
+          "type": "boolean"
+        },
+        "notes": {
+          "default": "",
+          "title": "Notes",
+          "type": "string"
+        },
+        "context_expansion_applied": {
+          "default": false,
+          "title": "Context Expansion Applied",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "subject_grounded",
+        "entities_resolved",
+        "pronouns_resolved",
+        "premise_to_payoff_complete",
+        "qualifiers_preserved",
+        "passed"
+      ],
+      "title": "ColdViewerAudit",
+      "type": "object"
+    },
+    "EditorialCriterionScore": {
+      "additionalProperties": false,
+      "properties": {
+        "dimension": {
+          "title": "Dimension",
+          "type": "string"
+        },
+        "rationale": {
+          "title": "Rationale",
+          "type": "string"
+        },
+        "score": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Score"
+        }
+      },
+      "required": [
+        "dimension",
+        "rationale"
+      ],
+      "title": "EditorialCriterionScore",
+      "type": "object"
+    },
+    "SourceSpan": {
+      "additionalProperties": false,
+      "properties": {
+        "transcript_revision_id": {
+          "title": "Transcript Revision Id",
+          "type": "string"
+        },
+        "segment_id": {
+          "minimum": 0,
+          "title": "Segment Id",
+          "type": "integer"
+        },
+        "coordinate_system": {
+          "const": "unicode_codepoint_half_open",
+          "default": "unicode_codepoint_half_open",
+          "title": "Coordinate System",
+          "type": "string"
+        },
+        "char_start": {
+          "minimum": 0,
+          "title": "Char Start",
+          "type": "integer"
+        },
+        "char_end": {
+          "minimum": 0,
+          "title": "Char End",
+          "type": "integer"
+        },
+        "gap_before": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gap Before"
+        }
+      },
+      "required": [
+        "transcript_revision_id",
+        "segment_id",
+        "char_start",
+        "char_end"
+      ],
+      "title": "SourceSpan",
+      "type": "object"
+    },
+    "SpokenHookEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "speaker": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Speaker"
+        },
+        "source_spans": {
+          "items": {
+            "$ref": "#/$defs/SourceSpan"
+          },
+          "minItems": 1,
+          "title": "Source Spans",
+          "type": "array"
+        }
+      },
+      "required": [
+        "text",
+        "source_spans"
+      ],
+      "title": "SpokenHookEvidence",
+      "type": "object"
+    },
+    "TimestampProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "timing_source": {
+          "default": "unknown",
+          "enum": [
+            "creator_caption",
+            "auto_caption",
+            "asr_segment",
+            "asr_word",
+            "vad_region",
+            "unknown"
+          ],
+          "title": "Timing Source",
+          "type": "string"
+        },
+        "alignment_method": {
+          "default": "none",
+          "enum": [
+            "none",
+            "caption_container",
+            "asr_cross_attention",
+            "forced_alignment_ctc",
+            "vad_energy_or_neural",
+            "character_interpolation",
+            "human_manual"
+          ],
+          "title": "Alignment Method",
+          "type": "string"
+        },
+        "evidence_quality": {
+          "default": "unknown",
+          "enum": [
+            "high_subframe",
+            "medium_word",
+            "coarse_segment",
+            "low_estimated",
+            "unknown"
+          ],
+          "title": "Evidence Quality",
+          "type": "string"
+        },
+        "transformation": {
+          "default": "raw_unmodified",
+          "enum": [
+            "raw_unmodified",
+            "silence_proximity_adjusted",
+            "vad_onset_offset_adjusted",
+            "editorial_context_expanded",
+            "human_adjusted"
+          ],
+          "title": "Transformation",
+          "type": "string"
+        },
+        "uncertainty_seconds": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Uncertainty Seconds"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confidence"
+        },
+        "human_reviewed": {
+          "default": false,
+          "title": "Human Reviewed",
+          "type": "boolean"
+        },
+        "original_seconds": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Original Seconds"
+        }
+      },
+      "title": "TimestampProvenance",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": "1.0",
+      "title": "Version",
+      "type": "string"
+    },
+    "project_id": {
+      "title": "Project Id",
+      "type": "string"
+    },
+    "source_media_ref": {
+      "title": "Source Media Ref",
+      "type": "string"
+    },
+    "transcript_revision_id": {
+      "title": "Transcript Revision Id",
+      "type": "string"
+    },
+    "generated_at": {
+      "title": "Generated At",
+      "type": "string"
+    },
+    "candidates": {
+      "items": {
+        "$ref": "#/$defs/CandidateClip"
+      },
+      "title": "Candidates",
+      "type": "array"
+    }
+  },
+  "required": [
+    "version",
+    "project_id",
+    "source_media_ref",
+    "transcript_revision_id",
+    "generated_at",
+    "candidates"
+  ],
+  "title": "ClipSelectionPlan",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/artifacts/clip_selection_plan"
+}
