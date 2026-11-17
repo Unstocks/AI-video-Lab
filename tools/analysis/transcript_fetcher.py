@@ -105,7 +105,7 @@ class TranscriptFetcher(BaseTool):
         cpu_cores=1, ram_mb=256, vram_mb=0, disk_mb=10,
         network_required=True,
     )
-    idempotency_key_fields = ["url_or_video_id", "languages"]
+    idempotency_key_fields = ["url_or_video_id", "languages", "include_auto_generated"]
     side_effects = []
     fallback = "transcriber"
     user_visible_verification = [
@@ -142,8 +142,25 @@ class TranscriptFetcher(BaseTool):
 
             ytt = YouTubeTranscriptApi()
 
-            # Fetch transcript using the instance-based API (v1.0+)
-            transcript_result = ytt.fetch(video_id, languages=languages)
+            transcript_list = ytt.list(video_id)
+            available = list(transcript_list)
+            selected = None
+            for language in languages:
+                selected = next((t for t in available if t.language_code == language and not t.is_generated), None)
+                if selected:
+                    break
+            if selected is None and include_auto:
+                for language in languages:
+                    selected = next((t for t in available if t.language_code == language), None)
+                    if selected:
+                        break
+            if selected is None:
+                selected = next((t for t in available if not t.is_generated), None)
+            if selected is None and include_auto and available:
+                selected = available[0]
+            if selected is None:
+                return ToolResult(success=False, error="No captions match the requested language and auto-caption policy.", data={"video_id": video_id})
+            transcript_result = selected.fetch()
 
             # Build segments and full text from snippets
             segments = []

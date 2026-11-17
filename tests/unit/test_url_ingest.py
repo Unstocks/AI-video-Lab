@@ -38,7 +38,9 @@ def adapter(tmp_path):
     """Create URLIntakeAdapter pointing to a temporary projects directory."""
     projects_dir = tmp_path / "projects"
     projects_dir.mkdir(parents=True, exist_ok=True)
-    return URLIntakeAdapter(projects_dir=projects_dir)
+    instance = URLIntakeAdapter(projects_dir=projects_dir)
+    instance._resolve_host = lambda host: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0))]
+    return instance
 
 
 @pytest.fixture
@@ -90,7 +92,9 @@ def test_validate_project_id_invalid(adapter):
 def test_validate_url_schemes(adapter):
     """Only http and https are allowed."""
     assert adapter.validate_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-    assert adapter.validate_url("http://vimeo.com/123456789")
+    assert adapter.validate_url("https://vimeo.com/123456789")
+    with pytest.raises(URLValidationError, match="HTTPS is required"):
+        adapter.validate_url("http://vimeo.com/123456789")
 
     invalid_schemes = [
         "file:///etc/passwd",
@@ -119,26 +123,226 @@ def test_validate_url_domains(adapter):
 
 def test_validate_url_ssrf_blocking(adapter):
     """Private, loopback, and link-local destinations must be blocked."""
-    with patch("socket.getaddrinfo") as mock_dns:
+    with patch.object(adapter, "_resolve_host") as mock_dns:
         # Loopback IPv4
         mock_dns.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
         with pytest.raises(URLValidationError, match="Blocked loopback"):
             adapter.validate_url("https://www.youtube.com/watch?v=123")
 
-        # Private RFC 1918
-        mock_dns.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.100", 0))]
-        with pytest.raises(URLValidationError, match="Blocked private network"):
+
+def test_validate_url_dns_failure_is_closed(adapter):
+    with patch.object(adapter, "_resolve_host", side_effect=socket.gaierror("offline")):
+        with pytest.raises(URLValidationError, match="Could not resolve"):
             adapter.validate_url("https://www.youtube.com/watch?v=123")
 
-        # Link-local cloud metadata
-        mock_dns.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 0))]
-        with pytest.raises(URLValidationError, match="Blocked link-local"):
-            adapter.validate_url("https://www.youtube.com/watch?v=123")
 
-        # Loopback IPv6
-        mock_dns.return_value = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0))]
-        with pytest.raises(URLValidationError, match="Blocked loopback"):
-            adapter.validate_url("https://www.youtube.com/watch?v=123")
+def test_transactional_commit_rolls_back_and_removes_stale_transcript(tmp_path):
+    from lib.url_ingest import URLIntakeAdapter
+    video = tmp_path / "source_video.mp4"
+    transcript = tmp_path / "transcript.json"
+    video.write_text("old")
+    transcript.write_text("stale")
+    new_video = tmp_path / "new.mp4"
+    new_video.write_text("new")
+    new_audio = tmp_path / "new.wav"
+    new_audio.write_text("audio")
+    real_replace = __import__("os").replace
+    calls = {"n": 0}
+    def fail_midway(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 4:
+            raise OSError("simulated locked file")
+        return real_replace(src, dst)
+    with patch("lib.url_ingest.os.replace", side_effect=fail_midway):
+        with pytest.raises(OSError):
+            URLIntakeAdapter._commit_bundle({video: new_video, tmp_path / "source_audio.wav": new_audio, transcript: None})
+    assert video.read_text() == "old"
+    assert transcript.read_text() == "stale"
+    new_video.write_text("new")
+    new_audio.write_text("audio")
+    URLIntakeAdapter._commit_bundle({video: new_video, tmp_path / "source_audio.wav": new_audio, transcript: None})
+    assert video.read_text() == "new"
+    assert not transcript.exists()
+
+
+def test_transient_download_retry_is_bounded(adapter):
+    assert adapter._transient_error("connection reset")
+    assert not adapter._transient_error("unsupported format")
+
+
+@pytest.mark.parametrize("duration", [0, -1, 9999])
+def test_post_probe_duration_validation_and_staging_cleanup(adapter, sample_video_path, duration):
+    tool = MagicMock()
+    tool.execute.side_effect = [
+        ToolResult(success=True, data={"metadata": {"duration": 1}}),
+        ToolResult(success=True, data={"video_path": str(sample_video_path), "audio_path": None}),
+    ]
+    with patch.object(adapter, "validate_url", return_value="https://www.youtube.com/watch?v=mock1234567"), patch("lib.url_ingest.registry") as reg:
+        reg.get.side_effect = lambda name: tool if name == "video_downloader" else None
+        reg.ensure_discovered.return_value = None
+        adapter.extract_audio_fallback = lambda src, dst: (dst.write_bytes(b"audio") or dst)
+        original_probe = adapter.probe_media_file
+        def probe(path):
+            if Path(path).name == "source_audio.wav":
+                return {"streams": [{"codec_type":"audio", "codec_name":"pcm_s16le", "sample_rate":"16000", "channels":1}]}
+            return {"format":{"duration":str(duration)}, "streams":[{"codec_type":"video", "codec_name":"h264", "width":1,"height":1}]}
+        adapter.ensure_valid_mp4 = lambda src, dst: (shutil.copy2(src, dst) and dst)
+        adapter.probe_media_file = probe
+        result = adapter.ingest_url("https://www.youtube.com/watch?v=mock1234567", "duration-check")
+    assert not result.success
+    assert not list((adapter.projects_dir / "duration-check" / "source").glob(".staging_*"))
+
+
+def test_url_intake_tool_discovery_and_pipeline_propagation(adapter, sample_video_path):
+    from tools.analysis.url_intake import URLIntake
+    from tools.tool_registry import ToolRegistry
+    tool = URLIntake()
+    assert tool.name == "url_intake"
+    assert tool.get_status() is not None
+    assert ToolRegistry is not None
+    adapter.pipeline_type = "podcast-repurpose"
+    assert adapter.pipeline_type == "podcast-repurpose"
+
+
+def test_transcript_fetcher_prefers_manual_language_and_respects_auto_flag(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from tools.analysis.transcript_fetcher import TranscriptFetcher
+    class Track:
+        def __init__(self, code, generated):
+            self.language_code, self.is_generated, self.language = code, generated, code
+        def fetch(self):
+            return SimpleNamespace(snippets=[SimpleNamespace(text=self.language_code, start=0, duration=1)], is_generated=self.is_generated, language=self.language_code)
+    tracks = [Track("en", True), Track("hi", False)]
+    class API:
+        def list(self, _video_id): return tracks
+    monkeypatch.setitem(sys.modules, "youtube_transcript_api", SimpleNamespace(YouTubeTranscriptApi=API))
+    tool = TranscriptFetcher()
+    preferred = tool.execute({"url_or_video_id":"abcdefghijk", "languages":["en", "hi"]})
+    assert preferred.success and preferred.data["language"] == "hi" and not preferred.data["is_auto_generated"]
+    tracks[:] = [Track("en", True)]
+    excluded = tool.execute({"url_or_video_id":"abcdefghijk", "languages":["en"], "include_auto_generated":False})
+    assert not excluded.success
+
+
+def test_video_downloader_allowed_extractors_are_opt_in(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+    from tools.analysis.video_downloader import VideoDownloader
+    opts_seen = []
+    class YDL:
+        def __init__(self, opts): opts_seen.append(opts)
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def extract_info(self, *_args, **_kwargs): return {"duration":10}
+        def download(self, _urls): return None
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=YDL))
+    downloader = VideoDownloader()
+    downloader._extract_metadata("https://example.com/video")
+    downloader._extract_metadata("https://youtube.com/watch?v=abcdefghijk", ["youtube", "vimeo"])
+    assert "allowed_extractors" not in opts_seen[0]
+    assert opts_seen[1]["allowed_extractors"] == ["youtube", "vimeo"]
+    downloader._download_video("https://instagram.com/reel/x", tmp_path, "720p")
+    assert "allowed_extractors" not in opts_seen[-1]
+    downloader._download_video("https://youtube.com/watch?v=abcdefghijk", tmp_path, "720p", ["youtube", "vimeo"])
+    assert opts_seen[-1]["allowed_extractors"] == ["youtube", "vimeo"]
+
+
+def _mock_intake_registry(adapter, mock_downloader):
+    def get_tool(name):
+        return mock_downloader if name == "video_downloader" else None
+    return patch("lib.url_ingest.registry.get", side_effect=get_tool), patch("lib.url_ingest.registry.ensure_discovered")
+
+
+def test_ingest_url_non_wav_audio_triggers_pcm_fallback(adapter, sample_video_path, tmp_path):
+    compressed = tmp_path / "compressed.m4a"
+    subprocess.run(["ffmpeg", "-y", "-i", str(sample_video_path), "-vn", "-c:a", "aac", str(compressed)], check=True, capture_output=True)
+    tool = MagicMock()
+    tool.execute.side_effect = [ToolResult(True, {"metadata":{"duration":1}}), ToolResult(True, {"video_path":str(sample_video_path), "audio_path":str(compressed)})]
+    registry_patch, discover_patch = _mock_intake_registry(adapter, tool)
+    with patch.object(adapter, "validate_url", return_value="https://www.youtube.com/watch?v=mock1234567"), registry_patch, discover_patch:
+        result = adapter.ingest_url("https://youtube.com/watch?v=mock1234567", "nonwav", extract_transcript=False)
+    assert result.success
+    stream = next(s for s in adapter.probe_media_file(Path(result.audio_path))["streams"] if s["codec_type"] == "audio")
+    assert stream["codec_name"] == "pcm_s16le" and stream["sample_rate"] == "16000" and stream["channels"] == 1
+
+
+def test_ingest_url_bounded_retries(adapter, sample_video_path, monkeypatch):
+    monkeypatch.setattr("lib.url_ingest.time.sleep", lambda _: None)
+    url = "https://youtube.com/watch?v=mock1234567"
+    for failures, expected_calls, should_succeed in [
+        (["HTTP Error 503"], 2, True), (["connection reset"] * 3, 3, False), (["private video"], 1, False),
+    ]:
+        tool = MagicMock()
+        calls = {"download":0}
+        def execute(inputs):
+            if inputs["format"] == "metadata_only": return ToolResult(True, {"metadata":{"duration":1}})
+            calls["download"] += 1
+            if calls["download"] <= len(failures): return ToolResult(False, error=failures[calls["download"]-1])
+            return ToolResult(True, {"video_path":str(sample_video_path), "audio_path":None})
+        tool.execute.side_effect = execute
+        registry_patch, discover_patch = _mock_intake_registry(adapter, tool)
+        with patch.object(adapter, "validate_url", return_value=url), registry_patch, discover_patch:
+            result = adapter.ingest_url(url, f"retry-{len(failures)}-{expected_calls}", extract_transcript=False)
+        assert result.success is should_succeed and calls["download"] == expected_calls
+
+
+def test_ingest_url_non_h264_creates_proxy_and_url_intake_artifacts(adapter, tmp_path, monkeypatch):
+    from tools.analysis.url_intake import URLIntake
+    source = tmp_path / "mpeg4.mp4"
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=24", "-f", "lavfi", "-i", "sine=duration=1", "-c:v", "mpeg4", "-c:a", "aac", str(source)], check=True, capture_output=True)
+    tool = MagicMock()
+    tool.execute.side_effect = [ToolResult(True, {"metadata":{"duration":1}}), ToolResult(True, {"video_path":str(source), "audio_path":None})]
+    registry_patch, discover_patch = _mock_intake_registry(adapter, tool)
+    adapter.pipeline_type = "podcast-repurpose"
+    monkeypatch.setattr("tools.analysis.url_intake.URLIntakeAdapter", lambda pipeline_type: adapter)
+    with patch.object(adapter, "validate_url", return_value="https://youtube.com/watch?v=mock1234567"), registry_patch, discover_patch:
+        output = URLIntake().execute({"url":"https://youtube.com/watch?v=mock1234567", "project_id":"proxy-test", "pipeline_type":"podcast-repurpose"})
+    assert output.success
+    master = Path(output.data["video_path"])
+    proxy = master.with_name("source_video_h264.mp4")
+    assert master.is_file() and proxy.is_file()
+    original = next(s for s in adapter.probe_media_file(master)["streams"] if s["codec_type"] == "video")
+    encoded = next(s for s in adapter.probe_media_file(proxy)["streams"] if s["codec_type"] == "video")
+    assert original["codec_name"] == "mpeg4"
+    assert encoded["codec_name"] == "h264" and encoded["pix_fmt"] == "yuv420p"
+    manifest = json.loads(Path(output.data["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["pipeline_type"] == "podcast-repurpose"
+    assert manifest["master_video_path"] and manifest["proxy_video_path"] == str(proxy)
+    assert output.data["proxy_video_path"] == str(proxy) and str(proxy) in output.artifacts
+
+
+def test_url_intake_execute_returns_artifacts_proxy_and_clean_error(monkeypatch, tmp_path):
+    import json
+    from tools.analysis.url_intake import URLIntake
+    from lib.url_ingest import URLIngestResult, URLValidationError
+    source = tmp_path / "source"
+    source.mkdir()
+    video, audio, manifest = source / "v.mp4", source / "a.wav", source / "source_manifest.json"
+    video.write_text("video"); audio.write_text("audio")
+    manifest.write_text(json.dumps({"pipeline_type":"podcast-repurpose", "proxy_video_path":None}))
+    result = URLIngestResult(True, "p", "https://youtube.com", str(video), str(audio), manifest_path=str(manifest))
+    class Adapter:
+        def __init__(self, pipeline_type): assert pipeline_type == "podcast-repurpose"
+        def ingest_url(self, *_args, **_kwargs): return result
+    monkeypatch.setattr("tools.analysis.url_intake.URLIntakeAdapter", Adapter)
+    output = URLIntake().execute({"url":"https://youtube.com", "project_id":"p", "pipeline_type":"podcast-repurpose"})
+    assert output.success and output.data["proxy_video_path"] is None
+    assert set(output.artifacts) == {str(video), str(audio), str(manifest)}
+    class BadAdapter(Adapter):
+        def __init__(self, pipeline_type): pass
+        def ingest_url(self, *_args, **_kwargs): raise URLValidationError("bad url")
+    monkeypatch.setattr("tools.analysis.url_intake.URLIntakeAdapter", BadAdapter)
+    failed = URLIntake().execute({"url":"http://bad", "project_id":"p", "pipeline_type":"clip-factory"})
+    assert not failed.success and failed.error == "bad url"
+
+def test_validate_url_private_and_link_local_blocked(adapter):
+    for address, expected in [("192.168.1.100", "Blocked private network"), ("169.254.169.254", "Blocked link-local"), ("::1", "Blocked loopback")]:
+        family = socket.AF_INET6 if ":" in address else socket.AF_INET
+        entry = (family, socket.SOCK_STREAM, 6, "", (address, 0, 0, 0) if family == socket.AF_INET6 else (address, 0))
+        with patch.object(adapter, "_resolve_host", return_value=[entry]):
+            with pytest.raises(URLValidationError, match=expected):
+                adapter.validate_url("https://www.youtube.com/watch?v=123")
 
 
 # --- 4. Disk Space Headroom Checking ---

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from lib.url_ingest import URLIntakeAdapter, ensure_media_tools_on_path
 from lib.source_media_review import review_source_media
+import pytest
 
 
 def run_smoke_test(
@@ -79,6 +80,18 @@ def run_smoke_test(
         "manifest": manifest,
         "review_artifact": review_art,
     }
+
+
+@pytest.mark.network
+def test_url_intake_smoke():
+    """Opt-in real-network smoke test for public source acquisition."""
+    result = run_smoke_test()
+    assert result["success"], result.get("error")
+
+
+def test_url_intake_smoke_is_network_gated():
+    """Keep an offline-selected test so pytest exits successfully with -m not network."""
+    assert any(mark.name == "network" for mark in test_url_intake_smoke.pytestmark)
 
 
 if __name__ == "__main__":

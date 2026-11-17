@@ -24,11 +24,9 @@ Per AGENT_GUIDE.md → "Present Both Composition Runtimes (HARD RULE)": do NOT s
 When the user provides a video URL (YouTube, Vimeo) rather than a local file path:
 
 1. **Acquire Source Media via URL Intake Adapter**:
-   Invoke `lib/url_ingest.py` to acquire and normalize the media into `projects/<project-id>/source/`:
+   Invoke the `url_intake` tool to acquire and normalize the media into `projects/<project-id>/source/`:
    ```python
-   from lib.url_ingest import URLIntakeAdapter
-   adapter = URLIntakeAdapter()
-   result = adapter.ingest_url(url, project_id, max_duration_seconds=3600)
+   result = url_intake.execute({"url": url, "project_id": project_id, "pipeline_type": "clip-factory", "max_duration_seconds": 3600, "caption_languages": ["en", "hi"]})
    ```
    This performs protocol validation, SSRF checks, disk headroom verification, media acquisition via `video_downloader`, container normalization to `source_video.mp4`, audio verification with FFmpeg fallback to `source_audio.wav`, native caption extraction to `transcript.json`, and writes `source_manifest.json`.
 

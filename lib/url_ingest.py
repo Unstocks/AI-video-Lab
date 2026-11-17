@@ -113,10 +113,42 @@ class URLIngestResult:
 class URLIntakeAdapter:
     """Adapter for ingesting remote video URLs into OpenMontage projects."""
 
-    def __init__(self, projects_dir: Optional[Path] = None) -> None:
+    def __init__(self, projects_dir: Optional[Path] = None, *, pipeline_type: str = "clip-factory") -> None:
         ensure_media_tools_on_path()
         self.workspace_root = Path(__file__).resolve().parent.parent
         self.projects_dir = projects_dir or (self.workspace_root / "projects")
+        self.pipeline_type = pipeline_type
+
+    @staticmethod
+    def _commit_bundle(files: dict[Path, Optional[Path]]) -> None:
+        backup_dir = next(iter(files)).parent / f".backup_{uuid.uuid4().hex}"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backups: dict[Path, Path] = {}
+        installed: list[Path] = []
+        try:
+            for i, target in enumerate(files):
+                if target.exists():
+                    backup = backup_dir / str(i)
+                    os.replace(target, backup)
+                    backups[target] = backup
+            for target, staged in files.items():
+                if staged is not None:
+                    os.replace(staged, target)
+                    installed.append(target)
+        except Exception:
+            for target in reversed(installed):
+                target.unlink(missing_ok=True)
+            for target, backup in backups.items():
+                if backup.exists():
+                    os.replace(backup, target)
+            raise
+        finally:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+
+    @staticmethod
+    def _transient_error(error: Any) -> bool:
+        value = str(error).lower()
+        return any(x in value for x in ("timeout", "temporarily unavailable", "connection reset", "connection aborted", "http error 5"))
 
     def validate_project_id(self, project_id: str) -> None:
         """Validate project identifier to prevent path traversal."""
@@ -132,9 +164,9 @@ class URLIntakeAdapter:
             raise URLValidationError("URL must be a non-empty string.")
 
         parsed = urlparse(url.strip())
-        if parsed.scheme.lower() not in ("http", "https"):
+        if parsed.scheme.lower() != "https":
             raise URLValidationError(
-                f"Unsupported URL scheme '{parsed.scheme}'. Only 'http' and 'https' are allowed."
+                f"Unsupported URL scheme '{parsed.scheme}'. HTTPS is required."
             )
 
         hostname = (parsed.hostname or "").lower()
@@ -152,7 +184,7 @@ class URLIntakeAdapter:
 
         # Anti-SSRF: Resolve IP addresses and block private/loopback/link-local
         try:
-            addr_info = socket.getaddrinfo(hostname, None)
+            addr_info = self._resolve_host(hostname)
             for item in addr_info:
                 ip_str = item[4][0]
                 ip_obj = ipaddress.ip_address(ip_str)
@@ -164,17 +196,20 @@ class URLIntakeAdapter:
                     raise URLValidationError(f"Blocked private network destination: {ip_str}")
                 if ip_obj.is_reserved or ip_obj.is_multicast:
                     raise URLValidationError(f"Blocked reserved/multicast destination: {ip_str}")
-        except socket.gaierror:
-            # If hostname is an IP literal or offline/sandboxed test environment
+        except socket.gaierror as exc:
             try:
                 ip_obj = ipaddress.ip_address(hostname)
-                if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local:
-                    raise URLValidationError(f"Blocked destination IP: {hostname}")
             except ValueError:
-                # Valid domain name in offline environment, already passed domain whitelist
-                pass
+                raise URLValidationError(f"Could not resolve approved host '{hostname}'.") from exc
+            if not ip_obj.is_global:
+                raise URLValidationError(f"Blocked destination IP: {hostname}") from exc
 
         return url.strip()
+
+    @staticmethod
+    def _resolve_host(hostname: str) -> list:
+        """DNS seam used for deterministic offline validation tests."""
+        return socket.getaddrinfo(hostname, None)
 
     def check_disk_headroom(
         self, output_dir: Path, estimated_duration_seconds: float = 600.0
@@ -304,6 +339,7 @@ class URLIntakeAdapter:
         max_duration_seconds: int = 3600,
         preferred_quality: str = "720p",
         extract_transcript: bool = True,
+        caption_languages: Optional[list[str]] = None,
     ) -> URLIngestResult:
         """Acquire video URL into project source directory with complete validation."""
         self.validate_project_id(project_id)
@@ -330,31 +366,38 @@ class URLIntakeAdapter:
                 "url": validated_url,
                 "output_dir": str(staging_dir),
                 "format": "metadata_only",
+                "allowed_extractors": ["youtube", "vimeo"],
             })
             metadata = meta_res.data.get("metadata", {}) if meta_res.success else {}
             if metadata.get("error"):
                 logger.warning("Metadata extraction warning: %s", metadata.get("error"))
 
             duration = float(metadata.get("duration") or 0.0)
-            if duration and duration > max_duration_seconds:
+            if duration <= 0 or duration > max_duration_seconds:
                 return URLIngestResult(
                     success=False,
                     project_id=project_id,
                     source_url=validated_url,
-                    error=f"Video duration ({duration}s) exceeds max limit ({max_duration_seconds}s).",
+                    error=f"Video metadata duration ({duration}s) is unknown or exceeds max limit ({max_duration_seconds}s).",
                 )
 
             # 2. Check Disk Space Headroom
             self.check_disk_headroom(source_dir, estimated_duration_seconds=duration or 600.0)
 
             # 3. Download Source Media via video_downloader
-            dl_res = video_downloader.execute({
+            dl_inputs = {
                 "url": validated_url,
                 "output_dir": str(staging_dir),
                 "format": "video",
                 "max_resolution": preferred_quality,
                 "max_duration_seconds": max_duration_seconds,
-            })
+                "allowed_extractors": ["youtube", "vimeo"],
+            }
+            for attempt in range(3):
+                dl_res = video_downloader.execute(dl_inputs)
+                if dl_res.success or attempt == 2 or not self._transient_error(dl_res.error):
+                    break
+                time.sleep(0.25 * (2 ** attempt))
             if not dl_res.success:
                 return URLIngestResult(
                     success=False,
@@ -383,7 +426,9 @@ class URLIntakeAdapter:
             if raw_audio_path and Path(raw_audio_path).is_file() and Path(raw_audio_path).stat().st_size > 1024:
                 try:
                     probe = self.probe_media_file(Path(raw_audio_path))
-                    if any(s.get("codec_type") == "audio" for s in probe.get("streams", [])):
+                    stream = next((s for s in probe.get("streams", []) if s.get("codec_type") == "audio"), {})
+                    if (stream.get("codec_name") == "pcm_s16le" and int(stream.get("sample_rate") or 0) == 16000
+                            and int(stream.get("channels") or 0) == 1 and Path(raw_audio_path).suffix.lower() == ".wav"):
                         shutil.copy2(raw_audio_path, staging_audio_wav)
                         audio_valid = True
                 except Exception:
@@ -401,7 +446,7 @@ class URLIntakeAdapter:
                     try:
                         tf_res = transcript_fetcher.execute({
                             "url_or_video_id": validated_url,
-                            "languages": ["en"],
+                            "languages": caption_languages or ["en", "hi"],
                         })
                         if tf_res.success and tf_res.data.get("transcript"):
                             with open(staging_transcript, "w", encoding="utf-8") as f:
@@ -437,21 +482,24 @@ class URLIntakeAdapter:
             height = int(v_stream.get("height") or 0)
             fps = _parse_fps(v_stream.get("r_frame_rate", "0/1"))
             duration_s = float(fmt_data.get("duration") or v_stream.get("duration") or 0.0)
+            if duration_s <= 0 or duration_s > max_duration_seconds:
+                raise MediaIngestionError(
+                    f"Probed duration ({duration_s}s) is unknown or exceeds max limit ({max_duration_seconds}s)."
+                )
             file_size = int(fmt_data.get("size") or staging_video_mp4.stat().st_size)
+            proxy_path = None
+            if v_stream.get("codec_name") != "h264":
+                proxy_path = staging_dir / "source_video_h264.mp4"
+                proxy_cmd = ["ffmpeg", "-y", "-i", str(staging_video_mp4), "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(proxy_path)]
+                proc = subprocess.run(proxy_cmd, capture_output=True, text=True, timeout=600)
+                if proc.returncode or not proxy_path.is_file():
+                    raise MediaIngestionError(f"H.264 editing proxy creation failed: {proc.stderr}")
 
             # 8. Atomic Finalization into projects/<project-id>/source/
             final_video = source_dir / "source_video.mp4"
             final_audio = source_dir / "source_audio.wav"
             final_transcript = source_dir / "transcript.json" if has_native_captions else None
             final_manifest = source_dir / "source_manifest.json"
-
-            # Atomically move files into source_dir
-            if staging_video_mp4.exists():
-                shutil.move(str(staging_video_mp4), str(final_video))
-            if staging_audio_wav.exists():
-                shutil.move(str(staging_audio_wav), str(final_audio))
-            if has_native_captions and staging_transcript.exists():
-                shutil.move(str(staging_transcript), str(final_transcript))
 
             # Build Canonical Manifest
             acquired_timestamp = datetime.now(timezone.utc).isoformat()
@@ -473,12 +521,21 @@ class URLIntakeAdapter:
                 "audio_path": str(final_audio),
                 "transcript_path": str(final_transcript) if has_native_captions else None,
                 "metadata": metadata,
+                "pipeline_type": self.pipeline_type,
+                "master_video_path": str(final_video),
+                "proxy_video_path": str(source_dir / proxy_path.name) if proxy_path else None,
             }
 
             tmp_manifest = final_manifest.with_suffix(".json.tmp")
             with open(tmp_manifest, "w", encoding="utf-8") as f:
                 json.dump(manifest_payload, f, indent=2)
-            os.replace(tmp_manifest, final_manifest)
+            self._commit_bundle({
+                final_video: staging_video_mp4,
+                final_audio: staging_audio_wav,
+                source_dir / "source_video_h264.mp4": proxy_path,
+                source_dir / "transcript.json": staging_transcript if has_native_captions else None,
+                final_manifest: tmp_manifest,
+            })
 
             return URLIngestResult(
                 success=True,
@@ -523,6 +580,6 @@ class URLIntakeAdapter:
         project_dir = self.projects_dir / ingest_result.project_id
         return review_source_media(
             [Path(ingest_result.video_path)],
-            {"project_dir": project_dir, "pipeline_type": "clip-factory"},
+            {"project_dir": project_dir, "pipeline_type": self.pipeline_type},
             reg,
         )

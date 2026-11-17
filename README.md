@@ -31,8 +31,8 @@ Agent reads pipeline manifest (YAML) ──> reads stage director skill (Markdow
 Enables OpenMontage's `clip-factory` pipeline to ingest remote video URLs (YouTube, Vimeo, etc.) and acquire ground-truth media:
 - **Dedicated URL Intake Adapter (`lib/url_ingest.py`):**
   - Production wrapper integrating OpenMontage's `VideoDownloader` (`yt-dlp`) and `TranscriptFetcher` (`youtube-transcript-api`).
-  - Strict **SSRF protection**: blocks private, loopback, and cloud metadata IP ranges (`127.0.0.1`, `10.0.0.0/8`, `169.254.169.254`, etc.).
-  - **Resource Guards:** Enforces maximum duration limits (e.g. 1800s default) and pre-download disk-space verification (1.5 GB minimum free).
+  - Application-level YouTube/Vimeo host allowlisting and preflight IP filtering for private, loopback, link-local, reserved, and multicast destinations. This does not guarantee protection from DNS rebinding or redirects after preflight.
+  - Resource guards enforce a 3600-second default maximum duration, recheck duration after probing, and check disk space before download.
   - **Dual Extraction:** Automatically extracts high-quality audio (`source_audio.wav`) and captions (`transcript.json`).
   - Seamless handoff to canonical `lib/source_media_review.py` for duration, resolution, audio track, and speech density probing.
 - **Pipeline Integration:**
@@ -153,7 +153,7 @@ pip install -r requirements.txt
 ### 3. Verify Tests
 Run the test suites to ensure system integrity:
 ```bash
-pytest tests/contracts/ tests/unit/test_url_ingest.py tests/qa/test_url_intake_smoke.py
+pytest -m "not network" tests/
 ```
 
 ### 4. Run the Living Storyboard (Backlot)

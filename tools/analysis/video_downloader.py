@@ -88,6 +88,7 @@ class VideoDownloader(BaseTool):
                 "default": 600,
                 "description": "Reject videos longer than this (safety limit)",
             },
+            "allowed_extractors": {"type": ["array", "null"], "items": {"type": "string"}, "default": None},
         },
     }
 
@@ -150,15 +151,21 @@ class VideoDownloader(BaseTool):
             return "twitter"
         return "other_url"
 
-    def _extract_metadata(self, url: str) -> dict:
+    def _extract_metadata(self, url: str, allowed_extractors: list[str] | None = None) -> dict:
         """Extract metadata without downloading."""
         import yt_dlp
 
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 30,
+            "extractor_retries": 2,
+            "fragment_retries": 2,
+            "file_access_retries": 1,
             "skip_download": True,
         }
+        if allowed_extractors:
+            ydl_opts["allowed_extractors"] = allowed_extractors
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -190,10 +197,13 @@ class VideoDownloader(BaseTool):
         start = time.time()
 
         # Step 1: Always get metadata first
-        metadata = self._extract_metadata(url)
+        allowed_extractors = inputs.get("allowed_extractors")
+        metadata = self._extract_metadata(url, allowed_extractors)
 
         # Check duration limit
         duration = metadata.get("duration", 0)
+        if dl_format == "video" and (not duration or duration <= 0):
+            return ToolResult(success=False, error="Video duration is unknown; refusing unbounded download.", data={"metadata": metadata, "platform": platform})
         if duration and duration > max_duration:
             return ToolResult(
                 success=False,
@@ -224,12 +234,12 @@ class VideoDownloader(BaseTool):
         try:
             if dl_format == "video":
                 video_path, audio_path = self._download_video(
-                    url, output_dir, max_res
+                    url, output_dir, max_res, allowed_extractors
                 )
             elif dl_format == "audio_only":
-                audio_path = self._download_audio(url, output_dir)
+                audio_path = self._download_audio(url, output_dir, allowed_extractors)
             elif dl_format == "subtitles_only":
-                subtitle_path = self._download_subtitles(url, output_dir)
+                subtitle_path = self._download_subtitles(url, output_dir, allowed_extractors)
         except Exception as e:
             elapsed = time.time() - start
             return ToolResult(
@@ -256,7 +266,7 @@ class VideoDownloader(BaseTool):
         )
 
     def _download_video(
-        self, url: str, output_dir: Path, max_res: str
+        self, url: str, output_dir: Path, max_res: str, allowed_extractors: list[str] | None = None
     ) -> tuple[str | None, str | None]:
         """Download video + extract audio track."""
         import yt_dlp
@@ -271,7 +281,13 @@ class VideoDownloader(BaseTool):
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 30,
+            "extractor_retries": 2,
+            "fragment_retries": 2,
+            "file_access_retries": 1,
         }
+        if allowed_extractors:
+            ydl_opts["allowed_extractors"] = allowed_extractors
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -300,7 +316,7 @@ class VideoDownloader(BaseTool):
 
         return video_path, audio_path
 
-    def _download_audio(self, url: str, output_dir: Path) -> str | None:
+    def _download_audio(self, url: str, output_dir: Path, allowed_extractors: list[str] | None = None) -> str | None:
         """Download audio only."""
         import yt_dlp
 
@@ -316,12 +332,18 @@ class VideoDownloader(BaseTool):
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 30,
+            "extractor_retries": 2,
+            "fragment_retries": 2,
+            "file_access_retries": 1,
         }
+        if allowed_extractors:
+            ydl_opts["allowed_extractors"] = allowed_extractors
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         return self._find_downloaded(output_dir, "reference_audio", ["wav", "mp3", "m4a", "opus"])
 
-    def _download_subtitles(self, url: str, output_dir: Path) -> str | None:
+    def _download_subtitles(self, url: str, output_dir: Path, allowed_extractors: list[str] | None = None) -> str | None:
         """Download subtitles only."""
         import yt_dlp
 
@@ -337,6 +359,8 @@ class VideoDownloader(BaseTool):
             "quiet": True,
             "no_warnings": True,
         }
+        if allowed_extractors:
+            ydl_opts["allowed_extractors"] = allowed_extractors
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
