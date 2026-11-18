@@ -152,15 +152,33 @@ def build_style_change_prompt(
     candidate_id: str,
     style_preset: str,
     layout_mode: str | None = None,
+    corrections: dict[str, str] | None = None,
+    margin_v: int | None = None,
+    highlight_style: str | None = None,
 ) -> str:
-    """Build subtitle preset swap re-render directive preserving active framing."""
-    layout_note = f"`layout_mode=\"{layout_mode}\"`" if layout_mode else "the clip's existing `layout_mode` and any saved `crop_overrides`"
+    """Build subtitle preset swap / typo correction re-render directive preserving active framing."""
+    layout_note = (
+        f'`layout_mode="{layout_mode}"`'
+        if layout_mode
+        else "the clip's existing `layout_mode` and any saved `crop_overrides`"
+    )
+    extras: list[str] = []
+    if corrections:
+        extras.append(
+            f"- Non-destructive caption typo `corrections` (NEVER mutate immutable `source/transcript.json`): "
+            f"`{json.dumps(corrections, ensure_ascii=False)}`"
+        )
+    if margin_v is not None:
+        extras.append(f"- Custom `margin_v`: `{int(margin_v)}`")
+    if highlight_style:
+        extras.append(f"- Highlight mode: `{highlight_style}`")
+    extras_block = ("\n" + "\n".join(extras)) if extras else ""
     return (
         f"Subtitle style preset change requested from Studio UI for project `{project_id}`, clip `{candidate_id}`:\n"
-        f"- New `style_preset`: `{style_preset}`\n\n"
+        f"- New `style_preset`: `{style_preset}`{extras_block}\n\n"
         f"## Execute Now\n"
         f"1. Re-render ONLY `{candidate_id}` via `vertical_clip_composer(mode=\"single_clip\", ...)` "
-        f"with `style_preset=\"{style_preset}\"`, `codec=\"auto\"`, and preserving {layout_note}.\n"
+        f"with `style_preset=\"{style_preset}\"`, `codec=\"auto\"`, preserving {layout_note} and applying any `corrections` strictly at ASS subtitle generation time without mutating `source/transcript.json`.\n"
         f"2. Re-run `media_qa` and update `projects/{project_id}/artifacts/final_review.json`."
     )
 
@@ -193,6 +211,7 @@ def build_production_prompt(
     style_playbook: str | None = None,
     media_profile: str | None = None,
     render_runtime: str | None = None,
+    composition_mode: str | None = None,
     style_preset: str | None = None,
     budget_usd: float | None = None,
     clip_count: int = 2,
@@ -239,6 +258,8 @@ def build_production_prompt(
         lines.append(f"- Target Media Profile: `{media_profile}`")
     if render_runtime:
         lines.append(f"- Preferred Composition Runtime: `{render_runtime}`")
+    if composition_mode:
+        lines.append(f"- Composition Authoring Mode (`AGENT_GUIDE.md`): `{composition_mode}`")
     if style_preset:
         lines.append(f"- Subtitle Style Preset: `{style_preset}`")
     if budget_usd is not None:
@@ -262,6 +283,8 @@ def build_gate_decision_prompt(
     stage: str,
     decision: str,
     notes: str = "",
+    render_runtime: str | None = None,
+    composition_mode: str | None = None,
 ) -> str:
     """Build universal human gate decision directive for any gated pipeline stage."""
     norm = decision.strip().lower()
@@ -288,7 +311,35 @@ def build_gate_decision_prompt(
         f"- Stage: `{stage}`",
         f"- Decision: `{norm.upper()}`",
     ]
+    if render_runtime:
+        lines.append(
+            f"- Locked `render_runtime`: `{render_runtime}` (log `render_runtime_selection` in `decision_log.json`)"
+        )
+    if composition_mode:
+        lines.append(
+            f"- Locked `composition_mode`: `{composition_mode}` (log `composition_mode` in `decision_log.json`)"
+        )
     if notes.strip():
         lines.append(f"- Human Feedback: {notes.strip()}")
     lines.extend(["", "## Execute Now", *action_lines])
     return "\n".join(lines)
+
+
+def build_tool_action_prompt(
+    *,
+    project_id: str,
+    action: str,
+    params: dict[str, Any] | None = None,
+) -> str:
+    """Build deterministic skill-compliant directive for Creator Editor AI Tools / Audio / Overlay / Scene actions."""
+    p = params or {}
+    payload = json.dumps(p, ensure_ascii=False, indent=2) if p else "{}"
+    return (
+        f"Creator Studio Tool Directive for project `{project_id}`:\n"
+        f"- Action: `{action}`\n"
+        f"- Parameters:\n```json\n{payload}\n```\n\n"
+        f"## Execute Now\n"
+        f"1. Honor all `AGENT_GUIDE.md` invariants (never mutate immutable `source/transcript.json`, log major provider/music/runtime changes to `artifacts/decision_log.json`, preserve locked `render_runtime` & `composition_mode`).\n"
+        f"2. Execute the matching registered OpenMontage `BaseTool`(s) under `projects/{project_id}/`.\n"
+        f"3. Re-run `media_qa` if any rendered MP4 changed and update `artifacts/final_review.json`."
+    )

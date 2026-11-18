@@ -51,30 +51,39 @@ export function CommandPalette() {
       {
         id: 'nav-hub',
         group: 'Workspaces',
-        label: 'Production Command Hub & Project Library',
-        hint: '1',
+        label: 'Home — Create Video & Project Recents',
+        hint: 'Home',
         icon: Sparkles,
         run: () => navigate('/'),
+      },
+      {
+        id: 'nav-demo-editor',
+        group: 'Workspaces',
+        label: 'Open Interactive Creator Editor (Demo Project)',
+        hint: 'Editor',
+        icon: Film,
+        run: () => navigate('/editor/demo'),
       },
       {
         id: 'nav-system',
         group: 'Workspaces',
         label: 'System Capabilities & 169-Tool Registry Matrix',
-        hint: '5',
+        hint: 'Tools',
         icon: Cpu,
         run: () => navigate('/system'),
       },
       {
         id: 'toggle-theme',
         group: 'Studio Controls',
-        label: theme === 'dark' ? 'Switch to Light Studio Theme' : 'Switch to Broadcast Obsidian Dark Theme',
+        label: theme === 'dark' ? 'Switch to Creator Crisp Light Theme' : 'Switch to Broadcast Obsidian Dark Theme',
         icon: theme === 'dark' ? Sun : Moon,
         run: () => toggleTheme(),
       },
       {
         id: 'toggle-dock',
         group: 'Studio Controls',
-        label: dockOpen ? 'Collapse Executive Producer Dock' : 'Open Executive Producer Dock',
+        label: dockOpen ? 'Close Executive Producer Drawer' : 'Open Executive Producer Drawer',
+        hint: 'Ctrl+J',
         icon: PanelRight,
         run: () => setDockOpen(!dockOpen),
       },
@@ -87,26 +96,23 @@ export function CommandPalette() {
         {
           id: 'nav-nle',
           group: 'Active Project',
-          label: `Open Pro NLE Clip & Reframe Studio (${activeProjectId})`,
-          hint: '2',
+          label: `Open Creator Video Editor (${activeProjectId})`,
           icon: Film,
-          run: () => navigate(`/project/${activeProjectId}/nle`),
+          run: () => navigate(`/editor/${activeProjectId}`),
         },
         {
           id: 'nav-board',
           group: 'Active Project',
-          label: `Open Universal Pipeline Board (${activeProjectId})`,
-          hint: '3',
+          label: `Open Pipeline Board (${activeProjectId})`,
           icon: Layers,
-          run: () => navigate(`/project/${activeProjectId}/board`),
+          run: () => navigate(`/editor/${activeProjectId}/board`),
         },
         {
           id: 'nav-qa',
           group: 'Active Project',
-          label: `Open Broadcast QA & Export Studio (${activeProjectId})`,
-          hint: '4',
+          label: `Open Broadcast QA & Export (${activeProjectId})`,
           icon: ShieldCheck,
-          run: () => navigate(`/project/${activeProjectId}/qa`),
+          run: () => navigate(`/editor/${activeProjectId}/qa`),
         },
       );
     }
@@ -114,14 +120,13 @@ export function CommandPalette() {
     for (const p of projects.slice(0, 12)) {
       const pid = p.project_id || p.id || '';
       if (!pid) continue;
-      const targetTab = p.pipeline_type === 'clip-factory' ? 'nle' : 'board';
       base.push({
         id: `proj-${pid}`,
         group: 'Projects',
         label: p.title || pid,
         hint: p.pipeline_type || 'project',
         icon: FolderOpen,
-        run: () => navigate(`/project/${pid}/${targetTab}`),
+        run: () => navigate(`/editor/${pid}`),
       });
     }
     return base;

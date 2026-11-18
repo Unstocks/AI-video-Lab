@@ -3,10 +3,10 @@
 **Document Path:** `architecture/01_SYSTEM_ARCHITECTURE.md`  
 **Repository:** `https://github.com/Unstocks/AI-video-Lab.git` (`C:\AI-Video-Lab`)  
 **Upstream Base:** `https://github.com/OpenMontageInc/OpenMontage.git` (`upstream/main` @ `2e003e6`)  
-**Accepted Working Branches:** Local `main` tracking `origin/main`; remote review branch `origin/openmontage` (same commit `7cf6b52f0b279f50d193f6aab7c25be5f3b8f95f`). Both names are accepted; do not propose branch renames. `[VERIFIED]`  
-**Base HEAD Commit Inspected:** `7cf6b52f0b279f50d193f6aab7c25be5f3b8f95f` `[VERIFIED]`  
+**Accepted Working Branches:** Local `main` tracking `origin/main`; remote review branch `origin/openmontage`. Both names are accepted; do not propose branch renames. `[VERIFIED]`  
+**Current Verified HEAD:** `216a604` (evolved from baseline `7cf6b52f` across M1–M6a, Phases 1–5, Adversarial Backend Hardening `f9796d8`, and Broadcast Obsidian Pro Studio `216a604`) `[VERIFIED]`  
 **Architecture Status:** Permanent Reference Layer 1 of 3 (`01_SYSTEM_ARCHITECTURE.md`, `02_EXECUTION_PLAN_AND_ENGINEERING_GOVERNANCE.md`, `03_ENGINEERING_BRAIN_AND_DECISION_PLAYBOOK.md`)  
-**Date:** November 17, 2026
+**Last Updated:** November 18, 2026
 
 > **Evidence Classification Key Used Throughout All Three Architecture Documents:**
 > - `[VERIFIED]` Directly confirmed in repository source code, test execution, or authoritative documentation.
@@ -36,23 +36,24 @@ AI Video Lab is **not** a generic video cutter. It is an **editorial intelligenc
 ### 2.1 Core Editorial Philosophy
 > **Three genuinely excellent, contextually complete, independently understandable clips are far more valuable than ten mediocre or confusing clips.** `[VERIFIED — Product Mandate]`
 
-### 2.2 Functional Workflow Requirements (23-Step Intended Lifecycle)
-| # | Capability | Current Status |
+### 2.2 Functional Workflow Requirements (23-Step Intended Lifecycle + Pro Studio Layer)
+| # | Capability | Current Status (`HEAD 216a604`) |
 |---|---|---|
-| 1–2 | Public video URL input (YouTube/Vimeo) and local video file input | `[VERIFIED]` URL via `lib/url_ingest.py` + `tools/analysis/url_intake.py` (Milestone 1 ACCEPTED, uncommitted); local via `lib/source_media_review.py` |
-| 3–4 | Source media acquisition & technical inspection | `[VERIFIED]` Milestone 1 hardened & independently verified (uncommitted: transactional rollback, post-probe duration cap, PCM WAV check, H.264 proxy) |
-| 5 | Caption retrieval (multilingual, manual prioritized over auto) | `[VERIFIED]` Milestone 1 ACCEPTED (uncommitted `transcript_fetcher.py` `ytt.list()` + `include_auto_generated`) |
-| 6 | Timestamped ASR transcription when captions absent/insufficient | `[UNVERIFIED]` `tools/analysis/transcriber.py` exists (`faster-whisper`), **UNAVAILABLE** locally (missing package on Py3.14) |
-| 7–8 | Complete conversation understanding & topic/semantic segmentation | `[VERIFIED — M2B ACCEPTED UNCOMMITTED]` Stateless `TranscriptNormalizer` + `ConversationStructureAnalyzer` (multilingual/Devanagari/Hinglish/HTML-entity offset mapping + Q&A topology) |
-| 9–10 | Candidate moment discovery & context reconstruction | `[VERIFIED — M2D/M3 ACCEPTED UNCOMMITTED]` Semantic Pass 1–2 in `script-director.md` + deterministic `ColdViewerAuditor` context-window & episodic-ceiling enforcement |
-| 11 | Cold-viewer comprehension validation | `[VERIFIED — M2D ACCEPTED UNCOMMITTED]` `lib/cold_viewer_auditor.py` (5-point gate + EN/Hinglish/Devanagari dangling-pronoun & mid-answer checks) |
-| 12 | Authentic spoken-hook discovery & verbatim provenance validation | `[VERIFIED — M2D ACCEPTED UNCOMMITTED]` `lib/hook_validator.py` (zero-tolerance verbatim single-speaker multi-segment `SpokenHookEvidence`, case-insensitive auto-caption support) |
-| 13 | Natural clip boundary determination with honest timing uncertainty | `[VERIFIED — M2C ACCEPTED UNCOMMITTED]` `lib/acoustic_profiler.py` wrapping `SilenceCutter(mode="mark")`, `AudioEnergy`, `SceneDetect` + non-destructive `thought_complete`-gated snapping |
-| 14–16 | Editorial eligibility, quality ranking, semantic deduplication & portfolio diversity | `[VERIFIED — M2D/M3 ACCEPTED UNCOMMITTED]` `lib/editorial_evaluator.py`, `lib/deduplicator.py`, `tools/analysis/clip_selector.py` (tool #166, zero quota padding, SHA-256 dual-artifact sync) |
-| 17 | Human review & approval via OpenMontage checkpoint gate | `[VERIFIED — M3 ACCEPTED UNCOMMITTED]` Proven end-to-end against unmodified `lib/checkpoint.py` (`awaiting_human` -> `GATE VIOLATION` -> `finalize_approved_selection` -> `completed` -> `scene_plan`) + read-only `backlot/state.py` |
-| 18–19 | Vertical 9:16 composition & speaker-aware framing | `[VERIFIED — M4 ACCEPTED]` Shot-cut-aware + speaker-track-ready `auto_reframe` (`single_crop`/`blurred_pillarbox`/`stacked_split`), Windows `sendcmd` escaping, `YOUTUBE_SHORTS` 180s, approval-gated `lib/vertical_composer.py` |
-| 20 | Synchronized, readable subtitles with word highlighting | `[VERIFIED — M4 ACCEPTED]` Clip-rebased `subtitle_gen` (`format="ass"` + 9:16 mobile safe zones `MarginV=320`, UTF-8 Devanagari/Hinglish, honest coarse-caption highlight downgrade); Remotion seam preserved |
-| 21–23 | Audio/visual QA, final rendering & validated MP4 export | `[VERIFIED — M5 ACCEPTED]` Automated `lib/media_qa.py` (`ffprobe` + 4+ PIL frames + `ebur128` + subtitle drift -> schema-valid `final_review.json`) + multi-clip QA-gated `export_bundle` -> `publish_log.json` + Backlot verified |
+| 1–2 | Public video URL input (YouTube/Vimeo) and local video file input | `[VERIFIED — COMMITTED 0699621, a3bff47, f9796d8, 216a604]` URL via `lib/url_ingest.py` + `tools/analysis/url_intake.py` + connect-time `lib/ssrf_guard.py`; local upload (`POST /api/studio/upload`, 2 GiB streaming) & local FS browser (`GET /api/studio/fs/browse`) + `lib/source_media_review.py` |
+| 3–4 | Source media acquisition & technical inspection | `[VERIFIED — COMMITTED 0699621, a3bff47]` Transactional rollback, preflight resolution/duration cap, PCM WAV extraction, H.264 proxy |
+| 5 | Caption retrieval (multilingual, manual prioritized over auto) | `[VERIFIED — COMMITTED 0699621]` `transcript_fetcher.py` `ytt.list()` + `include_auto_generated` |
+| 6 | Timestamped ASR transcription when captions absent/insufficient | `[OPTIONAL / DEGRADED ON PY3.14]` `tools/analysis/transcriber.py` (`faster-whisper`) optional in `clip-factory.yaml`; native captions prioritized on Python 3.14 |
+| 7–8 | Complete conversation understanding & topic/semantic segmentation | `[VERIFIED — COMMITTED 4196087]` Stateless `TranscriptNormalizer` + `ConversationStructureAnalyzer` (multilingual/Devanagari/Hinglish/HTML-entity offset mapping + Q&A topology) |
+| 9–10 | Candidate moment discovery & context reconstruction | `[VERIFIED — COMMITTED 4196087, b443b3c]` Semantic Pass 1–2 in `script-director.md` + deterministic `ColdViewerAuditor` context-window & episodic-ceiling enforcement |
+| 11 | Cold-viewer comprehension validation | `[VERIFIED — COMMITTED 4196087]` `lib/cold_viewer_auditor.py` (5-point gate + EN/Hinglish/Devanagari dangling-pronoun & mid-answer checks) |
+| 12 | Authentic spoken-hook discovery & verbatim provenance validation | `[VERIFIED — COMMITTED 4196087]` `lib/hook_validator.py` (zero-tolerance verbatim single-speaker multi-segment `SpokenHookEvidence`, case-insensitive auto-caption support) |
+| 13 | Natural clip boundary determination with honest timing uncertainty | `[VERIFIED — COMMITTED 4196087]` `lib/acoustic_profiler.py` wrapping `SilenceCutter(mode="mark")`, `AudioEnergy`, `SceneDetect` + non-destructive `thought_complete`-gated snapping |
+| 14–16 | Editorial eligibility, quality ranking, semantic deduplication & portfolio diversity | `[VERIFIED — COMMITTED 4196087, b443b3c]` `lib/editorial_evaluator.py`, `lib/deduplicator.py`, `tools/analysis/clip_selector.py` (zero quota padding, SHA-256 dual-artifact sync) |
+| 17 | Human review & approval via OpenMontage checkpoint gate | `[VERIFIED — COMMITTED b443b3c, 03ac66d, 216a604]` Proven against `lib/checkpoint.py`, read-only `backlot/state.py`, and Pro Studio Universal Gate Bar (`POST /api/studio/sessions/{id}/gate`) |
+| 18–19 | Vertical 9:16 composition & Smart Reframe v2 cinematography | `[VERIFIED — COMMITTED c935bab, a3bff47, 8027c36, f9796d8]` RTX 3050 `h264_nvenc` + single-pass `-14 LUFS` `lib/ffmpeg_profiles.py`; YuNet ONNX `lib/face_detector.py`, `SmoothedCameraman` (`lib/camera_tracker.py`), `lib/split_layout.py`, `lib/active_speaker.py`, `lib/punch_in.py`, zero-drift multi-scene `auto_reframe`, `tools/video/vertical_clip_composer.py` |
+| 20 | Synchronized, readable subtitles with 8 presets & `Style: Seam` | `[VERIFIED — COMMITTED cdfc094, b0ed975, f9796d8]` 8 DirectWrite-verified bundled OFL fonts in `assets/fonts/`, `lib/layout_ranges.py`, `Style: Seam` (`Alignment=5`) for 2-speaker split, continuation-word merging (negative-number/`.NET` safe), Devanagari/Hinglish safe |
+| 21–23 | Audio/visual QA, final rendering & validated MP4 export | `[VERIFIED — COMMITTED fb82380, 080f19a, 03ac66d, f9796d8]` Registered `tools/analysis/media_qa.py` (`integrated_lufs`, `true_peak_dbtp`, strict loudnorm window, freeze/black frame checks) + hard-gated batch `export_bundle` -> `publish_log.json` |
+| 24 | Interactive Top-Supervisor Pro Studio Workstation (`127.0.0.1:4760`) | `[VERIFIED — COMMITTED 03ac66d, f9796d8, 216a604]` Loopback + CSRF hardened FastAPI BFF (`studio/`) + React 19 / TS / Tailwind v4 **Broadcast Obsidian Pro** SPA (`studio/web/` → `studio/ui/`): Command Hub (all 13 pipelines), NLE Studio (PCM waveform, filmstrip, on-canvas Single/Split crop, word-snapped recut), Universal Pipeline Board, Broadcast QA, 169-Tool Matrix, and persistent `fcc-claude` Executive Producer Dock. *Live `fcc-claude` runtime (`BU-0.1`) & live podcast walkthrough (`BU-6.1`) pending.* |
 
 ### 2.3 Explicit Product Anti-Goals
 AI Video Lab must NEVER: slice at fixed time intervals; extract isolated punchlines without setup; select clips solely by audio energy or keyword triggers; fabricate or splice spoken hooks; hide missing context behind misleading titles; produce redundant clips covering the same insight; claim word-level precision from coarse captions; or pad weak clips to hit a count quota. `[VERIFIED — Product Mandate]`

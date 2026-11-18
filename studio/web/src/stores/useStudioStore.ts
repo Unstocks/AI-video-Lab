@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { studioApi } from '@/lib/api';
 import type {
   BoardState,
+  BundledFontInfo,
   CropOverrideEntry,
   CropOverridesMap,
   FilmstripData,
@@ -19,7 +20,7 @@ import type {
   WaveformData,
 } from '@/types/studio';
 
-// ── Zero-rerender 60fps Playback Pub/Sub ────────────────────────────────
+// ── Zero-rerender 60fps Playback Pub/Sub (With Script Cut-Range Skip) ───
 type PlaybackListener = (time: number, duration: number, playing: boolean) => void;
 
 class PlaybackHub {
@@ -81,7 +82,7 @@ export const useToastStore = create<ToastState>((set) => ({
     set((s) => ({ items: [...s.items.slice(-4), { ...item, id }] }));
     window.setTimeout(() => {
       set((s) => ({ items: s.items.filter((x) => x.id !== id) }));
-    }, 4500);
+    }, 4200);
   },
   dismiss: (id) => set((s) => ({ items: s.items.filter((x) => x.id !== id) })),
 }));
@@ -100,34 +101,36 @@ interface SystemState {
   playbooks: PlaybookSummary[];
   mediaProfiles: MediaProfile[];
   presets: SubtitlePreset[];
+  bundledFonts: BundledFontInfo[];
   tools: ToolRegistrySnapshot | null;
   musicLibrary: MusicLibrarySnapshot | null;
   config: Record<string, unknown>;
   bootstrapped: boolean;
   toolsLoading: boolean;
-  theme: 'dark' | 'light';
+  theme: 'light' | 'dark';
   commandPaletteOpen: boolean;
+  /** Slide-over Executive Producer drawer (default closed for full-width creator canvas) */
   dockOpen: boolean;
   dockWidth: number;
   bootstrap: () => Promise<void>;
   refreshHealth: () => Promise<void>;
   loadTools: (forceRefresh?: boolean) => Promise<void>;
   loadMusicLibrary: () => Promise<void>;
-  setTheme: (theme: 'dark' | 'light') => void;
+  setTheme: (theme: 'light' | 'dark') => void;
   toggleTheme: () => void;
   setCommandPaletteOpen: (open: boolean) => void;
   setDockOpen: (open: boolean) => void;
   setDockWidth: (width: number) => void;
 }
 
-function getInitialTheme(): 'dark' | 'light' {
+function getInitialTheme(): 'light' | 'dark' {
   try {
-    const saved = localStorage.getItem('studio.theme');
+    const saved = localStorage.getItem('studio.theme.v2');
     if (saved === 'light' || saved === 'dark') return saved;
   } catch {
     // ignore
   }
-  return 'dark';
+  return 'light'; // User-locked default: Creator Crisp Light
 }
 
 export const useSystemStore = create<SystemState>((set, get) => ({
@@ -136,6 +139,7 @@ export const useSystemStore = create<SystemState>((set, get) => ({
   playbooks: [],
   mediaProfiles: [],
   presets: [],
+  bundledFonts: [],
   tools: null,
   musicLibrary: null,
   config: {},
@@ -143,8 +147,8 @@ export const useSystemStore = create<SystemState>((set, get) => ({
   toolsLoading: false,
   theme: getInitialTheme(),
   commandPaletteOpen: false,
-  dockOpen: true,
-  dockWidth: 380,
+  dockOpen: false,
+  dockWidth: 400,
 
   bootstrap: async () => {
     if (get().bootstrapped) return;
@@ -153,16 +157,16 @@ export const useSystemStore = create<SystemState>((set, get) => ({
     document.documentElement.setAttribute('data-theme', theme);
     document.documentElement.classList.toggle('dark', theme === 'dark');
 
-    // Kick off health/hardware probe independently so fast catalog hydration
-    // (presets, pipelines, playbooks, media profiles) commits in <15ms.
+    // Run hardware/FCC probe independently so fast catalogs commit in <15ms
     void get().refreshHealth();
 
-    const [pipelines, playbooks, mediaProfiles, presets, config] = await Promise.allSettled([
+    const [pipelines, playbooks, mediaProfiles, presets, config, fonts] = await Promise.allSettled([
       studioApi.getPipelines(),
       studioApi.getPlaybooks(),
       studioApi.getMediaProfiles(),
       studioApi.getPresets(),
       studioApi.getConfig(),
+      studioApi.getFonts(),
     ]);
 
     set({
@@ -171,6 +175,7 @@ export const useSystemStore = create<SystemState>((set, get) => ({
       mediaProfiles: mediaProfiles.status === 'fulfilled' ? mediaProfiles.value : [],
       presets: presets.status === 'fulfilled' ? presets.value : [],
       config: config.status === 'fulfilled' ? config.value : {},
+      bundledFonts: fonts.status === 'fulfilled' ? fonts.value : [],
     });
   },
 
@@ -208,7 +213,7 @@ export const useSystemStore = create<SystemState>((set, get) => ({
     document.documentElement.setAttribute('data-theme', theme);
     document.documentElement.classList.toggle('dark', theme === 'dark');
     try {
-      localStorage.setItem('studio.theme', theme);
+      localStorage.setItem('studio.theme.v2', theme);
     } catch {
       // ignore
     }
@@ -222,10 +227,10 @@ export const useSystemStore = create<SystemState>((set, get) => ({
 
   setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
   setDockOpen: (open) => set({ dockOpen: open }),
-  setDockWidth: (width) => set({ dockWidth: Math.max(300, Math.min(620, Math.round(width))) }),
+  setDockWidth: (width) => set({ dockWidth: Math.max(320, Math.min(580, Math.round(width))) }),
 }));
 
-// ── 2. Project & Board State Store ──────────────────────────────────────
+// ── 2. Project & Disk-Bus State Store ───────────────────────────────────
 interface ProjectState {
   projects: ProjectSummary[];
   projectsLoading: boolean;
@@ -269,6 +274,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   loadProject: async (projectId, silent = false) => {
+    if (projectId === 'demo') {
+      set({ activeProjectId: 'demo', boardState: null, boardLoading: false, boardError: null });
+      return;
+    }
     if (!silent) {
       set({ activeProjectId: projectId, boardLoading: true, boardError: null });
     }
@@ -287,7 +296,6 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         activeClipId: nextClipId,
       });
 
-      // Hydrate saved crop drafts into NLE store when switching projects
       if (!silent && boardState.crop_drafts) {
         useNleStore.getState().hydrateDrafts(boardState.crop_drafts);
       }
@@ -299,6 +307,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   setActiveClipId: (clipId) => set({ activeClipId: clipId }),
 
   loadTranscript: async (projectId, candidateId) => {
+    if (projectId === 'demo') return;
     try {
       const transcript = await studioApi.getTranscript(projectId, candidateId);
       set({ transcript });
@@ -311,7 +320,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     const key = `${projectId}:${relPath}`;
     if (get().waveforms[key]) return;
     try {
-      const data = await studioApi.getWaveform(projectId, relPath, 360);
+      const data = await studioApi.getWaveform(projectId, relPath, 320);
       set((s) => ({ waveforms: { ...s.waveforms, [key]: data } }));
     } catch {
       // ignore
@@ -330,67 +339,47 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 }));
 
-// ── 3. Pro NLE Editor Store (With Full Undo/Redo Stack) ─────────────────
+// ── 3. Reframe v2 Crop Draft Store (Exact lib/reframe_v2.py Contract) ───
 interface NleState {
-  previewMode: 'rendered' | 'source_crop' | 'compare';
-  activePreset: string;
-  layoutMode: 'auto' | 'single_crop' | 'blurred_pillarbox' | 'stacked_split' | 'speaker_cut';
-  enablePunchIn: boolean;
-  showSafeZones: boolean;
-  showSubtitlesOverlay: boolean;
-  timelineZoom: number;
   selectedRangeIdx: number;
-  /** Per-clip crop overrides map */
+  timelineZoom: number;
+  showSafeZones: boolean;
+  /** Per-clip exact reframe_v2 crop_overrides maps */
   drafts: Record<string, CropOverridesMap>;
   past: Array<Record<string, CropOverridesMap>>;
   future: Array<Record<string, CropOverridesMap>>;
   recutStart: number | null;
   recutEnd: number | null;
-  setPreviewMode: (mode: 'rendered' | 'source_crop' | 'compare') => void;
-  setActivePreset: (preset: string) => void;
-  setLayoutMode: (mode: NleState['layoutMode']) => void;
-  setEnablePunchIn: (val: boolean) => void;
-  setShowSafeZones: (val: boolean) => void;
-  setShowSubtitlesOverlay: (val: boolean) => void;
-  setTimelineZoom: (z: number) => void;
   setSelectedRangeIdx: (idx: number) => void;
+  setTimelineZoom: (z: number) => void;
+  setShowSafeZones: (val: boolean) => void;
   hydrateDrafts: (drafts: Record<string, CropOverridesMap>) => void;
   updateRangeOverride: (clipId: string, rangeKey: string, entry: CropOverrideEntry) => void;
-  undo: () => void;
-  redo: () => void;
+  undoCrop: () => void;
+  redoCrop: () => void;
   setRecutBounds: (start: number | null, end: number | null) => void;
 }
 
 export const useNleStore = create<NleState>((set, get) => ({
-  previewMode: 'rendered',
-  activePreset: 'hinglish_impact',
-  layoutMode: 'auto',
-  enablePunchIn: true,
-  showSafeZones: false,
-  showSubtitlesOverlay: true,
-  timelineZoom: 1,
   selectedRangeIdx: 0,
+  timelineZoom: 1,
+  showSafeZones: false,
   drafts: {},
   past: [],
   future: [],
   recutStart: null,
   recutEnd: null,
 
-  setPreviewMode: (previewMode) => set({ previewMode }),
-  setActivePreset: (activePreset) => set({ activePreset }),
-  setLayoutMode: (layoutMode) => set({ layoutMode }),
-  setEnablePunchIn: (enablePunchIn) => set({ enablePunchIn }),
-  setShowSafeZones: (showSafeZones) => set({ showSafeZones }),
-  setShowSubtitlesOverlay: (showSubtitlesOverlay) => set({ showSubtitlesOverlay }),
-  setTimelineZoom: (z) => set({ timelineZoom: Math.max(1, Math.min(8, z)) }),
   setSelectedRangeIdx: (selectedRangeIdx) => set({ selectedRangeIdx }),
+  setTimelineZoom: (z) => set({ timelineZoom: Math.max(1, Math.min(8, z)) }),
+  setShowSafeZones: (showSafeZones) => set({ showSafeZones }),
   hydrateDrafts: (drafts) => set({ drafts, past: [], future: [] }),
 
   updateRangeOverride: (clipId, rangeKey, entry) => {
     const prev = get().drafts;
     const nextClipMap: CropOverridesMap = {
       ...(prev[clipId] || {}),
-      [rangeKey]: { ...(prev[clipId]?.[rangeKey] || {}), ...entry },
+      [rangeKey]: entry,
     };
     const next = { ...prev, [clipId]: nextClipMap };
     set((s) => ({
@@ -400,7 +389,7 @@ export const useNleStore = create<NleState>((set, get) => ({
     }));
   },
 
-  undo: () => {
+  undoCrop: () => {
     const { past, drafts, future } = get();
     if (!past.length) return;
     const prev = past[past.length - 1];
@@ -411,7 +400,7 @@ export const useNleStore = create<NleState>((set, get) => ({
     });
   },
 
-  redo: () => {
+  redoCrop: () => {
     const { past, drafts, future } = get();
     if (!future.length) return;
     const next = future[0];
@@ -477,7 +466,7 @@ export const useSupervisorStore = create<SupervisorState>((set, get) => ({
 
   ensureSessionForProject: async (projectId, title) => {
     const { sessions, activeSessionId } = get();
-    if (projectId) {
+    if (projectId && projectId !== 'demo') {
       const match = sessions.find((s) => s.project_id === projectId);
       if (match) {
         if (activeSessionId !== match.session_id) {
@@ -486,11 +475,11 @@ export const useSupervisorStore = create<SupervisorState>((set, get) => ({
         return match.session_id;
       }
     }
-    if (activeSessionId && !projectId) return activeSessionId;
+    if (activeSessionId && (!projectId || projectId === 'demo')) return activeSessionId;
 
     const created = await studioApi.createSession({
-      project_id: projectId ?? null,
-      title: title || (projectId ? `Director · ${projectId}` : 'Executive Producer'),
+      project_id: projectId && projectId !== 'demo' ? projectId : null,
+      title: title || (projectId && projectId !== 'demo' ? `Director · ${projectId}` : 'Executive Producer'),
     });
     set((s) => ({
       sessions: [created, ...s.sessions],

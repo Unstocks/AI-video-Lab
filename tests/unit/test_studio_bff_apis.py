@@ -247,3 +247,107 @@ def test_fs_browse_returns_valid_listing(studio_env):
     assert "path" in data
     assert isinstance(data["dirs"], list)
     assert isinstance(data["files"], list)
+
+
+def test_creator_editor_draft_brand_kit_subtitles_and_title_override(studio_env):
+    client, headers, proj_dir, _ = studio_env
+
+    # Fonts catalog lists bundled DirectWrite fonts
+    fonts = client.get("/api/studio/fonts")
+    assert fonts.status_code == 200
+    assert any("Montserrat" in f["filename"] for f in fonts.json())
+
+    # Editor draft + title override persistence (outside projects/)
+    no_csrf = client.put("/api/studio/project/demo-proj/editor-draft", json={"draft": {"aspect": "9:16"}})
+    assert no_csrf.status_code == 403
+
+    saved = client.put(
+        "/api/studio/project/demo-proj/editor-draft",
+        json={"draft": {"aspect_ratio": "9:16", "captions": [{"id": "c1", "start": 0, "end": 2, "text": "Hello"}]}},
+        headers=headers,
+    )
+    assert saved.status_code == 200
+    got = client.get("/api/studio/project/demo-proj/editor-draft")
+    assert got.status_code == 200
+    assert got.json()["draft"]["aspect_ratio"] == "9:16"
+
+    # Provisional crop draft saved in exact reframe_v2 center-point contract
+    cd = client.put(
+        "/api/studio/project/demo-proj/crop-draft/clip_01",
+        json={"overrides": {"0": {"x": 0.42}, "1": {"top": {"x": 0.28, "y": 0.45}, "bottom": {"x": 0.72, "y": 0.45}}}},
+        headers=headers,
+    )
+    assert cd.status_code == 200
+
+    # Title override reflects in /state without mutating projects/demo-proj/project.json
+    rn = client.patch(
+        "/api/studio/project/demo-proj/title",
+        json={"title": "Renamed Creator Episode"},
+        headers=headers,
+    )
+    assert rn.status_code == 200
+    st = client.get("/api/studio/project/demo-proj/state")
+    assert st.status_code == 200
+    assert st.json()["title"] == "Renamed Creator Episode"
+    assert st.json()["crop_drafts"]["clip_01"]["0"]["x"] == 0.42
+
+    # Subtitles generate & read from project transcript.json
+    (proj_dir / "source").mkdir(parents=True, exist_ok=True)
+    (proj_dir / "source" / "transcript.json").write_text(
+        json.dumps({
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 3.0,
+                    "speaker": "Host",
+                    "words": [
+                        {"word": "Kabhi-kabhi", "start": 0.0, "end": 0.6},
+                        {"word": "hum", "start": 0.6, "end": 1.0},
+                        {"word": "kisi", "start": 1.0, "end": 1.4},
+                        {"word": "book", "start": 1.4, "end": 1.9},
+                        {"word": "padte", "start": 1.9, "end": 2.5},
+                    ],
+                }
+            ]
+        }),
+        encoding="utf-8",
+    )
+    gen = client.post(
+        "/api/studio/project/demo-proj/subtitles/generate",
+        json={"candidate_id": "source", "language": "hi-EN", "max_words": 4},
+        headers=headers,
+    )
+    assert gen.status_code == 200
+    gdata = gen.json()
+    assert gdata["status"] == "ready"
+    assert gdata["evidence_quality"] == "medium_word"
+    assert len(gdata["captions"]) == 2
+    assert gdata["captions"][0]["text"] == "Kabhi-kabhi hum kisi book"
+
+    # Brand Kit CRUD (CSRF-protected)
+    bk_add = client.post(
+        "/api/studio/brand-kit",
+        json={"category": "saved", "name": "Hinglish Pop Caption", "payload": {"preset": "hinglish_impact"}},
+        headers=headers,
+    )
+    assert bk_add.status_code == 201
+    iid = bk_add.json()["item_id"]
+    bk_list = client.get("/api/studio/brand-kit?category=saved")
+    assert bk_list.status_code == 200
+    assert any(x["item_id"] == iid for x in bk_list.json()["items"])
+    bk_del = client.delete(f"/api/studio/brand-kit/{iid}", headers=headers)
+    assert bk_del.status_code == 200
+
+    # Tool action directive + proposal runtime lock + style corrections
+    s = client.post(
+        "/api/studio/sessions",
+        json={"title": "Creator Session", "project_id": "demo-proj"},
+        headers=headers,
+    ).json()
+    sid = s["session_id"]
+    ta = client.post(
+        f"/api/studio/sessions/{sid}/tool-action",
+        json={"action": "silence_cutter", "params": {"threshold_db": -35}, "project_id": "demo-proj"},
+        headers=headers,
+    )
+    assert ta.status_code == 202

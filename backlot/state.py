@@ -836,6 +836,8 @@ def _build_clip_studio(
                 "integrated_lufs": au.get("integrated_lufs") if au.get("integrated_lufs") is not None else au.get("mean_lufs"),
                 "true_peak_dbtp": au.get("true_peak_dbtp") if au.get("true_peak_dbtp") is not None else au.get("peak_lufs"),
                 "issues": list(qa_raw.get("issues") or []),
+                "check_statuses": dict(qa_raw.get("check_statuses") or {}),
+                "video_sha256": qa_raw.get("video_sha256"),
             }
 
         exported_paths = exports_by_id.get(cid, [])

@@ -15,6 +15,7 @@ import asyncio
 import base64
 import json
 import math
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -154,10 +155,13 @@ def _load_project_transcript_words(
     words: list[dict[str, Any]] = []
     win_lo = max(0.0, clip_start - pad_seconds) if clip_start is not None else 0.0
     win_hi = (clip_end + pad_seconds) if (clip_end is not None and clip_end > 0) else float("inf")
+    has_real_words = False
 
     for seg in segments:
+        speaker = seg.get("speaker")
         seg_words = seg.get("words")
         if isinstance(seg_words, list) and seg_words:
+            has_real_words = True
             for w in seg_words:
                 if not isinstance(w, dict):
                     continue
@@ -167,7 +171,12 @@ def _load_project_transcript_words(
                     continue
                 text = str(w.get("word") or w.get("text") or "").strip()
                 if text:
-                    words.append({"word": text, "start": round(ws, 3), "end": round(we, 3)})
+                    words.append({
+                        "word": text,
+                        "start": round(ws, 3),
+                        "end": round(we, 3),
+                        "speaker": w.get("speaker") or speaker,
+                    })
         else:
             ss = float(seg.get("start") or 0.0)
             se = float(seg.get("end") or (ss + float(seg.get("duration") or 0.0)))
@@ -180,15 +189,181 @@ def _load_project_transcript_words(
             for idx, tok in enumerate(tokens):
                 ws = ss + idx * step
                 we = min(se, ws + step) if se > ss else ws + step
-                words.append({"word": tok, "start": round(ws, 3), "end": round(we, 3)})
+                words.append({
+                    "word": tok,
+                    "start": round(ws, 3),
+                    "end": round(we, 3),
+                    "speaker": speaker,
+                })
 
+    evidence_quality = "medium_word" if has_real_words else ("coarse_segment" if words else "unknown")
+    timing_source = "asr_word" if has_real_words else ("caption_segment" if words else "unknown")
     return {
         "candidate_id": candidate_id,
         "clip_start_seconds": clip_start,
         "clip_end_seconds": clip_end,
         "window_start": round(win_lo, 3),
         "window_end": None if win_hi == float("inf") else round(win_hi, 3),
+        "evidence_quality": evidence_quality,
+        "timing_source": timing_source,
         "words": words,
+    }
+
+
+_ASS_TAG_RE = re.compile(r"\{[^}]*\}")
+_SRT_TIME_RE = re.compile(
+    r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})"
+)
+
+
+def _ass_ts_to_seconds(ts: str) -> float:
+    parts = ts.strip().split(":")
+    if len(parts) != 3:
+        return 0.0
+    try:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    except ValueError:
+        return 0.0
+
+
+def _chunk_words_to_captions(
+    words: list[dict[str, Any]],
+    *,
+    max_words: int = 4,
+    max_gap: float = 0.8,
+) -> list[dict[str, Any]]:
+    """Group word timestamps into clean 3–5 word portrait subtitle rows."""
+    captions: list[dict[str, Any]] = []
+    buf: list[dict[str, Any]] = []
+    limit = max(2, min(8, int(max_words)))
+    for w in words:
+        if buf:
+            prev_end = float(buf[-1].get("end") or 0.0)
+            cur_start = float(w.get("start") or prev_end)
+            prev_word = str(buf[-1].get("word") or "")
+            should_break = (
+                len(buf) >= limit
+                or (cur_start - prev_end) > max_gap
+                or prev_word.endswith((".", "!", "?", "।"))
+            )
+            if should_break:
+                captions.append({
+                    "id": f"cap_{len(captions) + 1:03d}",
+                    "start": round(float(buf[0]["start"]), 3),
+                    "end": round(max(float(buf[-1]["end"]), float(buf[0]["start"]) + 0.25), 3),
+                    "text": " ".join(str(x["word"]) for x in buf),
+                    "speaker": buf[0].get("speaker"),
+                    "style_name": "Default",
+                })
+                buf = []
+        buf.append(w)
+    if buf:
+        captions.append({
+            "id": f"cap_{len(captions) + 1:03d}",
+            "start": round(float(buf[0]["start"]), 3),
+            "end": round(max(float(buf[-1]["end"]), float(buf[0]["start"]) + 0.25), 3),
+            "text": " ".join(str(x["word"]) for x in buf),
+            "speaker": buf[0].get("speaker"),
+            "style_name": "Default",
+        })
+    return captions
+
+
+def _load_project_subtitles(
+    project_dir: Path,
+    candidate_id: Optional[str] = None,
+    *,
+    max_words: int = 4,
+) -> dict[str, Any]:
+    """Read existing .ass/.srt subtitle cues or segment project transcript words."""
+    state = load_board_state(project_dir)
+    sub_file: Optional[Path] = None
+    cs = state.get("clip_studio") or {}
+    if candidate_id and candidate_id != "source":
+        for clip in cs.get("clips") or []:
+            if clip.get("candidate_id") == candidate_id and clip.get("subtitle_path"):
+                cand = (project_dir / str(clip["subtitle_path"])).resolve()
+                try:
+                    cand.relative_to(project_dir.resolve())
+                    if cand.is_file():
+                        sub_file = cand
+                except ValueError:
+                    pass
+                break
+
+    if sub_file is None:
+        for fallback_rel in ("assets/subtitles.ass", "assets/subtitles.srt", "source/subtitles.srt"):
+            cand = project_dir / fallback_rel
+            if cand.is_file():
+                sub_file = cand
+                break
+
+    cues: list[dict[str, Any]] = []
+    source_kind = "transcript_chunked"
+
+    if sub_file is not None:
+        raw = sub_file.read_text(encoding="utf-8", errors="replace")
+        if sub_file.suffix.lower() == ".ass":
+            source_kind = "ass"
+            for line in raw.splitlines():
+                if not line.startswith("Dialogue:"):
+                    continue
+                parts = line[len("Dialogue:") :].split(",", 9)
+                if len(parts) < 10:
+                    continue
+                start_s = _ass_ts_to_seconds(parts[1])
+                end_s = _ass_ts_to_seconds(parts[2])
+                style_name = parts[3].strip() or "Default"
+                text = _ASS_TAG_RE.sub("", parts[9]).replace("\\N", " ").replace("\\n", " ").strip()
+                if text:
+                    cues.append({
+                        "id": f"cap_{len(cues) + 1:03d}",
+                        "start": round(start_s, 3),
+                        "end": round(max(end_s, start_s + 0.1), 3),
+                        "text": text,
+                        "style_name": style_name,
+                    })
+        else:
+            source_kind = "srt"
+            blocks = re.split(r"\r?\n\r?\n", raw.strip())
+            for block in blocks:
+                lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+                if len(lines) < 2:
+                    continue
+                m = None
+                text_start_idx = 0
+                for idx, ln in enumerate(lines):
+                    m = _SRT_TIME_RE.search(ln)
+                    if m:
+                        text_start_idx = idx + 1
+                        break
+                if not m:
+                    continue
+                h1, m1, s1, ms1, h2, m2, s2, ms2 = [int(x) for x in m.groups()]
+                start_s = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000.0
+                end_s = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000.0
+                text = " ".join(lines[text_start_idx:]).strip()
+                if text:
+                    cues.append({
+                        "id": f"cap_{len(cues) + 1:03d}",
+                        "start": round(start_s, 3),
+                        "end": round(max(end_s, start_s + 0.1), 3),
+                        "text": text,
+                        "style_name": "Default",
+                    })
+
+    tx = _load_project_transcript_words(
+        project_dir, None if (not candidate_id or candidate_id == "source") else candidate_id
+    )
+    if not cues and tx.get("words"):
+        cues = _chunk_words_to_captions(tx["words"], max_words=max_words)
+
+    return {
+        "candidate_id": candidate_id,
+        "source": source_kind,
+        "evidence_quality": tx.get("evidence_quality", "unknown"),
+        "timing_source": tx.get("timing_source", "unknown"),
+        "captions": cues,
     }
 
 
@@ -296,6 +471,9 @@ class StyleChangeRequest(BaseModel):
     style_preset: str = Field(..., min_length=1)
     project_id: Optional[str] = None
     layout_mode: Optional[LayoutModeLiteral] = None
+    corrections: Optional[dict[str, str]] = None
+    margin_v: Optional[int] = Field(default=None, ge=0, le=900)
+    highlight_style: Optional[str] = None
 
     @field_validator("project_id")
     @classmethod
@@ -322,6 +500,7 @@ class StartProductionRequest(BaseModel):
     style_playbook: Optional[str] = None
     media_profile: Optional[str] = None
     render_runtime: Optional[str] = None
+    composition_mode: Optional[Literal["templated", "atelier"]] = None
     style_preset: Optional[str] = None
     budget_usd: Optional[float] = Field(default=None, ge=0.0, le=500.0)
     clip_count: int = Field(default=2, ge=1, le=10)
@@ -349,11 +528,48 @@ class GateDecisionRequest(BaseModel):
     decision: Literal["approve", "revise", "reject"]
     notes: str = ""
     project_id: Optional[str] = None
+    render_runtime: Optional[str] = None
+    composition_mode: Optional[Literal["templated", "atelier"]] = None
 
     @field_validator("project_id")
     @classmethod
     def _val_pid(cls, v: Optional[str]) -> Optional[str]:
         return _check_optional_project_id(v)
+
+
+class ToolActionRequest(BaseModel):
+    action: str = Field(..., min_length=1)
+    params: dict[str, Any] = Field(default_factory=dict)
+    project_id: Optional[str] = None
+
+    @field_validator("project_id")
+    @classmethod
+    def _val_pid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_optional_project_id(v)
+
+
+class EditorDraftRequest(BaseModel):
+    draft: dict[str, Any] = Field(default_factory=dict)
+
+
+class CropDraftSaveRequest(BaseModel):
+    overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class TitleUpdateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=120)
+
+
+class BrandKitCreateRequest(BaseModel):
+    category: Literal["saved", "video", "audio", "image", "subtitle", "font_color"]
+    name: str = Field(..., min_length=1, max_length=120)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class GenerateSubtitlesRequest(BaseModel):
+    candidate_id: Optional[str] = None
+    language: str = Field(default="en-US")
+    max_words: int = Field(default=4, ge=2, le=8)
 
 
 class FccModelSwitchRequest(BaseModel):
@@ -550,19 +766,74 @@ def create_app(
             "size_bytes": written,
         }
 
-    # ---- Projects (Read-Only Reuse of Backlot) ---------------------------
+    # ---- Projects (Read-Only Reuse of Backlot + SQLite Drafts/Overrides) -
+
+    @app.get("/api/studio/fonts")
+    async def studio_fonts_catalog(request: Request) -> list[dict[str, Any]]:
+        require_loopback(request)
+        if not FONTS_DIR.is_dir():
+            return []
+        out: list[dict[str, Any]] = []
+        for p in sorted(FONTS_DIR.iterdir()):
+            if p.is_file() and p.suffix.lower() in {".ttf", ".otf", ".woff2"}:
+                out.append({
+                    "filename": p.name,
+                    "stem": p.stem,
+                    "url": f"/fonts/{p.name}",
+                    "size_bytes": p.stat().st_size,
+                })
+        return out
+
+    @app.get("/api/studio/brand-kit")
+    async def studio_list_brand_kit(
+        request: Request, category: Optional[str] = None
+    ) -> dict[str, Any]:
+        require_loopback(request)
+        items = await asyncio.to_thread(session_store.list_brand_kit, category)
+        return {"count": len(items), "items": items}
+
+    @app.post("/api/studio/brand-kit", status_code=201)
+    async def studio_create_brand_kit_item(
+        body: BrandKitCreateRequest, request: Request
+    ) -> dict[str, Any]:
+        require_studio_write(request, token)
+        return await asyncio.to_thread(
+            session_store.add_brand_kit_item,
+            category=body.category,
+            name=body.name,
+            payload=body.payload,
+        )
+
+    @app.delete("/api/studio/brand-kit/{item_id}")
+    async def studio_delete_brand_kit_item(item_id: str, request: Request) -> dict[str, Any]:
+        require_studio_write(request, token)
+        deleted = await asyncio.to_thread(session_store.delete_brand_kit_item, item_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Unknown brand kit item")
+        return {"ok": True, "item_id": item_id}
 
     @app.get("/api/studio/projects")
     async def studio_projects(request: Request) -> list[dict[str, Any]]:
         require_loopback(request)
-        return await asyncio.to_thread(backlot_server._cached_summaries)
+        summaries = await asyncio.to_thread(backlot_server._cached_summaries)
+        overrides = await asyncio.to_thread(session_store.get_all_title_overrides)
+        if not overrides:
+            return summaries
+        enriched: list[dict[str, Any]] = []
+        for s in summaries:
+            pid = s.get("project_id")
+            if pid and pid in overrides:
+                enriched.append({**s, "title": overrides[pid]})
+            else:
+                enriched.append(s)
+        return enriched
 
     @app.get("/api/studio/library/events")
     async def studio_library_events(request: Request) -> StreamingResponse:
         require_loopback(request)
 
         async def stream():
-            q = backlot_server.hub.subscribe("*")
+            q = backlot_server.hub.subscribe(None)
             last_hb = time.monotonic()
             try:
                 yield _sse({"type": "hello", "scope": "library"})
@@ -599,7 +870,71 @@ def create_app(
         project_dir = backlot_server._safe_project_dir(project_id)
         state = await asyncio.to_thread(load_board_state, project_dir)
         state["crop_drafts"] = await asyncio.to_thread(session_store.get_crop_drafts, project_id)
+        ed = await asyncio.to_thread(session_store.get_editor_draft, project_id)
+        if ed.get("title_override"):
+            state["title"] = ed["title_override"]
+        state["editor_draft"] = ed.get("draft") or {}
         return state
+
+    @app.get("/api/studio/project/{project_id}/editor-draft")
+    async def studio_get_editor_draft(project_id: str, request: Request) -> dict[str, Any]:
+        require_loopback(request)
+        if not is_valid_project_id(project_id):
+            raise HTTPException(status_code=400, detail="Invalid project_id")
+        return await asyncio.to_thread(session_store.get_editor_draft, project_id)
+
+    @app.put("/api/studio/project/{project_id}/editor-draft")
+    async def studio_save_editor_draft(
+        project_id: str, body: EditorDraftRequest, request: Request
+    ) -> dict[str, Any]:
+        require_studio_write(request, token)
+        if not is_valid_project_id(project_id):
+            raise HTTPException(status_code=400, detail="Invalid project_id")
+        return await asyncio.to_thread(session_store.save_editor_draft, project_id, body.draft)
+
+    @app.put("/api/studio/project/{project_id}/crop-draft/{candidate_id}")
+    async def studio_save_crop_draft(
+        project_id: str, candidate_id: str, body: CropDraftSaveRequest, request: Request
+    ) -> dict[str, Any]:
+        require_studio_write(request, token)
+        if not is_valid_project_id(project_id):
+            raise HTTPException(status_code=400, detail="Invalid project_id")
+        return await asyncio.to_thread(
+            session_store.save_crop_draft, project_id, candidate_id, body.overrides
+        )
+
+    @app.patch("/api/studio/project/{project_id}/title")
+    async def studio_update_project_title(
+        project_id: str, body: TitleUpdateRequest, request: Request
+    ) -> dict[str, Any]:
+        require_studio_write(request, token)
+        if not is_valid_project_id(project_id):
+            raise HTTPException(status_code=400, detail="Invalid project_id")
+        return await asyncio.to_thread(session_store.set_title_override, project_id, body.title)
+
+    @app.get("/api/studio/project/{project_id}/subtitles/{candidate_id}")
+    async def studio_project_subtitles(
+        project_id: str, candidate_id: str, request: Request, max_words: int = 4
+    ) -> dict[str, Any]:
+        require_loopback(request)
+        project_dir = backlot_server._safe_project_dir(project_id)
+        return await asyncio.to_thread(
+            _load_project_subtitles, project_dir, candidate_id, max_words=max_words
+        )
+
+    @app.post("/api/studio/project/{project_id}/subtitles/generate")
+    async def studio_generate_subtitles(
+        project_id: str, body: GenerateSubtitlesRequest, request: Request
+    ) -> dict[str, Any]:
+        require_studio_write(request, token)
+        project_dir = backlot_server._safe_project_dir(project_id)
+        result = await asyncio.to_thread(
+            _load_project_subtitles,
+            project_dir,
+            body.candidate_id or "source",
+            max_words=body.max_words,
+        )
+        return {**result, "language": body.language, "status": "ready"}
 
     @app.get("/api/studio/project/{project_id}/artifacts/{artifact_name}")
     async def studio_project_artifact(
@@ -889,6 +1224,7 @@ def create_app(
                 style_playbook=body.style_playbook,
                 media_profile=body.media_profile,
                 render_runtime=body.render_runtime,
+                composition_mode=body.composition_mode,
                 style_preset=body.style_preset,
                 budget_usd=body.budget_usd,
                 clip_count=body.clip_count,
@@ -925,6 +1261,23 @@ def create_app(
                 stage=body.stage,
                 decision=body.decision,
                 notes=body.notes,
+                project_id=body.project_id,
+                render_runtime=body.render_runtime,
+                composition_mode=body.composition_mode,
+            )
+        except Exception as exc:
+            raise _map_supervisor_errors(exc)
+
+    @app.post("/api/studio/sessions/{session_id}/tool-action", status_code=202)
+    async def post_tool_action(
+        session_id: str, body: ToolActionRequest, request: Request
+    ) -> dict[str, Any]:
+        require_studio_write(request, token)
+        try:
+            return await mgr.send_tool_action(
+                session_id,
+                action=body.action,
+                params=body.params,
                 project_id=body.project_id,
             )
         except Exception as exc:
@@ -1012,6 +1365,9 @@ def create_app(
                 style_preset=body.style_preset,
                 project_id=body.project_id,
                 layout_mode=body.layout_mode,
+                corrections=body.corrections,
+                margin_v=body.margin_v,
+                highlight_style=body.highlight_style,
             )
         except Exception as exc:
             raise _map_supervisor_errors(exc)
@@ -1123,6 +1479,7 @@ def create_app(
         require_loopback(request)
         return _render_index_html()
 
+    @app.get("/editor/{rest:path}")
     @app.get("/project/{rest:path}")
     @app.get("/system")
     async def studio_spa_fallback(request: Request, rest: str = "") -> HTMLResponse:

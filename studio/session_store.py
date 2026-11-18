@@ -50,6 +50,23 @@ CREATE TABLE IF NOT EXISTS crop_drafts (
     updated_at         TEXT NOT NULL,
     PRIMARY KEY (project_id, candidate_id)
 );
+
+CREATE TABLE IF NOT EXISTS editor_drafts (
+    project_id         TEXT PRIMARY KEY,
+    title_override     TEXT,
+    draft_json         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS brand_kit_items (
+    item_id            TEXT PRIMARY KEY,
+    category           TEXT NOT NULL,
+    name               TEXT NOT NULL,
+    payload_json       TEXT NOT NULL,
+    created_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_brand_kit_category ON brand_kit_items(category, created_at DESC);
 """
 
 
@@ -249,5 +266,135 @@ class SessionStore:
         with self._lock, self._connection() as conn:
             cur = conn.execute(
                 "DELETE FROM sessions WHERE session_id = ?", (session_id,)
+            )
+            return (cur.rowcount or 0) > 0
+
+    # ---- Provisional UI Editor Drafts & Title Overrides ------------------
+
+    def get_editor_draft(self, project_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as conn:
+            row = conn.execute(
+                "SELECT project_id, title_override, draft_json, updated_at FROM editor_drafts WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            return {"project_id": project_id, "title_override": None, "draft": {}, "updated_at": None}
+        try:
+            draft = json.loads(row["draft_json"])
+            if not isinstance(draft, dict):
+                draft = {}
+        except json.JSONDecodeError:
+            draft = {}
+        return {
+            "project_id": project_id,
+            "title_override": row["title_override"],
+            "draft": draft,
+            "updated_at": row["updated_at"],
+        }
+
+    def save_editor_draft(
+        self,
+        project_id: str,
+        draft: dict[str, Any],
+        *,
+        title_override: Any = ...,
+    ) -> dict[str, Any]:
+        now = _utc_now()
+        existing = self.get_editor_draft(project_id)
+        next_title = existing.get("title_override") if title_override is ... else title_override
+        raw = json.dumps(draft, ensure_ascii=False, default=str)
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO editor_drafts (project_id, title_override, draft_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(project_id)
+                DO UPDATE SET title_override = excluded.title_override,
+                              draft_json = excluded.draft_json,
+                              updated_at = excluded.updated_at
+                """,
+                (project_id, next_title, raw, now),
+            )
+        return {
+            "project_id": project_id,
+            "title_override": next_title,
+            "draft": draft,
+            "updated_at": now,
+        }
+
+    def set_title_override(self, project_id: str, title: str) -> dict[str, Any]:
+        existing = self.get_editor_draft(project_id)
+        return self.save_editor_draft(
+            project_id,
+            existing.get("draft") or {},
+            title_override=title.strip()[:120] or None,
+        )
+
+    def get_all_title_overrides(self) -> dict[str, str]:
+        with self._lock, self._connection() as conn:
+            rows = conn.execute(
+                "SELECT project_id, title_override FROM editor_drafts WHERE title_override IS NOT NULL AND title_override != ''"
+            ).fetchall()
+        return {str(r["project_id"]): str(r["title_override"]) for r in rows}
+
+    # ---- Brand Kit / My Workspace Persistence ----------------------------
+
+    def list_brand_kit(self, category: Optional[str] = None) -> list[dict[str, Any]]:
+        with self._lock, self._connection() as conn:
+            if category and category != "all":
+                rows = conn.execute(
+                    "SELECT * FROM brand_kit_items WHERE category = ? ORDER BY created_at DESC",
+                    (category,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM brand_kit_items ORDER BY created_at DESC"
+                ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                payload = json.loads(r["payload_json"])
+            except json.JSONDecodeError:
+                payload = {}
+            out.append({
+                "item_id": r["item_id"],
+                "category": r["category"],
+                "name": r["name"],
+                "payload": payload,
+                "created_at": r["created_at"],
+            })
+        return out
+
+    def add_brand_kit_item(
+        self,
+        *,
+        category: str,
+        name: str,
+        payload: dict[str, Any],
+        item_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        iid = item_id or f"bk_{uuid.uuid4().hex[:10]}"
+        now = _utc_now()
+        raw = json.dumps(payload, ensure_ascii=False, default=str)
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO brand_kit_items (item_id, category, name, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (iid, category.strip().lower(), name.strip()[:120], raw, now),
+            )
+        return {
+            "item_id": iid,
+            "category": category.strip().lower(),
+            "name": name.strip()[:120],
+            "payload": payload,
+            "created_at": now,
+        }
+
+    def delete_brand_kit_item(self, item_id: str) -> bool:
+        with self._lock, self._connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM brand_kit_items WHERE item_id = ?", (item_id,)
             )
             return (cur.rowcount or 0) > 0

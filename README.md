@@ -1,8 +1,9 @@
 # AI Video Lab — Local-First AI Video & Social Media Studio
 ### Powered by OpenMontage | Local-First Architecture
 
-[![Tests](https://img.shields.io/badge/tests-22%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-235%2B%20passed-brightgreen.svg)]()
 [![Python 3.11–3.14 core](https://img.shields.io/badge/python-3.11--3.14-blue.svg)]()
+[![Studio UI](https://img.shields.io/badge/studio-React%2019%20%2B%20Vite%206%20%2B%20Tailwind%20v4-amber.svg)]()
 [![License: AGPLv3](https://img.shields.io/badge/license-AGPLv3-blue.svg)](LICENSE)
 [![Architecture](https://img.shields.io/badge/architecture-local--first%20agentic-purple.svg)]()
 
@@ -25,47 +26,17 @@ Agent reads pipeline manifest (YAML) ──> reads stage director skill (Markdow
 
 ---
 
-## 📦 Milestone Implementation & Architecture Status
+## 📦 Implementation Status (`HEAD 216a604`)
 
-### ✅ Milestone 1: URL Intake & Source Media Acquisition (COMPLETED & ACCEPTED)
-Enables OpenMontage's `clip-factory` pipeline to ingest remote video URLs (YouTube, Vimeo, etc.) and acquire ground-truth media:
-- **Dedicated URL Intake Adapter (`lib/url_ingest.py`):**
-  - Production wrapper integrating OpenMontage's `VideoDownloader` (`yt-dlp`) and `TranscriptFetcher` (`youtube-transcript-api`).
-  - Application-level YouTube/Vimeo host allowlisting and preflight IP filtering for private, loopback, link-local, reserved, and multicast destinations. This does not guarantee protection from DNS rebinding or redirects after preflight.
-  - Resource guards enforce a 3600-second default maximum duration, recheck duration after probing, and check disk space before download.
-  - **Dual Extraction:** Automatically extracts high-quality audio (`source_audio.wav`) and captions (`transcript.json`).
-  - Seamless handoff to canonical `lib/source_media_review.py` for duration, resolution, audio track, and speech density probing.
-- **Pipeline Integration:**
-  - `pipeline_defs/clip-factory.yaml`: Unlocked `video_downloader` and `transcript_fetcher` in stage `idea.tools_available`.
-  - `skills/pipelines/clip-factory/idea-director.md`: Documented Source Acquisition Protocol and input schema contract.
-- **Test Coverage:**
-  - `tests/unit/test_url_ingest.py`: 12 automated unit tests covering URL normalization, SSRF protection, duration guardrails, mock intake flows, and error handling.
-  - `tests/qa/test_url_intake_smoke.py`: 2 automated smoke tests verifying live integration and manifest persistence.
-
----
-
-### 🔬 Milestone 2: Conversation Intelligence, Semantic Moment Discovery & Clip Selection (ARCHITECTURE FROZEN)
-Addresses the challenge of extracting viral, coherent, standalone clips from long-form conversations:
-- **Comprehensive Forensic Audit (`planning/16_M2_MASTER_REPOSITORY_FORENSIC_AUDIT.md`):**
-  - Audited all 10 existing pipeline agents, 26 core repository files, and model/runtime constraints.
-  - Established that OpenMontage has **no runtime LLM in Python** (`docs/ARCHITECTURE.md line 100`).
-- **Architectural Decision: Option B (Native OpenMontage Extension):**
-  - Preserves the **Script Director** (`skills/pipelines/clip-factory/script-director.md`) as the semantic reasoning intelligence.
-  - Equips the Script Director with specialized deterministic Python analytical tools:
-    1. `transcript_normalizer.py`: Text cleaning, speaker grouping, and bidirectional token-to-source indexing.
-    2. `clip_selector.py`: Candidate ranking, silence-snapping boundary refinement, and schema serialization.
-    3. `hook_validator.py`: Verbatim spoken hook verification against raw transcript evidence with character offsets `[char_start, char_end]`.
-- **Dual-Artifact Pipeline Compatibility:**
-  - **Canonical `script.json`:** Approved clips formatted as sections `script.sections`, 100% compatible with `lib/checkpoint.py`, `backlot/state.py` storyboard cards, and downstream `scene_plan` stages.
-  - **First-Class `clip_selection_plan.json`:** Comprehensive candidate dossier with virality vectors, hook classifications, and full transcript provenance.
-- **3-Tier Timestamp Provenance:**
-  - `SOURCE_SEGMENT`: Exact YouTube caption or Whisper segment boundary.
-  - `ESTIMATED_INTERPOLATED`: Word-count interpolated boundary.
-  - `ACOUSTICALLY_VERIFIED`: Snapped to speech onset/offset via `silence_cutter` (FFmpeg `silencedetect`).
-  - Universal fixed padding is abolished in favor of acoustic silence snapping.
-- **Hardware Envelope & Model Tiering:**
-  - Grounded for consumer workstation hardware (NVIDIA GeForce RTX 3050 Laptop GPU, 6,144 MiB VRAM, 15.7 GB RAM).
-  - Tier 1 (Cloud/Frontier LLMs via agent) for full 30k-token conversation intelligence; Tier 2/3 (Local 7B/3B via Ollama) for offline fallback.
+| Layer / Milestone | Status | Key Modules & Verified Capabilities |
+| :--- | :---: | :--- |
+| **M1 + Phase 1: Hardened Intake & Broadcast GPU** | ✅ **DONE** | `lib/url_ingest.py`, `lib/ssrf_guard.py` (connect-time SSRF), `tools/analysis/url_intake.py`, `lib/ffmpeg_profiles.py` (RTX 3050 `h264_nvenc` + single-pass `-14 LUFS`/`-2.0 dBTP` loudnorm + metadata scrub) |
+| **M2 + M3: Conversation Intelligence & Human Gates** | ✅ **DONE** | `lib/models/`, `lib/transcript_normalizer.py`, `lib/conversation_structure.py`, `lib/acoustic_profiler.py`, `lib/hook_validator.py`, `lib/cold_viewer_auditor.py`, `lib/editorial_evaluator.py`, `lib/deduplicator.py`, `tools/analysis/clip_selector.py` (SHA-256 dual-artifact sync with `lib/checkpoint.py`) |
+| **M4 + Phase 2: Smart Reframe v2 Cinematography** | ✅ **DONE** | `lib/face_detector.py` (YuNet ONNX), `lib/camera_tracker.py` (`SmoothedCameraman`), `lib/split_layout.py`, `lib/active_speaker.py`, `lib/punch_in.py`, `tools/video/auto_reframe.py` (zero frame drift), `tools/video/vertical_clip_composer.py` |
+| **M6a + Phase 3: 8 Presets, `Style: Seam` & Eval Studio** | ✅ **DONE** | `lib/subtitle_styles.py` (8 DirectWrite-verified OFL fonts in `assets/fonts/`, incl. Hinglish Devanagari), `lib/layout_ranges.py`, `tools/subtitle/subtitle_gen.py` (`Style: Seam` center placement for 2-speaker split), `lib/eval_studio.py` |
+| **M5 + Phase 5: Broadcast QA, Hard-Gated Export & Gateway** | ✅ **DONE** | `tools/analysis/media_qa.py` & `lib/media_qa.py` (`integrated_lufs`, `true_peak_dbtp`, strict loudnorm window, freeze/black-frame detection), hard-gated batch `tools/publishers/export_bundle.py`, `lib/llm_gateway.py` |
+| **Phase 4 + Pro Studio (`216a604`): Broadcast Obsidian Pro UI** | ✅ **DONE** | Loopback + CSRF hardened FastAPI BFF (`studio/` on `127.0.0.1:4760`) + React 19 / TypeScript / Vite 6 / Tailwind v4 SPA (`studio/web/` → `studio/ui/`) covering all 13 pipelines, 169 tools, 6 playbooks, NLE Multi-Track Timeline (PCM waveform, filmstrip, on-canvas Single/Split crop, word-snapped recut), Universal Pipeline Board, Broadcast QA, and persistent `fcc-claude` Executive Producer Dock (`0` console/page/network errors in Playwright Chromium E2E) |
+| **Phase 0 (`BU-0.1`) & Phase 6 (`BU-6.1`)** | ⏳ **NEXT** | System-level `free-claude-code` (`127.0.0.1:8082`) install + live end-to-end 2-speaker podcast walkthrough through Pro Studio UI |
 
 ---
 
@@ -98,29 +69,26 @@ All research, architecture decisions, forensic audits, and verification reports 
 
 ```text
 AI-Video-Lab/
-├── backlot/                   # Living storyboard web UI & state server (port 4750)
-├── docs/                      # Architectural specifications & provider documentation
-├── lib/                       # Core library modules
-│   ├── checkpoint.py          # State machine, artifact schemas, and human approval gates
-│   ├── source_media_review.py # Universal media probing and review
-│   └── url_ingest.py          # [M1] URL Intake Adapter (SSRF, yt-dlp, transcript fetching)
-├── pipeline_defs/             # Declarative pipeline manifests
-│   └── clip-factory.yaml      # Multi-clip production pipeline
-├── planning/                  # Complete 16-report architectural & forensic audit dossier
+├── architecture/              # Permanent 3-layer engineering brain (01–03)
+├── assets/
+│   ├── fonts/                 # 8 bundled DirectWrite-verified OFL subtitle fonts (incl. Devanagari)
+│   └── models/                # YuNet ONNX face detection weights
+├── backlot/                   # Read-only living storyboard observer server (127.0.0.1:4750)
+├── studio/                    # Broadcast Obsidian Pro Studio (127.0.0.1:4760)
+│   ├── server.py              # Loopback + CSRF hardened FastAPI BFF & SSE streams
+│   ├── catalog.py             # Whole-system 13-pipeline / 169-tool / 6-playbook catalog
+│   ├── media_engine.py        # FFmpeg PCM waveform, filmstrip, upload & music engine
+│   ├── supervisor.py          # fcc-claude NDJSON stream-json + --resume manager
+│   ├── web/                   # React 19 + TypeScript + Vite 6 + Tailwind CSS v4 source
+│   └── ui/                    # Compiled static production SPA served by `python -m studio`
+├── lib/                       # Deterministic engines (Intake, Reframe v2, Seam Subs, QA, Eval)
+├── pipeline_defs/             # 13 declarative YAML pipeline manifests
+├── planning/                  # Architectural research, audits & roadmaps
 ├── remotion-composer/         # React-based programmatic video rendering engine
-├── schemas/                   # JSON schemas for stage artifacts
+├── schemas/                   # JSON schemas for all 21 stage artifacts
 ├── skills/                    # Instruction-driven stage director & meta skills
-│   └── pipelines/clip-factory/
-│       ├── idea-director.md   # [M1] Intake & concept ideation director
-│       └── script-director.md # [M2] Semantic moment discovery director
-├── tests/                     # Test suites
-│   ├── contracts/             # Instruction and pipeline contract integrity tests
-│   ├── qa/                    # Quality assurance & smoke tests
-│   └── unit/                  # Unit tests (including test_url_ingest.py)
-├── tools/                     # Deterministic tool registry & implementations
-│   ├── analysis/              # video_downloader, transcriber, transcript_fetcher, audio_energy
-│   ├── subtitle/              # subtitle_gen (karaoke style SRT/VTT)
-│   └── video/                 # video_trimmer, silence_cutter, auto_reframe
+├── tests/                     # Unit, backlot, contract, hardening & integration suites
+├── tools/                     # 169 registered BaseTool implementations across 27 families
 ├── AGENT_GUIDE.md             # Complete agent operating manual and contract
 └── requirements.txt           # Python dependencies
 ```
@@ -157,11 +125,19 @@ Run the test suites to ensure system integrity:
 pytest -m "not network" tests/
 ```
 
-### 4. Run the Living Storyboard (Backlot)
+### 4. Run Pro Studio (Interactive NLE & Top Supervisor Cockpit)
+```bash
+python -m studio
+```
+Visit `http://127.0.0.1:4760` for the Broadcast Obsidian Pro workstation (Command Hub, Pro NLE Clip & Reframe Studio, Universal Pipeline Board, Broadcast QA & Export, System 169-Tool Matrix, and `fcc-claude` Executive Producer Dock).
+
+*(To rebuild the frontend after editing `studio/web/`, run `pnpm --dir studio/web run build`.)*
+
+### 5. Run the Read-Only Living Storyboard (Backlot)
 ```bash
 python -m backlot.server
 ```
-Visit `http://localhost:4750` to inspect living production projects and review clips.
+Visit `http://127.0.0.1:4750` for the strictly read-only project observer board.
 
 ---
 

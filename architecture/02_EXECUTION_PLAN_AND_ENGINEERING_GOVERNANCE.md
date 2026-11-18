@@ -4,8 +4,8 @@
 **Repository:** `https://github.com/Unstocks/AI-video-Lab.git` (`C:\AI-Video-Lab`)  
 **Companion Architecture Spec:** `architecture/01_SYSTEM_ARCHITECTURE.md`  
 **Companion Decision Playbook:** `architecture/03_ENGINEERING_BRAIN_AND_DECISION_PLAYBOOK.md`  
-**Base HEAD Commit Inspected:** `7cf6b52f0b279f50d193f6aab7c25be5f3b8f95f` (`main` / `origin/openmontage`) `[VERIFIED]`  
-**Date:** November 17, 2026
+**Current Verified HEAD:** `216a604` (evolved from baseline `7cf6b52f`) `[VERIFIED]`  
+**Last Updated:** November 18, 2026
 
 > This document is the **permanent operational execution contract** governing how Antigravity, Codex, or any future engineering agent plans, implements, verifies, and reports every milestone in AI Video Lab.
 
@@ -30,8 +30,8 @@ flowchart TD
 
 ---
 
-### Milestone 1 (Phase 1) — M1 Reliability, Security, Packaging & Uncommitted Review Closure — `[VERIFIED — ACCEPTED, UNCOMMITTED]`
-- **Status:** **ACCEPTED (Uncommitted on disk at `HEAD 7cf6b52f`).** Independently audited and verified: `tests/unit/test_url_ingest.py` **26/26 passed** (`4.99s`, `--basetemp=.pytest_cache/tmp`); `tests/qa/test_url_intake_smoke.py` **2 collected** (`1 passed, 1 network deselected` offline); `ToolRegistry.discover()` **165 tools** (`url_intake` `source`/`source_ingest`/`available`); upstream regressions **55 passed**. All 3 previously flagged review defects (`VideoDownloader` global extractor lock -> caller-scoped `allowed_extractors` per `ADR-008`, duplicate manifest `proxy_video_path` key + H.264 `yuv420p`/`+faststart` encoding, `URLIntake` full `BaseTool` contract & error capture) are verified resolved. `[VERIFIED]`
+### Milestone 1 (Phase 1) — M1 Reliability, Security, Packaging & Uncommitted Review Closure — `[VERIFIED — COMMITTED 0699621]`
+- **Status:** **COMMITTED & HARDENED (`0699621`, `a3bff47`, `f9796d8`).** Independently audited and verified: `tests/unit/test_url_ingest.py` + `tests/unit/test_ssrf_guard.py` (connect-time SSRF guard + upfront private-URL block + post-probe duration cap + H.264 proxy). `[VERIFIED]`
 - **Objective:** Finalize URL intake hardening cleanly, fix the 3 review defects caught in Codex's uncommitted Phase 1 edits, and lock a verified, clean-install-safe M1 baseline. `[VERIFIED]`
 - **Why It Exists:** Clean installs previously failed (`yt-dlp`, `youtube-transcript-api` undeclared), unknown durations bypassed caps, sequential file moves lacked rollback, and Codex's uncommitted edits introduced a cross-pipeline regression in `VideoDownloader` (`allowed_extractors` hardcoded globally) and an incomplete `URLIntake` `BaseTool` contract.
 - **Prerequisites:** Read `architecture/01`, `02`, `03`; verify `git status -sb`.
@@ -50,35 +50,46 @@ flowchart TD
 
 ---
 
-### Milestone 2A — Evidence, Orthogonal Timing & Data Contracts — `[VERIFIED — ACCEPTED, UNCOMMITTED]`
-- **Status:** **ACCEPTED (Uncommitted).** All 5 Layer 0 review defects closed and independently verified (`lib/models/{__init__,transcript,clip_plan}.py`, `schemas/artifacts/clip_selection_plan.schema.json`, `schemas/artifacts/__init__.py`). `[VERIFIED]`
+### Milestone 2A — Evidence, Orthogonal Timing & Data Contracts — `[VERIFIED — COMMITTED 4196087]`
+- **Status:** **COMMITTED (`4196087`).** All 5 Layer 0 review defects closed and independently verified (`lib/models/{__init__,transcript,clip_plan}.py`, `schemas/artifacts/clip_selection_plan.schema.json`, `schemas/artifacts/__init__.py`). `[VERIFIED]`
 
-### Milestone 2B — Transcript Intelligence & True Offset-Mapped Normalization — `[VERIFIED — ACCEPTED, UNCOMMITTED]`
-- **Status:** **ACCEPTED (Uncommitted).** All 5 audit catches closed and independently verified (`lib/transcript_normalizer.py` stateless + 2-stage entity/whitespace/NFC cluster alignment + UTF-8 BOM + `segment_order` gap fidelity; `lib/conversation_structure.py` EN/Hinglish/Devanagari Q&A + max-overlap block lookup). `[VERIFIED]`
+### Milestone 2B — Transcript Intelligence & True Offset-Mapped Normalization — `[VERIFIED — COMMITTED 4196087]`
+- **Status:** **COMMITTED (`4196087`).** All 5 audit catches closed and independently verified (`lib/transcript_normalizer.py`, `lib/conversation_structure.py`). `[VERIFIED]`
 
-### Milestone 2C — Acoustic Evidence & Non-Destructive Boundary Signals — `[VERIFIED — ACCEPTED, UNCOMMITTED]`
-- **Status:** **ACCEPTED (Uncommitted).** `lib/acoustic_profiler.py` independently verified (`19/19` tests incl. real FFmpeg synthetic tone/silence WAV & 2-shot MP4, 0-silence branch, temp-dir sidecar cleanup, `thought_complete=False` protection, VAD Protocol seam). `[VERIFIED]`
+### Milestone 2C — Acoustic Evidence & Non-Destructive Boundary Signals — `[VERIFIED — COMMITTED 4196087]`
+- **Status:** **COMMITTED (`4196087`).** `lib/acoustic_profiler.py` independently verified (`19/19` tests). `[VERIFIED]`
 
-### Milestone 2D — Hook Validation, Cold-Viewer Gate, Editorial Evaluation, Deduplication & `clip_selector` Tool — `[VERIFIED — ACCEPTED, UNCOMMITTED]`
-- **Status:** **ACCEPTED (Uncommitted).** `lib/hook_validator.py`, `lib/cold_viewer_auditor.py`, `lib/editorial_evaluator.py`, `lib/deduplicator.py`, `tools/analysis/clip_selector.py` (tool #166 `analyze`/`analysis`/`available`/`[]`) + all 3 mini-hardening catches independently verified (`37/37` passed). `[VERIFIED]`
+### Milestone 2D — Hook Validation, Cold-Viewer Gate, Editorial Evaluation, Deduplication & `clip_selector` Tool — `[VERIFIED — COMMITTED 4196087]`
+- **Status:** **COMMITTED (`4196087`).** `lib/hook_validator.py`, `lib/cold_viewer_auditor.py`, `lib/editorial_evaluator.py`, `lib/deduplicator.py`, `tools/analysis/clip_selector.py` (`37/37` passed). `[VERIFIED]`
 
-### Milestone 3 — Human Review, Checkpoint Integration & Dual-Artifact Sync — `[VERIFIED — ACCEPTED, UNCOMMITTED]`
-- **Status:** **ACCEPTED (Uncommitted).** Unified `build_script_from_plan()`, `finalize_approved_selection()`, `verify_script_plan_sync()` in `tools/analysis/clip_selector.py`; wired `pipeline_defs/{clip-factory,podcast-repurpose}.yaml`, `skills/pipelines/clip-factory/{script-director,executive-producer}.md`, and 1-line read-only `backlot/state.py` `ARTIFACT_FILES`; 0 diff lines on `lib/checkpoint.py`, `lib/source_media_review.py`, `backlot/server.py`, and `schemas/artifacts/script.schema.json`. Independently verified (`134 passed, 1 deselected in 4.53s` incl. real `checkpoint.py` + `load_board_state()` end-to-end handoff). `[VERIFIED]`
-
----
-
-### Milestone 4 — Vertical 9:16 Composition, Speaker-Aware Reframing & Synchronized Subtitles — `[VERIFIED — ACCEPTED]`
-- **Status:** **ACCEPTED.** Locked `OD-04` (FFmpeg ASS/SRT first, Remotion seam preserved), `OD-02` (Py3.14), `OD-03` (pluggable STT seam). Updated `YOUTUBE_SHORTS` to `180s` (`lib/media_profiles.py`); upgraded `tools/video/auto_reframe.py` (shot-cut smoothing reset, pluggable `speaker_tracks`, 3 layout modes, Windows `sendcmd` escaping, `yuv420p`/`+faststart`); upgraded `tools/subtitle/subtitle_gen.py` (`rebase_segments_to_clip`, UTF-8 Devanagari/Hinglish `format="ass"` with 9:16 safe zones, honest coarse-caption highlight downgrade); created approval-gated `lib/vertical_composer.py`; wired `clip-factory.yaml` & `{scene,edit,compose}-director.md`. Independently verified (`86 passed in 15.84s`; real `ffprobe` 1080×1920 H.264/AAC/yuv420p). `[VERIFIED]`
-
-### Milestone 5 — Automated Media QA, Backlot Preview & Multi-Clip Export Delivery — `[VERIFIED — ACCEPTED]`
-- **Status:** **ACCEPTED.** Created `lib/media_qa.py` (`MediaQAInspector` + `apply_qa_to_plan` emitting schema-valid `final_review.json` with 4+ PIL frame black-frame detection, `ebur128` loudness/silence, AV-sync drift, subtitle drift, runtime-swap block); extended `tools/publishers/export_bundle.py` with backward-compatible multi-clip QA-gated batch export (`clips/01_<id>/`, atomic `manifest.json`, schema-valid `publish_log.json`, excluding `QA_FAILED` clips); wired `audio_probe`/`frame_sampler`/`export_bundle` into `clip-factory.yaml` & `publish-director.md`; proven end-to-end with real FFmpeg media, unmodified `lib/checkpoint.py`, and `backlot/state.py` (`76 passed in 36.23s`). `[VERIFIED]`
+### Milestone 3 — Human Review, Checkpoint Integration & Dual-Artifact Sync — `[VERIFIED — COMMITTED b443b3c]`
+- **Status:** **COMMITTED (`b443b3c`).** Unified `build_script_from_plan()`, `finalize_approved_selection()`, `verify_script_plan_sync()`; wired `pipeline_defs/{clip-factory,podcast-repurpose}.yaml`, `skills/pipelines/clip-factory/{script-director,executive-producer}.md`, and read-only `backlot/state.py`. `[VERIFIED]`
 
 ---
 
-### Milestone 6 — Multimodal Intelligence (ASD, Forced Alignment) & Golden-Dataset Evaluation Studio — `[NEXT OPTIONAL PRO UPGRADES]`
-- **Objective:** Upgrade multi-speaker framing with audio-visual Active Speaker Detection (`Light-ASD`/`LoCoNet`), integrate CTC forced alignment (`WhisperX`/`wav2vec2`) + diarization (`pyannote` or managed cloud STT), add optional opt-in `lib/providers/` evaluation seam ONLY if justified for automated benchmarks, and build the 12-dimension golden-dataset evaluation harness. `[PROPOSED]`
-- **Prerequisites:** Milestones 1–5 proven end-to-end on real episodes + owner decisions on **OD-02** and **OD-03**.
-- **Acceptance Criteria:** Measured baseline + comparative evaluation across 7+ podcast archetypes without regressing architecture or human gates.
+### Milestone 4 — Vertical 9:16 Composition, Speaker-Aware Reframing & Synchronized Subtitles — `[VERIFIED — COMMITTED c935bab]`
+- **Status:** **COMMITTED & UPGRADED (`c935bab`, `080f19a`, `a3bff47`, `8027c36`, `b0ed975`, `f9796d8`).** Evolved into full Smart Reframe v2 cinematography engine (YuNet ONNX, `SmoothedCameraman`, `SplitLayout`, `ActiveSpeaker`, `PunchIn`, zero frame drift) + `Style: Seam` split subtitles + 8/8 bundled OFL fonts + RTX 3050 `h264_nvenc` + single-pass `-14 LUFS` `lib/ffmpeg_profiles.py`. `[VERIFIED]`
+
+### Milestone 5 — Automated Media QA, Backlot Preview & Multi-Clip Export Delivery — `[VERIFIED — COMMITTED fb82380]`
+- **Status:** **COMMITTED & HARDENED (`fb82380`, `080f19a`, `03ac66d`, `f9796d8`).** Registered `tools/analysis/media_qa.py` + `tools/video/vertical_clip_composer.py`, strict loudnorm-window enforcement (`-16..-12 LUFS`, `<= -1.0 dBTP`), hard-gated batch `export_bundle`, and read-only Backlot Clip Studio projection. `[VERIFIED]`
+
+### Milestone 6a — 8 Designer ASS Subtitle Presets & 12-Dimension Golden Eval Studio — `[VERIFIED — COMMITTED cdfc094, f9796d8]`
+- **Status:** **COMMITTED (`cdfc094`, `b0ed975`, `f9796d8`).** All 8 ASS subtitle presets (`lib/subtitle_styles.py`) paired with bundled DirectWrite-verified fonts in `assets/fonts/` + 12-dimension `lib/eval_studio.py`. `[VERIFIED]`
+
+### Studio Phases 1–5 + Adversarial Backend Hardening + Broadcast Obsidian Pro UI — `[VERIFIED — COMMITTED a3bff47..216a604]`
+- **Phase 1 (`a3bff47`):** Connect-time `lib/ssrf_guard.py`, preflight gate, unified `lib/ffmpeg_profiles.py` (RTX 3050 NVENC + single-pass `-14 LUFS` + metadata scrub).
+- **Phase 2 (`8027c36`):** Smart Reframe v2 (`lib/face_detector.py` YuNet ONNX, `lib/camera_tracker.py`, `lib/split_layout.py`, `lib/active_speaker.py`, `lib/punch_in.py`, upgraded `auto_reframe.py`).
+- **Phase 3 (`b0ed975`):** `lib/layout_ranges.py`, `Style: Seam` split subtitles, continuation-word merging, bundled OFL fonts.
+- **Phase 4 Backend + Phase 5 (`03ac66d`):** Loopback/CSRF hardened `studio/` FastAPI server (`127.0.0.1:4760`), SQLite `SessionStore`, `fcc-claude` `SupervisorManager`, Backlot read-only `clip_studio` projection, Broadcast QA metrics, `lib/llm_gateway.py`.
+- **Adversarial Backend Hardening (`f9796d8`):** Closed all P0–P2 audit findings (schema joins, 16MiB NDJSON streaming, exact-frame multi-scene Reframe v2, 8/8 bundled fonts, SQLite WAL, apostrophe-safe `sendcmd`, strict loudnorm window, director skills — **210/210 tests green**).
+- **Broadcast Obsidian Pro Studio Frontend & Whole-System BFF (`216a604`):** `studio/catalog.py`, `studio/media_engine.py`, React 19 + TS + Vite 6 + Tailwind v4 + Framer Motion + Zustand SPA (`studio/web/` → `studio/ui/`) covering all 13 pipelines, 169 tools, 6 playbooks, 9 media profiles, NLE multi-track timeline (PCM waveform + inline filmstrip + on-canvas Single/Split crop + word-snapped transcript), Universal Pipeline Board, Broadcast QA, System 169-Tool Matrix, and Executive Producer Dock (**25/25 BFF/hardening tests + 0-error live Chromium E2E audit across 10 screenshots**).
+
+---
+
+### Remaining Work (Active Closure + Optional Future Horizon)
+1. **Phase 0 (`BU-0.1` — System-Level `free-claude-code` Setup) — `[PENDING]`:** Install `uv`, `free-claude-code` (`127.0.0.1:8082`), and `@anthropic-ai/claude-code` outside `C:\AI-Video-Lab`, configure free provider chain (NVIDIA NIM → Gemini → OpenRouter), and verify `fcc-doctor` + `fcc-claude --output-format stream-json`.
+2. **Phase 6 (`BU-6.1` — Full-Stack Live Production Sign-Off) — `[PENDING — BLOCKED ON BU-0.1]`:** Run a real 10–30 min 2-speaker podcast YouTube URL end-to-end through `http://127.0.0.1:4760` → `fcc-claude` → RTX 3050 NVENC Reframe v2 + `Style: Seam` → `media_qa` → on-canvas crop override → `export_bundle` → PNG visual audit.
+3. **Optional Future Horizon (Milestone 6b) — `[OPTIONAL]`:** Real human-annotated podcast corpus in `eval_datasets/` (7+ archetypes), optional Python 3.11/3.12 ML sidecar for `faster-whisper`/`WhisperX` CTC forced alignment & `Light-ASD`/`pyannote`, and optional `remotion-composer` npm install (`remotion_nm=False`, while `ffmpeg` and `hyperframes` are already ready). `[PROPOSED]`
 
 ---
 

@@ -474,6 +474,9 @@ class SupervisorManager:
         style_preset: str,
         project_id: str | None = None,
         layout_mode: str | None = None,
+        corrections: dict[str, str] | None = None,
+        margin_v: int | None = None,
+        highlight_style: str | None = None,
     ) -> dict[str, Any]:
         session = await asyncio.to_thread(self.store.get_session, session_id)
         if session is None:
@@ -486,6 +489,9 @@ class SupervisorManager:
             candidate_id=candidate_id,
             style_preset=style_preset,
             layout_mode=layout_mode,
+            corrections=corrections,
+            margin_v=margin_v,
+            highlight_style=highlight_style,
         )
         await self._launch_turn(
             session_id,
@@ -526,6 +532,7 @@ class SupervisorManager:
         style_playbook: str | None = None,
         media_profile: str | None = None,
         render_runtime: str | None = None,
+        composition_mode: str | None = None,
         style_preset: str | None = None,
         budget_usd: float | None = None,
         clip_count: int = 2,
@@ -550,6 +557,7 @@ class SupervisorManager:
             style_playbook=style_playbook,
             media_profile=media_profile,
             render_runtime=render_runtime,
+            composition_mode=composition_mode,
             style_preset=style_preset,
             budget_usd=budget_usd,
             clip_count=clip_count,
@@ -610,6 +618,8 @@ class SupervisorManager:
         decision: str,
         notes: str = "",
         project_id: str | None = None,
+        render_runtime: str | None = None,
+        composition_mode: str | None = None,
     ) -> dict[str, Any]:
         """Approve, revise, or reject ANY human-gated pipeline stage."""
         session = await asyncio.to_thread(self.store.get_session, session_id)
@@ -625,11 +635,40 @@ class SupervisorManager:
             stage=stage.strip(),
             decision=decision.strip().lower(),
             notes=notes,
+            render_runtime=render_runtime,
+            composition_mode=composition_mode,
         )
         await self._launch_turn(
             session_id,
             directive,
             user_display=f"Gate [{stage}]: {decision.upper()}" + (f" — {notes.strip()[:120]}" if notes.strip() else ""),
+        )
+        return await asyncio.to_thread(self.store.get_session, session_id) or session
+
+    async def send_tool_action(
+        self,
+        session_id: str,
+        *,
+        action: str,
+        params: dict[str, Any] | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Dispatch a structured Creator Editor tool action directive to Top Supervisor."""
+        session = await asyncio.to_thread(self.store.get_session, session_id)
+        if session is None:
+            raise KeyError(f"Unknown session: {session_id}")
+        pid = project_id or session.get("project_id")
+        if not pid or not is_valid_project_id(pid):
+            raise ValueError("Cannot execute tool action without a valid project_id.")
+        directive = prompts.build_tool_action_prompt(
+            project_id=pid,
+            action=action.strip(),
+            params=params,
+        )
+        await self._launch_turn(
+            session_id,
+            directive,
+            user_display=f"Tool Action [{action.strip()}] on {pid}",
         )
         return await asyncio.to_thread(self.store.get_session, session_id) or session
 

@@ -32,6 +32,8 @@ export function PipelineBoardWorkspace() {
   const [selectedArtifact, setSelectedArtifact] = useState<string | null>(null);
   const [artifactPayload, setArtifactPayload] = useState<unknown>(null);
   const [gateNotes, setGateNotes] = useState('');
+  const [gateRuntime, setGateRuntime] = useState<'ffmpeg' | 'hyperframes' | 'remotion'>('ffmpeg');
+  const [gateCompMode, setGateCompMode] = useState<'templated' | 'atelier'>('templated');
   const [gateSubmitting, setGateSubmitting] = useState(false);
 
   useEffect(() => {
@@ -82,6 +84,9 @@ export function PipelineBoardWorkspace() {
         decision,
         notes: gateNotes,
         project_id: projectId,
+        ...(awaitingStage.name === 'proposal'
+          ? { render_runtime: gateRuntime, composition_mode: gateCompMode }
+          : {}),
       });
       setRunning(true);
       setGateNotes('');
@@ -116,26 +121,22 @@ export function PipelineBoardWorkspace() {
     );
   }
 
-  const pipelineType =
-    boardState.pipeline?.pipeline_type || boardState.pipeline_type || 'unknown';
+  const pipelineType = boardState.pipeline?.pipeline_type || 'unknown';
   const scenes = Array.isArray(boardState.storyboard?.scenes)
     ? boardState.storyboard.scenes
-    : Array.isArray(boardState.scenes)
-      ? boardState.scenes
-      : [];
+    : [];
   const decisionLogArt = boardState.artifacts?.decision_log as
     | { decisions?: Array<Record<string, unknown>> }
     | undefined;
-  const decisions = Array.isArray(boardState.decisions)
-    ? boardState.decisions
-    : Array.isArray(decisionLogArt?.decisions)
-      ? decisionLogArt.decisions
-      : [];
-  const costTotal = boardState.cost?.total_usd ?? 0;
-  const costBudget = boardState.cost?.budget_usd ?? 0;
+  const decisions = Array.isArray(decisionLogArt?.decisions)
+    ? decisionLogArt.decisions
+    : [];
+  const costTotal = boardState.cost?.total_spent_usd ?? 0;
+  const costRemaining = boardState.cost?.budget_remaining_usd ?? null;
+  const isStalled = boardState.stages.some((s) => s.stalled);
 
   return (
-    <div className="mx-auto max-w-[1360px] space-y-5 p-5">
+    <div className="mx-auto max-w-[1360px] w-full overflow-y-auto space-y-5 p-5">
       {/* Project Header + Cost Meter */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
@@ -145,7 +146,7 @@ export function PipelineBoardWorkspace() {
             </h1>
             <Badge tone="cyan">{pipelineType}</Badge>
             {boardState.live && <Badge tone="pass">LIVE</Badge>}
-            {boardState.stalled && <Badge tone="fail">STALLED</Badge>}
+            {isStalled && <Badge tone="fail">STALLED</Badge>}
           </div>
           <div className="mt-0.5 font-mono text-[11px] text-[var(--text-muted)]">
             projects/{boardState.project_id}/ · {boardState.stages.length} stages ·{' '}
@@ -155,19 +156,19 @@ export function PipelineBoardWorkspace() {
 
         <Panel className="flex items-center gap-4 px-4 py-2 text-xs">
           <div>
-            <div className="text-[10px] uppercase text-[var(--text-muted)]">Spend</div>
+            <div className="text-[10px] uppercase text-[var(--text-muted)]">Spent</div>
             <div className="font-mono font-bold text-[var(--text-primary)]">{formatUsd(costTotal)}</div>
           </div>
-          {costBudget > 0 && (
+          {costRemaining != null && (
             <div>
-              <div className="text-[10px] uppercase text-[var(--text-muted)]">Budget Cap</div>
-              <div className="font-mono text-[var(--text-secondary)]">{formatUsd(costBudget)}</div>
+              <div className="text-[10px] uppercase text-[var(--text-muted)]">Remaining</div>
+              <div className="font-mono text-[var(--text-secondary)]">{formatUsd(costRemaining)}</div>
             </div>
           )}
         </Panel>
       </div>
 
-      {/* Universal Human Gate Review Bar */}
+      {/* Universal Human Gate Review Bar (with Proposal Runtime HARD RULE Lock) */}
       {awaitingStage && (
         <Panel className="border-[var(--accent-amber)]/50 bg-[var(--accent-amber-soft)]/70 p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -183,6 +184,33 @@ export function PipelineBoardWorkspace() {
               </p>
             </div>
           </div>
+          {awaitingStage.name === 'proposal' && (
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+              <label className="flex items-center gap-1.5">
+                <span className="font-semibold text-[var(--text-secondary)]">Lock Runtime:</span>
+                <select
+                  value={gateRuntime}
+                  onChange={(e) => setGateRuntime(e.target.value as typeof gateRuntime)}
+                  className="h-7 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2 text-xs font-mono"
+                >
+                  <option value="ffmpeg">ffmpeg</option>
+                  <option value="hyperframes">hyperframes</option>
+                  <option value="remotion">remotion</option>
+                </select>
+              </label>
+              <label className="flex items-center gap-1.5">
+                <span className="font-semibold text-[var(--text-secondary)]">Mode:</span>
+                <select
+                  value={gateCompMode}
+                  onChange={(e) => setGateCompMode(e.target.value as typeof gateCompMode)}
+                  className="h-7 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2 text-xs font-mono"
+                >
+                  <option value="templated">templated</option>
+                  <option value="atelier">atelier (bespoke)</option>
+                </select>
+              </label>
+            </div>
+          )}
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <input
               value={gateNotes}
@@ -376,8 +404,10 @@ export function PipelineBoardWorkspace() {
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {scenes.map((sc, idx) => {
-              const mediaUrl = String(sc.image_url || sc.thumb_url || sc.video_url || '');
-              const audioUrl = String(sc.audio_url || '');
+              const visPath = sc.visual?.path;
+              const mediaUrl = visPath && projectId ? `/media/${encodeURIComponent(projectId)}/${visPath}` : '';
+              const audioPath = sc.audio?.[0]?.path;
+              const audioUrl = audioPath && projectId ? `/media/${encodeURIComponent(projectId)}/${audioPath}` : '';
               return (
                 <Panel key={idx} className="overflow-hidden flex flex-col">
                   <div className="relative h-40 bg-[var(--bg-canvas)] border-b border-[var(--border-subtle)]">
@@ -390,16 +420,16 @@ export function PipelineBoardWorkspace() {
                     )}
                     <div className="absolute left-2 top-2">
                       <Badge tone="neutral" className="bg-black/70 text-zinc-100 border-white/15">
-                        SCENE {String(sc.scene_id || idx + 1)}
+                        SCENE {String(sc.id || idx + 1)}
                       </Badge>
                     </div>
                   </div>
                   <div className="p-3.5 flex-1 flex flex-col space-y-2 text-xs">
                     <div className="font-semibold text-[var(--text-primary)]">
-                      {String(sc.title || sc.heading || `Scene ${idx + 1}`)}
+                      {String(sc.section_label || sc.type || `Scene ${idx + 1}`)}
                     </div>
                     <p className="text-[11px] text-[var(--text-secondary)] line-clamp-3 leading-relaxed">
-                      {String(sc.narration || sc.script || sc.visual_description || '—')}
+                      {String(sc.narration || sc.description || '—')}
                     </p>
                     {audioUrl && (
                       <audio controls preload="none" src={audioUrl} className="mt-auto h-8 w-full" />

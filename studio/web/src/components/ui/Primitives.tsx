@@ -4,10 +4,11 @@ import { AlertTriangle, CheckCircle2, Info, X, XCircle } from 'lucide-react';
 import { cn } from '@/lib/format';
 import { useToastStore } from '@/stores/useStudioStore';
 
-export type Tone = 'neutral' | 'amber' | 'cyan' | 'violet' | 'pass' | 'warn' | 'fail';
+export type Tone = 'neutral' | 'lime' | 'amber' | 'cyan' | 'violet' | 'pass' | 'warn' | 'fail';
 
 const TONE_STYLES: Record<Tone, string> = {
   neutral: 'bg-[var(--bg-elevated)] text-[var(--text-secondary)] border-[var(--border-subtle)]',
+  lime: 'bg-[var(--accent-lime-soft)] text-[var(--accent-lime-strong)] border-[var(--accent-lime-border)]/50',
   amber: 'bg-[var(--accent-amber-soft)] text-[var(--accent-amber)] border-[var(--accent-amber)]/30',
   cyan: 'bg-[var(--accent-cyan-soft)] text-[var(--accent-cyan)] border-[var(--accent-cyan)]/30',
   violet: 'bg-[var(--accent-violet-soft)] text-[var(--accent-violet)] border-[var(--accent-violet)]/30',
@@ -70,7 +71,7 @@ export function StatusDot({
 }
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: 'primary' | 'secondary' | 'ghost' | 'danger' | 'cyan';
+  variant?: 'primary' | 'forest' | 'lime' | 'secondary' | 'ghost' | 'danger' | 'cyan';
   size?: 'xs' | 'sm' | 'md';
 }
 
@@ -83,11 +84,15 @@ export function Button({
 }: ButtonProps) {
   const styles = {
     primary:
-      'bg-[var(--accent-amber)] text-zinc-950 font-semibold hover:brightness-110 active:scale-[0.99] shadow-sm',
-    cyan: 'bg-[var(--accent-cyan)] text-zinc-950 font-semibold hover:brightness-110 active:scale-[0.99] shadow-sm',
+      'bg-[var(--cta-primary)] text-[var(--cta-primary-text)] font-semibold hover:bg-[var(--cta-primary-hover)] active:scale-[0.99] shadow-xs',
+    forest:
+      'bg-[#14452f] text-white font-semibold hover:bg-[#0f3624] active:scale-[0.99] shadow-xs',
+    lime:
+      'bg-[var(--accent-lime)] text-zinc-950 font-semibold hover:brightness-95 active:scale-[0.99] shadow-xs',
+    cyan: 'bg-[var(--accent-cyan)] text-white font-semibold hover:brightness-110 active:scale-[0.99] shadow-xs',
     secondary:
-      'bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-subtle)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-panel)]',
-    ghost: 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-elevated)]/70',
+      'bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-subtle)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-panel)]',
+    ghost: 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-elevated)]/80',
     danger:
       'bg-[var(--status-fail-soft)] text-[var(--status-fail)] border border-[var(--status-fail)]/40 hover:bg-[var(--status-fail)] hover:text-white',
   }[variant];

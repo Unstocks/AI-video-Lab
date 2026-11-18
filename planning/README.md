@@ -1,6 +1,8 @@
 # OpenMontage URL-to-Clips Architecture & Planning Documentation
 ## Master Index for Personal Social Media Video Automation
 
+> **Live Status Note (2026-11-18 @ `HEAD 216a604`):** The `planning/` folder is the historical research & design archive from M1–M2. For the **current live implementation ledger** (M1–M6a + Phases 1–5 + Adversarial Backend Hardening + Broadcast Obsidian Pro Studio React 19 UI = **18/20 Build Units COMPLETE**), see [`../architecture/02_EXECUTION_PLAN_AND_ENGINEERING_GOVERNANCE.md`](../architecture/02_EXECUTION_PLAN_AND_ENGINEERING_GOVERNANCE.md) and [`../README.md`](../README.md).
+
 Welcome to the architectural planning and forensic audit repository for enabling automated **URL-to-Shorts / Clips** functionality inside `AI-Video-Lab` using the official **OpenMontage** platform.
 
 ---
