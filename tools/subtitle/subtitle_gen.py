@@ -175,6 +175,21 @@ class SubtitleGen(BaseTool):
                 "type": "string", "enum": list(list_subtitle_styles()),
                 "description": "Optional offline ASS designer style preset.",
             },
+            "split_ranges": {
+                "type": "array",
+                "items": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2,
+                },
+                "description": "Optional [[start, end], ...] intervals where 2-speaker SPLIT layout is active (moves subtitles to center Style: Seam).",
+            },
+            "layout_ranges": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": "Optional .layout.json ranges array; 'split' entries automatically move subtitles to Style: Seam.",
+            },
         },
     }
 
@@ -183,6 +198,7 @@ class SubtitleGen(BaseTool):
         "segments", "format", "max_words_per_cue", "max_chars_per_line", "highlight_style",
         "clip_start_seconds", "clip_end_seconds", "play_res_x", "play_res_y", "font_name",
         "font_size", "margin_v", "margin_l", "margin_r", "corrections", "style_preset",
+        "split_ranges", "layout_ranges",
     ]
     side_effects = ["writes subtitle file to output_path"]
     user_visible_verification = [
@@ -260,6 +276,15 @@ class SubtitleGen(BaseTool):
             content = json.dumps({"cues": cues, "highlight_style": effective_highlight_style}, indent=2, ensure_ascii=False)
             ext = ".caption.json"
         elif fmt == "ass":
+            active_split_ranges: list[tuple[float, float]] = []
+            for pair in inputs.get("split_ranges") or []:
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    s_r, e_r = float(pair[0]), float(pair[1])
+                    if e_r > s_r:
+                        active_split_ranges.append((s_r, e_r))
+            if inputs.get("layout_ranges"):
+                from lib.layout_ranges import split_ranges as _extract_split_ranges
+                active_split_ranges.extend(_extract_split_ranges(inputs["layout_ranges"]))
             content = self._render_ass(
                 cues, effective_highlight_style,
                 play_res_x=inputs.get("play_res_x", 1080), play_res_y=inputs.get("play_res_y", 1920),
@@ -269,6 +294,7 @@ class SubtitleGen(BaseTool):
                 margin_l=inputs.get("margin_l", preset.margin_l if preset else 80),
                 margin_r=inputs.get("margin_r", preset.margin_r if preset else 120),
                 preset=preset,
+                split_ranges=active_split_ranges or None,
             )
             ext = ".ass"
         else:
@@ -335,6 +361,56 @@ class SubtitleGen(BaseTool):
 
         return result
 
+    @staticmethod
+    def merge_continuation_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Merge Whisper continuation fragments onto their base word and extend ``end``.
+
+        Handles both:
+        - Raw Whisper streams that mark word boundaries with leading spaces
+          (e.g. ``" anti"`` + ``"-hero"``, ``" $20"`` + ``".50"``, ``" don"`` + ``"'t"``).
+        - Pre-stripped word streams containing explicit continuation tokens
+          starting with ``-``, ``'``, ``’``, ``.``, or standalone punctuation.
+        """
+        if not words:
+            return []
+
+        uses_leading_space = any(
+            isinstance(w.get("word"), str) and len(w["word"]) > 1 and w["word"][0].isspace()
+            for w in words[1:]
+        )
+
+        merged: list[dict[str, Any]] = []
+        for item in words:
+            raw = str(item.get("word", ""))
+            stripped = raw.strip()
+            if not stripped:
+                continue
+
+            is_continuation = False
+            if merged:
+                if uses_leading_space and not raw[0].isspace():
+                    is_continuation = True
+                elif stripped[0] in ("-", "'", "\u2019", ".") and len(stripped) >= 1:
+                    # Attach contractions ('s, 't, n't), hyphen suffixes (-hero), decimals (.50)
+                    # Do not attach standalone ellipses "..." or sentence-opening quotes
+                    if not stripped.startswith("..."):
+                        is_continuation = True
+                elif all(ch in ".,!?;:%)]}" for ch in stripped):
+                    is_continuation = True
+
+            if is_continuation:
+                prev = merged[-1]
+                prev["word"] = f"{prev['word']}{stripped}"
+                prev["end"] = max(float(prev["end"]), float(item["end"]))
+            else:
+                merged.append({
+                    **item,
+                    "word": stripped,
+                    "start": float(item["start"]),
+                    "end": float(item["end"]),
+                })
+        return merged
+
     def _build_cues(
         self, segments: list[dict], max_words: int, max_chars: int
     ) -> list[dict]:
@@ -344,7 +420,7 @@ class SubtitleGen(BaseTool):
         for seg in segments:
             words = seg.get("words", [])
             if words:
-                all_words.extend(words)
+                all_words.extend(self.merge_continuation_words(list(words)))
             elif "text" in seg:
                 # Fallback: segment-level only (no word timestamps)
                 all_words.append({
@@ -498,6 +574,7 @@ class SubtitleGen(BaseTool):
         font_name: str = "Noto Sans Devanagari", font_size: int = 64,
         margin_v: int = 320, margin_l: int = 80, margin_r: int = 120,
         preset: SubtitleStylePreset | None = None,
+        split_ranges: list[tuple[float, float]] | None = None,
     ) -> str:
         values = (play_res_x, play_res_y, font_size, margin_v, margin_l, margin_r)
         if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
@@ -507,6 +584,24 @@ class SubtitleGen(BaseTool):
         if highlight_style not in ("none", "word_by_word", "karaoke"):
             raise ValueError("unsupported ASS highlight_style")
         safe_font = str(font_name).replace(",", " ").replace("\n", " ").replace("\r", " ")
+        active_split_ranges = [
+            (float(s), float(e)) for s, e in (split_ranges or []) if float(e) > float(s)
+        ]
+
+        def _style_row(name: str, alignment: int, v_margin: int) -> str:
+            if preset is None:
+                return (
+                    f"Style: {name},{safe_font},{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
+                    f"-1,0,0,0,100,100,0,0,1,4,2,{alignment},{margin_l},{margin_r},{v_margin},1"
+                )
+            return (
+                f"Style: {name},{safe_font},{font_size},{preset.primary_color},{preset.secondary_color},"
+                f"{preset.outline_color},{preset.back_color},{-1 if preset.bold else 0},{-1 if preset.italic else 0},"
+                f"0,0,100,100,0,0,{preset.border_style},{preset.outline:g},{preset.shadow:g},"
+                f"{alignment},{margin_l},{margin_r},{v_margin},1"
+            )
+
+        default_align = 2 if preset is None else preset.alignment
         lines = [
             "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {play_res_x}",
             f"PlayResY: {play_res_y}", "WrapStyle: 0", "ScaledBorderAndShadow: yes", "",
@@ -514,21 +609,26 @@ class SubtitleGen(BaseTool):
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
             "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
             "Alignment, MarginL, MarginR, MarginV, Encoding",
-            (f"Style: Default,{safe_font},{font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
-             f"-1,0,0,0,100,100,0,0,1,4,2,2,{margin_l},{margin_r},{margin_v},1")
-            if preset is None else
-            (f"Style: Default,{safe_font},{font_size},{preset.primary_color},{preset.secondary_color},"
-             f"{preset.outline_color},{preset.back_color},{-1 if preset.bold else 0},{-1 if preset.italic else 0},"
-             f"0,0,100,100,0,0,{preset.border_style},{preset.outline:g},{preset.shadow:g},"
-             f"{preset.alignment},{margin_l},{margin_r},{margin_v},1"),
+            _style_row("Default", default_align, margin_v),
+        ]
+        if active_split_ranges:
+            # Dedicated Style: Seam (Alignment=5 middle-center, MarginV=0) survives {\r} active-word resets!
+            lines.append(_style_row("Seam", 5, 0))
+        lines.extend([
             "", "[Events]",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-        ]
+        ])
 
         def dialogue(start: float, end: float, text: str) -> str:
             if end <= start:
                 return ""
-            return (f"Dialogue: 0,{self._ts_ass(start)},{self._ts_ass(end)},Default,,0,0,0,,{text}")
+            mid = (float(start) + float(end)) / 2.0
+            style_name = (
+                "Seam"
+                if active_split_ranges and any(s <= mid < e for s, e in active_split_ranges)
+                else "Default"
+            )
+            return f"Dialogue: 0,{self._ts_ass(start)},{self._ts_ass(end)},{style_name},,0,0,0,,{text}"
 
         def display(value: Any) -> str:
             raw = str(value)

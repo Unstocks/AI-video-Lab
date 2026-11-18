@@ -19,6 +19,7 @@ from lib.media_profiles import MediaProfile, get_profile
 from lib.models.clip_plan import ClipSelectionPlan
 from lib.subtitle_styles import get_subtitle_style
 from lib.ffmpeg_utils import escape_ffmpeg_filter_path
+from lib import layout_ranges as _layout_ranges
 from lib.ffmpeg_profiles import (
     METADATA_SCRUB,
     QUALITY,
@@ -27,10 +28,15 @@ from lib.ffmpeg_profiles import (
 )
 
 
+def _default_bundled_fonts_dir() -> Optional[Path]:
+    candidate = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+    return candidate if candidate.is_dir() else None
+
+
 @dataclass(frozen=True)
 class VerticalRenderConfig:
     profile_name: str = "youtube_shorts"
-    layout_mode: Literal["single_crop", "blurred_pillarbox", "stacked_split"] = "single_crop"
+    layout_mode: Literal["auto", "single_crop", "blurred_pillarbox", "stacked_split", "speaker_cut"] = "single_crop"
     burn_subtitles: bool = True
     subtitle_format: Literal["ass", "srt"] = "ass"
     highlight_style: Literal["none", "word_by_word", "karaoke"] = "karaoke"
@@ -47,10 +53,16 @@ class VerticalRenderConfig:
     fonts_dir: Optional[str] = None
     normalize_audio: bool = True
     scrub_metadata: bool = True
+    enable_punch_in: bool = False
+    punch_in_zoom: float = 1.12
+    emphasis_times: Optional[tuple[float, ...]] = None
+    enable_active_speaker: bool = True
+    speaker_cut_mode: bool = False
+    crop_overrides: Optional[dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         get_profile(self.profile_name)
-        if self.layout_mode not in ("single_crop", "blurred_pillarbox", "stacked_split"):
+        if self.layout_mode not in ("auto", "single_crop", "blurred_pillarbox", "stacked_split", "speaker_cut"):
             raise ValueError("unsupported layout_mode")
         if self.subtitle_format not in ("ass", "srt"):
             raise ValueError("subtitle_format must be ass or srt")
@@ -236,6 +248,8 @@ class VerticalClipComposer:
                 fonts_directory = Path(config.fonts_dir).expanduser()
                 if not fonts_directory.is_dir():
                     raise ValueError(f"fonts_dir is not an existing directory: {fonts_directory}")
+            else:
+                fonts_directory = _default_bundled_fonts_dir()
             duration = end - start
             if profile.max_duration_seconds is not None and duration > profile.max_duration_seconds:
                 warnings.append(
@@ -288,7 +302,7 @@ class VerticalClipComposer:
                 if not trim_result.success or not trimmed.is_file() or trimmed.stat().st_size <= 0:
                     raise RuntimeError(trim_result.error or "VideoTrimmer did not produce a non-empty clip")
 
-                reframed_result = self._get_reframer().execute({
+                reframe_inputs: dict[str, Any] = {
                     "input_path": str(trimmed), "output_path": str(reframed),
                     "target_width": profile.width, "target_height": profile.height,
                     "layout_mode": config.layout_mode,
@@ -296,20 +310,29 @@ class VerticalClipComposer:
                     "speaker_tracks": self._rebase_speaker_tracks(speaker_tracks, start, end),
                     "codec": effective_codec, "crf": config.crf,
                     "audio_copy": True, "scrub_metadata": config.scrub_metadata,
-                })
+                }
+                if config.enable_punch_in:
+                    reframe_inputs["enable_punch_in"] = True
+                    reframe_inputs["punch_in_zoom"] = config.punch_in_zoom
+                    if config.emphasis_times:
+                        reframe_inputs["emphasis_times"] = list(config.emphasis_times)
+                if config.layout_mode in ("auto", "speaker_cut") or config.crop_overrides:
+                    reframe_inputs["enable_active_speaker"] = config.enable_active_speaker
+                    reframe_inputs["speaker_cut_mode"] = (
+                        config.speaker_cut_mode or config.layout_mode == "speaker_cut"
+                    )
+                if config.crop_overrides:
+                    reframe_inputs["crop_overrides"] = dict(config.crop_overrides)
+
+                reframed_result = self._get_reframer().execute(reframe_inputs)
                 if not reframed_result.success:
                     if effective_codec != "h264_nvenc":
                         raise RuntimeError(reframed_result.error or "AutoReframe failed")
                     warnings.append("h264_nvenc failed during reframing; retried with libx264")
                     effective_codec = "libx264"
                     reframed_result = self._get_reframer().execute({
-                        "input_path": str(trimmed), "output_path": str(reframed),
-                        "target_width": profile.width, "target_height": profile.height,
-                        "layout_mode": config.layout_mode,
-                        "shot_cuts": self._rebase_shot_cuts(shot_cuts, start, end),
-                        "speaker_tracks": self._rebase_speaker_tracks(speaker_tracks, start, end),
-                        "codec": "libx264", "crf": config.crf,
-                        "audio_copy": True, "scrub_metadata": config.scrub_metadata,
+                        **reframe_inputs,
+                        "codec": "libx264",
                     })
                     if not reframed_result.success:
                         raise RuntimeError(reframed_result.error or "AutoReframe libx264 fallback failed")
@@ -318,6 +341,12 @@ class VerticalClipComposer:
                 if not reframed_source.is_file() or reframed_source.stat().st_size <= 0:
                     raise RuntimeError("AutoReframe did not produce a non-empty clip")
 
+                reframed_sidecar = _layout_ranges.sidecar_path(reframed_source)
+                active_layout_ranges = (
+                    reframed_result.data.get("layout_ranges")
+                    or _layout_ranges.read(reframed_source)
+                )
+
                 subtitle_result = None
                 if transcript_segments:
                     subtitle_inputs: dict[str, Any] = {
@@ -325,6 +354,8 @@ class VerticalClipComposer:
                         "clip_start_seconds": start, "clip_end_seconds": end,
                         "output_path": str(staged_subtitle), "highlight_style": config.highlight_style,
                     }
+                    if active_layout_ranges and config.subtitle_format == "ass":
+                        subtitle_inputs["layout_ranges"] = active_layout_ranges
                     if config.style_preset is None:
                         subtitle_inputs.update({
                             "max_words_per_cue": config.max_words_per_cue,
@@ -349,8 +380,8 @@ class VerticalClipComposer:
                         subtitle_inputs.update({
                             "play_res_x": profile.width, "play_res_y": profile.height,
                         })
-                        if config.fonts_dir is not None:
-                            subtitle_inputs["fonts_dir"] = config.fonts_dir
+                        if fonts_directory is not None:
+                            subtitle_inputs["fonts_dir"] = str(fonts_directory)
                         if config.style_preset is None:
                             subtitle_inputs.update({
                                 "font_name": config.font_name, "font_size": config.font_size,
@@ -367,7 +398,10 @@ class VerticalClipComposer:
                     warnings.append("no transcript segments supplied; subtitle burn skipped")
 
                 if config.burn_subtitles and cue_count > 0 and staged_subtitle.is_file():
-                    escaped_subtitle = self._escape_filter_path(staged_subtitle)
+                    # Neutral ASCII staging path avoids Windows apostrophe/Unicode filter quoting traps
+                    burn_sub = work / f"subs_burn.{config.subtitle_format}"
+                    shutil.copy2(staged_subtitle, burn_sub)
+                    escaped_subtitle = self._escape_filter_path(burn_sub)
                     filter_name = "ass" if config.subtitle_format == "ass" else "subtitles"
                     vf = f"{filter_name}='{escaped_subtitle}'"
                     if fonts_directory is not None and config.subtitle_format == "ass":
@@ -426,6 +460,8 @@ class VerticalClipComposer:
                 promotions = [(render_tmp, output_path)]
                 if staged_subtitle.is_file():
                     promotions.append((staged_subtitle, subtitle_path))
+                if reframed_sidecar.is_file():
+                    promotions.append((reframed_sidecar, _layout_ranges.sidecar_path(output_path)))
                 backups: dict[Path, Path] = {}
                 installed: list[Path] = []
                 try:

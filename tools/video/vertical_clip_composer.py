@@ -54,8 +54,10 @@ class VerticalClipCompose(BaseTool):
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         try:
-            raw_config = inputs.get("config") or {}
-            config = VerticalRenderConfig(**raw_config) if isinstance(raw_config, dict) else raw_config
+            raw_config = dict(inputs.get("config") or {}) if isinstance(inputs.get("config"), dict) else inputs.get("config")
+            if isinstance(raw_config, dict) and isinstance(raw_config.get("emphasis_times"), list):
+                raw_config["emphasis_times"] = tuple(float(t) for t in raw_config["emphasis_times"])
+            config = VerticalRenderConfig(**raw_config) if isinstance(raw_config, dict) else (raw_config or VerticalRenderConfig())
             composer = VerticalClipComposer()
             manifest = self._source_manifest(inputs.get("source_manifest"))
             shot_cuts = inputs.get("shot_cuts")
