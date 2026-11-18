@@ -124,7 +124,17 @@ class AutoReframe(BaseTool):
             },
             "codec": {"type": "string", "default": "libx264"},
             "crf": {"type": "integer", "default": 18},
-            "layout_mode": {"type": "string", "enum": ["single_crop", "blurred_pillarbox", "stacked_split"], "default": "single_crop"},
+            "layout_mode": {
+                "type": "string",
+                "enum": ["auto", "single_crop", "blurred_pillarbox", "stacked_split", "speaker_cut"],
+                "default": "single_crop",
+            },
+            "enable_punch_in": {"type": "boolean", "default": False},
+            "punch_in_zoom": {"type": "number", "minimum": 1.0, "maximum": 1.35, "default": 1.12},
+            "emphasis_times": {"type": "array", "items": {"type": "number", "minimum": 0}},
+            "enable_active_speaker": {"type": "boolean", "default": True},
+            "speaker_cut_mode": {"type": "boolean", "default": False},
+            "crop_overrides": {"type": "object"},
             "shot_cuts": {"type": "array", "items": {"type": "number", "minimum": 0}},
             "speaker_tracks": {
                 "type": "array",
@@ -166,6 +176,8 @@ class AutoReframe(BaseTool):
         "smoothing_window", "face_padding", "face_tracking_json", "sample_fps",
         "codec", "crf", "layout_mode", "shot_cuts", "speaker_tracks",
         "active_speaker_json", "split_left_center_x", "split_right_center_x",
+        "enable_punch_in", "punch_in_zoom", "emphasis_times",
+        "enable_active_speaker", "speaker_cut_mode", "crop_overrides",
     ]
     side_effects = ["writes reframed video to output_path"]
     user_visible_verification = [
@@ -180,7 +192,7 @@ class AutoReframe(BaseTool):
 
         start = time.time()
         layout_mode = inputs.get("layout_mode", "single_crop")
-        if layout_mode not in {"single_crop", "blurred_pillarbox", "stacked_split"}:
+        if layout_mode not in {"auto", "single_crop", "blurred_pillarbox", "stacked_split", "speaker_cut"}:
             return ToolResult(success=False, error=f"Unknown layout_mode: {layout_mode}")
         try:
             shot_cuts = self._validated_shot_cuts(inputs.get("shot_cuts", []))
@@ -195,8 +207,73 @@ class AutoReframe(BaseTool):
                 padding = self._finite_number(inputs["face_padding"], "face_padding", minimum=0)
                 if padding > 1:
                     raise ValueError("face_padding must be between 0 and 1")
+            if "punch_in_zoom" in inputs:
+                pzoom = self._finite_number(inputs["punch_in_zoom"], "punch_in_zoom", minimum=1.0)
+                if pzoom > 1.35:
+                    raise ValueError("punch_in_zoom must be between 1.0 and 1.35")
         except (TypeError, ValueError) as exc:
             return ToolResult(success=False, error=str(exc))
+
+        # Smart Reframe v2 route: auto, speaker_cut, punch-in, or manual crop_overrides
+        use_v2 = (
+            layout_mode in {"auto", "speaker_cut"}
+            or bool(inputs.get("enable_punch_in", False))
+            or bool(inputs.get("crop_overrides"))
+        )
+        if use_v2:
+            aspect_name = inputs.get("target_aspect", "portrait")
+            tw_a, th_a = ASPECT_PRESETS.get(aspect_name, (9, 16))
+            explicit_w = inputs.get("target_width")
+            explicit_h = inputs.get("target_height")
+            aspect_ratio = (
+                float(explicit_w) / float(explicit_h)
+                if (explicit_w and explicit_h)
+                else float(tw_a) / float(th_a)
+            )
+            output_path = Path(
+                inputs.get("output_path", str(input_path.with_stem(f"{input_path.stem}_{aspect_name}")))
+            )
+            try:
+                from lib.reframe_v2 import render_reframe_v2
+
+                v2_data = render_reframe_v2(
+                    input_path,
+                    output_path,
+                    aspect_ratio=aspect_ratio,
+                    target_width=explicit_w,
+                    target_height=explicit_h,
+                    codec=inputs.get("codec", "auto"),
+                    crf=inputs.get("crf"),
+                    audio_copy=bool(inputs.get("audio_copy", False)),
+                    scrub_metadata=bool(inputs.get("scrub_metadata", True)),
+                    shot_cuts=shot_cuts or None,
+                    enable_punch_in=bool(inputs.get("enable_punch_in", False)),
+                    punch_in_zoom=inputs.get("punch_in_zoom"),
+                    emphasis_times=inputs.get("emphasis_times"),
+                    enable_active_speaker=bool(inputs.get("enable_active_speaker", True)),
+                    speaker_cut_mode=(
+                        layout_mode == "speaker_cut"
+                        or bool(inputs.get("speaker_cut_mode", False))
+                    ),
+                    crop_overrides=inputs.get("crop_overrides"),
+                )
+            except Exception as exc:
+                return ToolResult(success=False, error=f"Reframe v2 error: {exc}")
+
+            elapsed = time.time() - start
+            artifacts = [str(output_path)]
+            if v2_data.get("layout_sidecar"):
+                artifacts.append(str(v2_data["layout_sidecar"]))
+            return ToolResult(
+                success=True,
+                data={
+                    "input": str(input_path),
+                    **v2_data,
+                    "target_aspect": aspect_name,
+                },
+                artifacts=artifacts,
+                duration_seconds=round(elapsed, 2),
+            )
 
         # Get source video dimensions
         src_w, src_h, src_fps, src_sar = self._get_video_info(input_path)
@@ -291,6 +368,28 @@ class AutoReframe(BaseTool):
         if method == "center_crop":
             warnings.append("face tracking/speaker tracks unavailable; used static center_crop")
 
+        # Write layout sidecar for downstream seam subtitles and Studio UI timeline
+        layout_label = {
+            "stacked_split": "split",
+            "blurred_pillarbox": "general",
+        }.get(layout_mode, "track")
+        out_ranges: list[dict[str, Any]] = []
+        sidecar_str: str | None = None
+        try:
+            from lib import layout_ranges as _lr
+
+            dur_s = self._probe_duration(output_path) or self._probe_duration(input_path)
+            if dur_s > 0:
+                entry: dict[str, Any] = {"start": 0.0, "end": round(dur_s, 3), "layout": layout_label}
+                if layout_label == "general":
+                    from lib.reframe_v2 import general_content_band
+                    _fg_h, band = general_content_band(out_w, out_h, orig_w=src_w, orig_h=src_h)
+                    entry["content"] = band
+                out_ranges = _lr.normalise([entry])
+                sidecar_str = str(_lr.write(output_path, out_ranges, punch_ins=[]))
+        except Exception:
+            pass
+
         return ToolResult(
             success=True,
             data={
@@ -301,11 +400,23 @@ class AutoReframe(BaseTool):
                 "output_resolution": f"{out_w}x{out_h}",
                 "method": method,
                 "target_aspect": inputs.get("target_aspect", "portrait"),
+                "layout_ranges": out_ranges,
+                "layout_sidecar": sidecar_str,
                 "warnings": warnings,
             },
             artifacts=[str(output_path)],
             duration_seconds=round(elapsed, 2),
         )
+
+    def _probe_duration(self, path: Path) -> float:
+        try:
+            res = self.run_command(
+                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "json", str(path)],
+                timeout=15,
+            )
+            return float(json.loads(res.stdout).get("format", {}).get("duration") or 0.0)
+        except Exception:
+            return 0.0
 
     def _get_video_info(self, path: Path) -> tuple[int, int, float, float]:
         """Get encoded dimensions, FPS, and sample aspect ratio via ffprobe."""

@@ -23,6 +23,64 @@ from tools.base_tool import (
 )
 
 
+def _merge_short_scenes(
+    bounds: list[tuple[int, int]],
+    fps: float,
+    min_sec: float = 0.4,
+) -> list[tuple[int, int]]:
+    """Absorb scenes shorter than ``min_sec`` into an adjacent neighbor.
+
+    Ultra-short flash/transition scenes cause camera-snap bursts and starve
+    per-scene strategy sampling in Smart Reframe v2.
+    """
+    if len(bounds) <= 1 or min_sec <= 0 or fps <= 0:
+        return list(bounds)
+    min_frames = max(1, int(round(float(min_sec) * float(fps))))
+
+    merged: list[tuple[int, int]] = []
+    for s, e in bounds:
+        if merged and (e - s) < min_frames:
+            prev_s, _prev_e = merged[-1]
+            merged[-1] = (prev_s, e)
+        else:
+            merged.append((s, e))
+
+    # Handle a short leading scene by merging it forward into scene 1.
+    if len(merged) > 1 and (merged[0][1] - merged[0][0]) < min_frames:
+        merged[1] = (merged[0][0], merged[1][1])
+        merged.pop(0)
+    return merged
+
+
+def _merge_short_scene_dicts(scenes: list[dict[str, Any]], min_sec: float = 0.4) -> list[dict[str, Any]]:
+    """Time-domain equivalent of ``_merge_short_scenes`` for ``SceneDetect`` output dicts."""
+    if len(scenes) <= 1 or min_sec <= 0:
+        return scenes
+    merged: list[dict[str, Any]] = []
+    for scene in scenes:
+        start = float(scene["start_seconds"])
+        end = float(scene["end_seconds"])
+        if merged and (end - start) < min_sec:
+            merged[-1]["end_seconds"] = round(end, 3)
+            merged[-1]["duration_seconds"] = round(end - float(merged[-1]["start_seconds"]), 3)
+        else:
+            merged.append({
+                "index": len(merged),
+                "start_seconds": round(start, 3),
+                "end_seconds": round(end, 3),
+                "duration_seconds": round(end - start, 3),
+            })
+    if len(merged) > 1 and float(merged[0]["duration_seconds"]) < min_sec:
+        merged[1]["start_seconds"] = merged[0]["start_seconds"]
+        merged[1]["duration_seconds"] = round(
+            float(merged[1]["end_seconds"]) - float(merged[1]["start_seconds"]), 3
+        )
+        merged.pop(0)
+    for i, item in enumerate(merged):
+        item["index"] = i
+    return merged
+
+
 class SceneDetect(BaseTool):
     name = "scene_detect"
     version = "0.1.0"
@@ -94,6 +152,9 @@ class SceneDetect(BaseTool):
             scenes = self._detect_pyscenedetect(inputs)
         else:
             scenes = self._detect_ffmpeg(inputs)
+
+        min_merge = float(inputs.get("min_scene_length_seconds", 0.4) or 0.4)
+        scenes = _merge_short_scene_dicts(scenes, min_sec=min(0.4, min_merge))
 
         elapsed = time.time() - start
 

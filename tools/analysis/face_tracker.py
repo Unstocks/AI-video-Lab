@@ -114,6 +114,16 @@ class FaceTracker(BaseTool):
 
     fallback_tools = []
 
+    def _has_yunet(self) -> bool:
+        try:
+            import cv2
+            from lib.face_detector import default_yunet_model_path
+
+            model = default_yunet_model_path()
+            return hasattr(cv2, "FaceDetectorYN") and model.is_file() and model.stat().st_size > 1024
+        except Exception:
+            return False
+
     def _has_mediapipe(self) -> bool:
         try:
             import mediapipe  # noqa: F401
@@ -129,7 +139,7 @@ class FaceTracker(BaseTool):
             return False
 
     def get_status(self) -> ToolStatus:
-        if self._has_mediapipe() and self._has_opencv():
+        if self._has_opencv() and (self._has_yunet() or self._has_mediapipe()):
             return ToolStatus.AVAILABLE
         if self._has_opencv():
             return ToolStatus.DEGRADED
@@ -143,7 +153,7 @@ class FaceTracker(BaseTool):
         if not self._has_opencv():
             return ToolResult(
                 success=False,
-                error="opencv-python is required. Install: pip install opencv-python",
+                error="opencv-python-headless is required. Install: pip install opencv-python-headless",
             )
 
         output_path = Path(
@@ -156,10 +166,7 @@ class FaceTracker(BaseTool):
 
         start = time.time()
 
-        if self._has_mediapipe():
-            result_data = self._track_mediapipe(input_path, sample_fps, confidence)
-        else:
-            result_data = self._track_opencv(input_path, sample_fps)
+        result_data, method = self._track_multi_detector(input_path, sample_fps, confidence)
 
         elapsed = time.time() - start
 
@@ -175,10 +182,98 @@ class FaceTracker(BaseTool):
                 "duration_seconds": result_data["duration_seconds"],
                 "frames_sampled": result_data["frame_count"],
                 "faces_detected": result_data["face_detected_count"],
-                "method": "mediapipe" if self._has_mediapipe() else "opencv_haar",
+                "method": method,
             },
             artifacts=[str(output_path)],
             duration_seconds=round(elapsed, 2),
+        )
+
+    def _track_multi_detector(
+        self, input_path: Path, sample_fps: float, confidence: float
+    ) -> tuple[dict[str, Any], str]:
+        """Forward-pass face tracking using MultiFaceDetector (YuNet -> MediaPipe -> Haar)."""
+        import cv2
+        from lib.face_detector import MultiFaceDetector, read_frames_at
+
+        cap = cv2.VideoCapture(str(input_path))
+        video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        video_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        video_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / video_fps if video_fps > 0 else 0.0
+
+        sample_interval = max(1, int(video_fps / max(0.1, float(sample_fps))))
+        faces_data: list[dict[str, Any]] = []
+        sampled = 0
+
+        with MultiFaceDetector(min_confidence=float(confidence)) as detector:
+            method = {
+                "yunet": "opencv_yunet",
+                "mediapipe": "mediapipe",
+                "haar": "opencv_haar",
+            }.get(detector.backend, detector.backend)
+
+            if total_frames > 0:
+                indices = list(range(0, total_frames, sample_interval))
+                frame_stream = zip(indices, read_frames_at(cap, indices))
+            else:
+                def _sequential():
+                    idx = 0
+                    while cap.isOpened():
+                        ok, frm = cap.read()
+                        if not ok:
+                            break
+                        if idx % sample_interval == 0:
+                            yield idx, frm
+                        idx += 1
+                frame_stream = _sequential()
+
+            for frame_idx, frame in frame_stream:
+                if frame is None:
+                    continue
+                sampled += 1
+                detections = detector.detect(frame)
+                if not detections or video_w <= 0 or video_h <= 0:
+                    continue
+                best = detections[0]
+                x, y, w, h = best["box"]
+                all_boxes = [
+                    {
+                        "x": round(d["box"][0] / video_w, 4),
+                        "y": round(d["box"][1] / video_h, 4),
+                        "width": round(d["box"][2] / video_w, 4),
+                        "height": round(d["box"][3] / video_h, 4),
+                        "confidence": round(float(d.get("confidence", 0.0)), 3),
+                    }
+                    for d in detections
+                ]
+                faces_data.append({
+                    "frame_index": frame_idx,
+                    "timestamp_seconds": round(frame_idx / video_fps, 3),
+                    "confidence": round(float(best.get("confidence", 0.0)), 3),
+                    "bbox": {
+                        "x": round(x / video_w, 4),
+                        "y": round(y / video_h, 4),
+                        "width": round(w / video_w, 4),
+                        "height": round(h / video_h, 4),
+                    },
+                    "all_bboxes": all_boxes,
+                })
+
+        cap.release()
+
+        return (
+            {
+                "video_width": video_w,
+                "video_height": video_h,
+                "fps": round(video_fps, 2),
+                "duration_seconds": round(duration, 3),
+                "frame_count": sampled,
+                "face_detected_count": len(faces_data),
+                "method": method,
+                "faces": faces_data,
+            },
+            method,
         )
 
     def _track_mediapipe(
