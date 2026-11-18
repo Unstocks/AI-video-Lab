@@ -1055,6 +1055,51 @@ function tickReplay() {
 // page assembly
 // ---------------------------------------------------------------------------
 
+function renderClipStudio(s) {
+  const cs = s.clip_studio;
+  if (!cs || !Array.isArray(cs.clips) || !cs.clips.length) return null;
+  const grid = el("div", {
+    style: "display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-top:10px",
+  });
+  for (const c of cs.clips) {
+    const qa = c.qa_report || {};
+    const audio = qa.audio_spotcheck || {};
+    const lufs = audio.integrated_lufs != null ? `${Number(audio.integrated_lufs).toFixed(1)} LUFS` : "—";
+    const statusLabel = qa.passed || c.production_state === "QA_PASSED"
+      ? "QA PASSED"
+      : (c.review_state || c.production_state || "CANDIDATE");
+    grid.append(
+      el("div", {
+        class: "card",
+        style: "padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--surface)",
+      },
+        el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:8px;font-family:var(--mono);font-size:11px" },
+          el("strong", {}, c.candidate_id || c.clip_id || "clip"),
+          el("span", { style: "opacity:0.8" }, `${fmtDuration(c.start_seconds)} – ${fmtDuration(c.end_seconds)}`),
+        ),
+        el("p", { style: "margin:8px 0;font-size:12px;line-height:1.4;opacity:0.9" },
+          shortText(c.spoken_hook || c.hook_text || c.title || "Untitled clip", 140)),
+        el("div", { style: "display:flex;justify-content:space-between;align-items:center;font-family:var(--mono);font-size:10px;opacity:0.75" },
+          el("span", {}, `${statusLabel} · ${lufs}`),
+          c.style_preset ? el("span", {}, c.style_preset) : null,
+        ),
+      ),
+    );
+  }
+  return el("section", { class: "section", style: "margin-top:20px" },
+    el("div", { class: "section-head", style: "display:flex;justify-content:space-between;align-items:center" },
+      el("h2", {}, `CLIP STUDIO (${cs.clips.length})`),
+      el("a", {
+        href: `http://127.0.0.1:4760/project/${encodeURIComponent(projectId)}/nle`,
+        target: "_blank",
+        rel: "noreferrer",
+        style: "font-family:var(--mono);font-size:11px;text-decoration:none;opacity:0.85",
+      }, "OPEN IN PRO STUDIO NLE ↗"),
+    ),
+    grid,
+  );
+}
+
 function render() {
   if (!state) return;
   const s = replay ? stateAt(state, replay.t) : state;
@@ -1086,18 +1131,19 @@ function render() {
 
   // Media sections live INSIDE the main column so a tall decisions rail
   // never pushes them below the fold — the column flows beside the rail.
+  const clipStudio = renderClipStudio(s);
   const storyboard = renderStoryboard(s);
   const found = renderFoundMedia(s);
   const renders = renderRenders(s);
 
   if (approvalReview || script || decisions || activity) {
-    for (const section of [storyboard, found, renders]) {
+    for (const section of [clipStudio, storyboard, found, renders]) {
       if (section) main.append(section);
     }
     const hasAside = Boolean(decisions || activity);
     app.append(el("div", { class: `board${hasAside ? "" : " solo"}` }, main, hasAside ? aside : null));
   } else {
-    for (const section of [storyboard, found, renders]) {
+    for (const section of [clipStudio, storyboard, found, renders]) {
       if (section) app.append(section);
     }
   }

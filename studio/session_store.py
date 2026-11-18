@@ -244,3 +244,10 @@ class SessionStore:
             except json.JSONDecodeError:
                 continue
         return result
+
+    def delete_session(self, session_id: str) -> bool:
+        with self._lock, self._connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM sessions WHERE session_id = ?", (session_id,)
+            )
+            return (cur.rowcount or 0) > 0

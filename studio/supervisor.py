@@ -108,6 +108,36 @@ def probe_fcc_health(base_url: str | None = None, timeout: float = 1.5) -> dict[
     }
 
 
+def switch_fcc_model(model_id: str, base_url: str | None = None, timeout: float = 2.5) -> dict[str, Any]:
+    """Attempt to switch active model on Free Claude Code loopback server (127.0.0.1:8082)."""
+    cleaned = model_id.strip()
+    if not cleaned:
+        raise ValueError("model_id must be non-empty")
+    root = (base_url or os.environ.get("FCC_BASE_URL") or "http://127.0.0.1:8082").rstrip("/")
+    payload = json.dumps({"model": cleaned}).encode("utf-8")
+    last_err = "FCC server unreachable"
+    for path in ("/v1/models/active", "/api/model", "/model"):
+        try:
+            req = urllib.request.Request(
+                f"{root}{path}",
+                data=payload,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if 200 <= resp.status < 300:
+                    health = probe_fcc_health(root, timeout=timeout)
+                    return {"ok": True, "model": cleaned, **health}
+        except Exception as exc:
+            last_err = str(exc)
+    return {
+        "ok": False,
+        "model": cleaned,
+        "detail": f"Could not switch model on FCC ({last_err}). Switch via FCC CLI or restart FCC with the selected model.",
+        **probe_fcc_health(root, timeout=timeout),
+    }
+
+
 def _extract_project_id_from_inputs(tool_input: Any) -> Optional[str]:
     """Infer a validated ``project_id`` from a tool_use input dict or text."""
     if isinstance(tool_input, dict):
@@ -484,6 +514,133 @@ class SupervisorManager:
             user_display=f"Export approved clips: {', '.join(clip_ids)}",
         )
         return await asyncio.to_thread(self.store.get_session, session_id) or session
+
+    async def start_production(
+        self,
+        *,
+        pipeline_type: str,
+        brief_prompt: str = "",
+        project_id: str | None = None,
+        source_input: str | None = None,
+        reference_url: str | None = None,
+        style_playbook: str | None = None,
+        media_profile: str | None = None,
+        render_runtime: str | None = None,
+        style_preset: str | None = None,
+        budget_usd: float | None = None,
+        clip_count: int = 2,
+        layout_mode: str = "auto",
+        enable_punch_in: bool = True,
+    ) -> dict[str, Any]:
+        """Launch ANY OpenMontage pipeline through the Top Supervisor."""
+        if project_id is not None and not is_valid_project_id(project_id):
+            raise ValueError("Invalid project_id.")
+        cleaned_brief = brief_prompt.strip()
+        cleaned_source = (source_input or "").strip()
+        cleaned_ref = (reference_url or "").strip()
+        if not cleaned_brief and not cleaned_source and not cleaned_ref:
+            raise ValueError("Provide a brief_prompt, source_input, or reference_url.")
+
+        directive = prompts.build_production_prompt(
+            pipeline_type=pipeline_type,
+            brief_prompt=cleaned_brief or f"Run {pipeline_type} production",
+            project_id=project_id,
+            source_input=cleaned_source or None,
+            reference_url=cleaned_ref or None,
+            style_playbook=style_playbook,
+            media_profile=media_profile,
+            render_runtime=render_runtime,
+            style_preset=style_preset,
+            budget_usd=budget_usd,
+            clip_count=clip_count,
+            layout_mode=layout_mode,
+            enable_punch_in=enable_punch_in,
+        )
+        self._resolve_command(directive, None)
+
+        title = (
+            project_id
+            or (cleaned_brief[:64] if cleaned_brief else "")
+            or (Path(cleaned_source.rstrip("/\\")).name if cleaned_source else "")
+            or f"{pipeline_type} production"
+        )
+        session = await asyncio.to_thread(
+            self.store.create_session,
+            title=title[:80],
+            source_input=cleaned_source or cleaned_ref or pipeline_type,
+            project_id=project_id,
+            status="idle",
+        )
+        sid = session["session_id"]
+        summary_parts = [f"Launch `{pipeline_type}`"]
+        if cleaned_brief:
+            summary_parts.append(f'"{cleaned_brief[:120]}"')
+        if cleaned_source:
+            summary_parts.append(f"source={cleaned_source}")
+        if style_playbook:
+            summary_parts.append(f"playbook={style_playbook}")
+        if media_profile:
+            summary_parts.append(f"profile={media_profile}")
+        await self._launch_turn(sid, directive, user_display=" · ".join(summary_parts))
+        return await asyncio.to_thread(self.store.get_session, sid) or session
+
+    async def create_session(
+        self,
+        *,
+        title: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an idle Supervisor session (optionally attached to an existing project)."""
+        if project_id is not None and not is_valid_project_id(project_id):
+            raise ValueError("Invalid project_id.")
+        display = (title or "").strip() or (f"Project {project_id}" if project_id else "Executive Producer Chat")
+        return await asyncio.to_thread(
+            self.store.create_session,
+            title=display[:80],
+            source_input=None,
+            project_id=project_id,
+            status="idle",
+        )
+
+    async def send_gate_decision(
+        self,
+        session_id: str,
+        *,
+        stage: str,
+        decision: str,
+        notes: str = "",
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Approve, revise, or reject ANY human-gated pipeline stage."""
+        session = await asyncio.to_thread(self.store.get_session, session_id)
+        if session is None:
+            raise KeyError(f"Unknown session: {session_id}")
+        pid = project_id or session.get("project_id")
+        if not pid or not is_valid_project_id(pid):
+            raise ValueError("Cannot decide stage gate without a valid project_id.")
+        if decision.strip().lower() not in ("approve", "revise", "reject"):
+            raise ValueError("decision must be 'approve', 'revise', or 'reject'")
+        directive = prompts.build_gate_decision_prompt(
+            project_id=pid,
+            stage=stage.strip(),
+            decision=decision.strip().lower(),
+            notes=notes,
+        )
+        await self._launch_turn(
+            session_id,
+            directive,
+            user_display=f"Gate [{stage}]: {decision.upper()}" + (f" — {notes.strip()[:120]}" if notes.strip() else ""),
+        )
+        return await asyncio.to_thread(self.store.get_session, session_id) or session
+
+    async def delete_session(self, session_id: str) -> bool:
+        """Stop any running turn and delete the session row + messages."""
+        session = await asyncio.to_thread(self.store.get_session, session_id)
+        if session is None:
+            return False
+        if self.is_running(session_id):
+            await self.stop_run(session_id)
+        return await asyncio.to_thread(self.store.delete_session, session_id)
 
     async def stop_run(self, session_id: str) -> dict[str, Any]:
         async with self._lock_for(session_id):

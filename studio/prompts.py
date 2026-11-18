@@ -181,3 +181,114 @@ def build_export_prompt(
         f"into `projects/{project_id}/exports/` so `projects/{project_id}/exports/manifest.json` and `artifacts/publish_log.json` are written.\n"
         f"3. Mark `checkpoint_publish.json` completed and return the exact exported file paths."
     )
+
+
+def build_production_prompt(
+    *,
+    pipeline_type: str,
+    brief_prompt: str,
+    project_id: str | None = None,
+    source_input: str | None = None,
+    reference_url: str | None = None,
+    style_playbook: str | None = None,
+    media_profile: str | None = None,
+    render_runtime: str | None = None,
+    style_preset: str | None = None,
+    budget_usd: float | None = None,
+    clip_count: int = 2,
+    layout_mode: str = "auto",
+    enable_punch_in: bool = True,
+) -> str:
+    """Build Turn-1 Executive Producer prompt for ANY OpenMontage pipeline."""
+    if pipeline_type == "clip-factory" and source_input and not reference_url:
+        base = build_start_job_prompt(
+            source_input=source_input,
+            project_id=project_id,
+            clip_count=clip_count,
+            style_preset=style_preset or "hinglish_impact",
+            layout_mode=layout_mode,
+            enable_punch_in=enable_punch_in,
+        )
+        if brief_prompt.strip():
+            base += f"\n\n## Additional Creative Direction\n{brief_prompt.strip()}"
+        return base
+
+    proj_hint = (
+        f"Use exact project_id `{project_id}` under `projects/{project_id}/`."
+        if project_id
+        else "Create a clean slug project_id under `projects/<slug>/`."
+    )
+    lines = [
+        "You are the Executive Producer / Top Supervisor for AI Video Lab (OpenMontage).",
+        f"Follow `AGENT_GUIDE.md` Rule Zero and `pipeline_defs/{pipeline_type}.yaml` strictly.",
+        "",
+        "## Production Brief",
+        f"- Pipeline: `{pipeline_type}`",
+        f"- Project: {proj_hint}",
+        f"- Creative Brief: {brief_prompt.strip()}",
+    ]
+    if source_input and source_input.strip():
+        lines.append(f"- Source Footage / Media: `{source_input.strip()}`")
+    if reference_url and reference_url.strip():
+        lines.append(
+            f"- Reference Video (Inspiration — follow `skills/meta/video-reference-analyst.md`): `{reference_url.strip()}`"
+        )
+    if style_playbook:
+        lines.append(f"- Style Playbook: `styles/{style_playbook}.yaml`")
+    if media_profile:
+        lines.append(f"- Target Media Profile: `{media_profile}`")
+    if render_runtime:
+        lines.append(f"- Preferred Composition Runtime: `{render_runtime}`")
+    if style_preset:
+        lines.append(f"- Subtitle Style Preset: `{style_preset}`")
+    if budget_usd is not None:
+        lines.append(f"- Budget Cap: `${float(budget_usd):.2f}` USD")
+
+    lines.extend([
+        "",
+        "## Required Execution Contract",
+        f"1. Read `pipeline_defs/{pipeline_type}.yaml` and run preflight tool discovery (`registry.provider_menu_summary()`).",
+        "2. Initialize `projects/<project_id>/project.json` and log every major provider/model/runtime decision to `artifacts/decision_log.json`.",
+        "3. Read the exact stage director skill (`skills/pipelines/<pipeline>/<stage>-director.md`) before each stage.",
+        "4. Stop cleanly at the FIRST human-gated stage with `status=\"awaiting_human\"` in its `checkpoint_<stage>.json`.",
+        "5. Present a crisp executive summary (concepts, tool plan, estimated cost, and next gate) and wait for human approval in Studio UI.",
+    ])
+    return "\n".join(lines)
+
+
+def build_gate_decision_prompt(
+    *,
+    project_id: str,
+    stage: str,
+    decision: str,
+    notes: str = "",
+) -> str:
+    """Build universal human gate decision directive for any gated pipeline stage."""
+    norm = decision.strip().lower()
+    if norm == "approve":
+        action_lines = [
+            f"1. Mark `projects/{project_id}/checkpoint_{stage}.json` completed with `human_approved=True`.",
+            "2. Proceed to the next stage in the pipeline manifest, reading its stage director skill first.",
+            "3. Stop again cleanly at the next human-gated stage (or complete `publish` if this was the final gate).",
+        ]
+    elif norm == "revise":
+        action_lines = [
+            f"1. Keep `projects/{project_id}/checkpoint_{stage}.json` in revision (`in_progress` -> `awaiting_human`).",
+            f"2. Apply the human's revision notes to stage `{stage}` artifacts and re-run self-review.",
+            "3. Present the updated revision summary and wait for re-approval.",
+        ]
+    else:
+        action_lines = [
+            f"1. Record human rejection on `projects/{project_id}/checkpoint_{stage}.json` (`human_approved=False`) and log the reason in `decision_log.json`.",
+            "2. Propose concrete alternative directions before spending any further budget.",
+        ]
+
+    lines = [
+        f"Human Gate Decision from Studio UI for project `{project_id}`:",
+        f"- Stage: `{stage}`",
+        f"- Decision: `{norm.upper()}`",
+    ]
+    if notes.strip():
+        lines.append(f"- Human Feedback: {notes.strip()}")
+    lines.extend(["", "## Execute Now", *action_lines])
+    return "\n".join(lines)

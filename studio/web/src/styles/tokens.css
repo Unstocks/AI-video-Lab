@@ -1,0 +1,179 @@
+@import "tailwindcss";
+
+/* ── Local Bundled Fonts (Zero External Network Dependencies) ───────────── */
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/Inter-Variable.ttf") format("truetype");
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/fonts/JetBrainsMono-Variable.ttf") format("truetype");
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Montserrat";
+  src: url("/fonts/Montserrat-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Montserrat";
+  src: url("/fonts/Montserrat-ExtraBold.ttf") format("truetype");
+  font-weight: 800;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Outfit";
+  src: url("/fonts/Outfit-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Poppins";
+  src: url("/fonts/Poppins-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Playfair Display";
+  src: url("/fonts/PlayfairDisplay-Variable.ttf") format("truetype");
+  font-weight: 400 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Noto Sans Devanagari";
+  src: url("/fonts/NotoSansDevanagari-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Bangers";
+  src: url("/fonts/Bangers-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Anton";
+  src: url("/fonts/Anton-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Noto Serif";
+  src: url("/fonts/NotoSerif-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-display: swap;
+}
+
+/* ── Broadcast Obsidian Pro Design Tokens (OKLCH) ──────────────────────── */
+:root,
+[data-theme="dark"] {
+  --bg-canvas: oklch(0.145 0.008 260);
+  --bg-surface: oklch(0.18 0.009 260);
+  --bg-panel: oklch(0.21 0.01 260);
+  --bg-elevated: oklch(0.245 0.012 260);
+  --bg-input: oklch(0.16 0.008 260);
+
+  --border-subtle: oklch(0.28 0.012 260 / 0.7);
+  --border-strong: oklch(0.36 0.015 260 / 0.9);
+
+  --text-primary: oklch(0.955 0.005 260);
+  --text-secondary: oklch(0.76 0.01 260);
+  --text-muted: oklch(0.58 0.012 260);
+
+  --accent-amber: oklch(0.77 0.165 72);
+  --accent-amber-soft: oklch(0.77 0.165 72 / 0.16);
+  --accent-cyan: oklch(0.76 0.135 205);
+  --accent-cyan-soft: oklch(0.76 0.135 205 / 0.15);
+  --accent-violet: oklch(0.70 0.16 290);
+  --accent-violet-soft: oklch(0.70 0.16 290 / 0.16);
+
+  --status-pass: oklch(0.74 0.16 155);
+  --status-pass-soft: oklch(0.74 0.16 155 / 0.15);
+  --status-warn: oklch(0.80 0.155 82);
+  --status-warn-soft: oklch(0.80 0.155 82 / 0.16);
+  --status-fail: oklch(0.66 0.21 22);
+  --status-fail-soft: oklch(0.66 0.21 22 / 0.16);
+
+  --shadow-panel: 0 12px 32px oklch(0.05 0.01 260 / 0.55);
+  --shadow-float: 0 20px 56px oklch(0.04 0.01 260 / 0.72);
+  color-scheme: dark;
+}
+
+[data-theme="light"] {
+  --bg-canvas: oklch(0.968 0.004 260);
+  --bg-surface: oklch(0.992 0.002 260);
+  --bg-panel: oklch(0.955 0.006 260);
+  --bg-elevated: oklch(0.925 0.008 260);
+  --bg-input: oklch(0.988 0.003 260);
+
+  --border-subtle: oklch(0.86 0.008 260 / 0.85);
+  --border-strong: oklch(0.75 0.012 260 / 0.95);
+
+  --text-primary: oklch(0.18 0.015 260);
+  --text-secondary: oklch(0.38 0.015 260);
+  --text-muted: oklch(0.54 0.012 260);
+
+  --accent-amber: oklch(0.62 0.165 65);
+  --accent-amber-soft: oklch(0.62 0.165 65 / 0.14);
+  --accent-cyan: oklch(0.56 0.135 210);
+  --accent-cyan-soft: oklch(0.56 0.135 210 / 0.14);
+  --accent-violet: oklch(0.56 0.17 290);
+  --accent-violet-soft: oklch(0.56 0.17 290 / 0.14);
+
+  --status-pass: oklch(0.56 0.155 155);
+  --status-pass-soft: oklch(0.56 0.155 155 / 0.14);
+  --status-warn: oklch(0.64 0.155 78);
+  --status-warn-soft: oklch(0.64 0.155 78 / 0.14);
+  --status-fail: oklch(0.56 0.21 22);
+  --status-fail-soft: oklch(0.56 0.21 22 / 0.14);
+
+  --shadow-panel: 0 8px 24px oklch(0.2 0.01 260 / 0.08);
+  --shadow-float: 0 18px 48px oklch(0.2 0.01 260 / 0.14);
+  color-scheme: light;
+}
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+    font-family: "Inter", system-ui, -apple-system, sans-serif;
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+  }
+
+  code, pre, .font-mono, .tabular-nums {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  *:focus-visible {
+    outline: 2px solid var(--accent-cyan);
+    outline-offset: 2px;
+  }
+}
+
+/* Precision thin scrollbars for NLE panels */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

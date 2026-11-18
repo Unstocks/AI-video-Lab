@@ -12,9 +12,11 @@ Unified Top-Supervisor interactive cockpit:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import math
 import time
+import uuid
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -26,10 +28,29 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from backlot import server as backlot_server
-from backlot.state import load_board_state
+from backlot.state import ARTIFACT_FILES, _collect_history, load_board_state
 from lib.face_detector import MultiFaceDetector
 from lib.ffmpeg_profiles import nvenc_available
+from lib.paths import REPO_ROOT
 from lib.subtitle_styles import SUBTITLE_STYLE_PRESETS, SubtitleStylePreset
+from studio.catalog import (
+    get_media_profiles_catalog,
+    get_pipelines_catalog,
+    get_playbooks_catalog,
+    get_studio_config,
+    get_tools_catalog,
+)
+from studio.media_engine import (
+    MAX_UPLOAD_BYTES,
+    STUDIO_UPLOADS_DIR,
+    browse_local_media,
+    extract_filmstrip_frames,
+    extract_waveform_peaks,
+    get_music_library_dir,
+    list_music_library,
+    resolve_filmstrip_frame,
+    sanitize_upload_filename,
+)
 from studio.security import (
     generate_studio_token,
     is_valid_project_id,
@@ -43,10 +64,12 @@ from studio.supervisor import (
     SupervisorNotFoundError,
     discover_supervisor_bin,
     probe_fcc_health,
+    switch_fcc_model,
 )
 
 STUDIO_UI_DIR = Path(__file__).resolve().parent / "ui"
 BACKLOT_UI_DIR = Path(__file__).resolve().parent.parent / "backlot" / "ui"
+FONTS_DIR = REPO_ROOT / "assets" / "fonts"
 SSE_HEARTBEAT_SECONDS = 15
 VALID_LAYOUT_MODES = ("auto", "single_crop", "blurred_pillarbox", "stacked_split", "speaker_cut")
 LayoutModeLiteral = Literal["auto", "single_crop", "blurred_pillarbox", "stacked_split", "speaker_cut"]
@@ -290,9 +313,68 @@ class ExportRequest(BaseModel):
         return _check_optional_project_id(v)
 
 
+class StartProductionRequest(BaseModel):
+    pipeline_type: str = Field(..., min_length=1)
+    brief_prompt: str = Field(default="")
+    project_id: Optional[str] = None
+    source_input: Optional[str] = None
+    reference_url: Optional[str] = None
+    style_playbook: Optional[str] = None
+    media_profile: Optional[str] = None
+    render_runtime: Optional[str] = None
+    style_preset: Optional[str] = None
+    budget_usd: Optional[float] = Field(default=None, ge=0.0, le=500.0)
+    clip_count: int = Field(default=2, ge=1, le=10)
+    layout_mode: LayoutModeLiteral = Field(default="auto")
+    enable_punch_in: bool = Field(default=True)
+
+    @field_validator("project_id")
+    @classmethod
+    def _val_pid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_optional_project_id(v)
+
+
+class CreateSessionRequest(BaseModel):
+    title: Optional[str] = None
+    project_id: Optional[str] = None
+
+    @field_validator("project_id")
+    @classmethod
+    def _val_pid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_optional_project_id(v)
+
+
+class GateDecisionRequest(BaseModel):
+    stage: str = Field(..., min_length=1)
+    decision: Literal["approve", "revise", "reject"]
+    notes: str = ""
+    project_id: Optional[str] = None
+
+    @field_validator("project_id")
+    @classmethod
+    def _val_pid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_optional_project_id(v)
+
+
+class FccModelSwitchRequest(BaseModel):
+    model: str = Field(..., min_length=1)
+
+
+_HW_PROBE_CACHE: Optional[tuple[bool, str]] = None
+
+
+def _probe_hardware_cached() -> tuple[bool, str]:
+    global _HW_PROBE_CACHE
+    if _HW_PROBE_CACHE is None:
+        nv = nvenc_available()
+        with MultiFaceDetector() as det:
+            fb = det.backend
+        _HW_PROBE_CACHE = (nv, fb)
+    return _HW_PROBE_CACHE
+
+
 def _probe_face_backend() -> str:
-    with MultiFaceDetector() as det:
-        return det.backend
+    return _probe_hardware_cached()[1]
 
 
 def create_app(
@@ -312,15 +394,22 @@ def create_app(
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
         watch_task = asyncio.create_task(backlot_server._watch_projects()) if enable_watcher else None
+        warmup_task = (
+            asyncio.create_task(asyncio.to_thread(get_tools_catalog))
+            if enable_watcher
+            else None
+        )
         app.state.watch_task = watch_task
+        app.state.warmup_task = warmup_task
         try:
             yield
         finally:
             await mgr.shutdown()
-            if watch_task is not None:
-                watch_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await watch_task
+            for task in (watch_task, warmup_task):
+                if task is not None:
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
 
     app = FastAPI(title="AI Video Lab Studio", docs_url=None, redoc_url=None, lifespan=_lifespan)
     app.state.studio_token = token
@@ -345,10 +434,9 @@ def create_app(
     @app.get("/api/studio/health")
     async def studio_health(request: Request) -> dict[str, Any]:
         require_loopback(request)
-        fcc, nvenc, face_backend = await asyncio.gather(
-            asyncio.to_thread(probe_fcc_health),
-            asyncio.to_thread(nvenc_available),
-            asyncio.to_thread(_probe_face_backend),
+        fcc, (nvenc, face_backend) = await asyncio.gather(
+            asyncio.to_thread(probe_fcc_health, None, 0.5),
+            asyncio.to_thread(_probe_hardware_cached),
         )
         return {
             "ok": True,
@@ -364,12 +452,146 @@ def create_app(
         require_loopback(request)
         return [serialize_preset(p) for p in SUBTITLE_STYLE_PRESETS.values()]
 
+    # ---- Whole-System Catalog & Discovery --------------------------------
+
+    @app.get("/api/studio/pipelines")
+    async def studio_pipelines(request: Request) -> list[dict[str, Any]]:
+        require_loopback(request)
+        return await asyncio.to_thread(get_pipelines_catalog)
+
+    @app.get("/api/studio/playbooks")
+    async def studio_playbooks(request: Request) -> list[dict[str, Any]]:
+        require_loopback(request)
+        return await asyncio.to_thread(get_playbooks_catalog)
+
+    @app.get("/api/studio/media-profiles")
+    async def studio_media_profiles(request: Request) -> list[dict[str, Any]]:
+        require_loopback(request)
+        return await asyncio.to_thread(get_media_profiles_catalog)
+
+    @app.get("/api/studio/tools")
+    async def studio_tools(request: Request, refresh: bool = False) -> dict[str, Any]:
+        require_loopback(request)
+        return await asyncio.to_thread(get_tools_catalog, force_refresh=refresh)
+
+    @app.get("/api/studio/music-library")
+    async def studio_music_library(request: Request) -> dict[str, Any]:
+        require_loopback(request)
+        return await asyncio.to_thread(list_music_library)
+
+    @app.get("/api/studio/config")
+    async def studio_config(request: Request) -> dict[str, Any]:
+        require_loopback(request)
+        return await asyncio.to_thread(get_studio_config)
+
+    @app.get("/api/studio/fcc/models")
+    async def studio_fcc_models(request: Request) -> dict[str, Any]:
+        require_loopback(request)
+        return await asyncio.to_thread(probe_fcc_health, None, 0.5)
+
+    @app.post("/api/studio/fcc/model")
+    async def studio_fcc_switch_model(body: FccModelSwitchRequest, request: Request) -> dict[str, Any]:
+        require_studio_write(request, token)
+        try:
+            return await asyncio.to_thread(switch_fcc_model, body.model)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/api/studio/fs/browse")
+    async def studio_fs_browse(request: Request, path: Optional[str] = None) -> dict[str, Any]:
+        require_loopback(request)
+        return await asyncio.to_thread(browse_local_media, path)
+
+    @app.post("/api/studio/upload", status_code=201)
+    async def studio_upload(request: Request, filename: str = "upload.mp4") -> dict[str, Any]:
+        """Stream raw binary file upload directly into .studio/uploads/ (no python-multipart needed)."""
+        require_studio_write(request, token)
+        try:
+            safe_name = sanitize_upload_filename(filename)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        STUDIO_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        unique_name = f"{uuid.uuid4().hex[:8]}_{safe_name}"
+        dest = (STUDIO_UPLOADS_DIR / unique_name).resolve()
+        try:
+            dest.relative_to(STUDIO_UPLOADS_DIR.resolve())
+        except ValueError:
+            raise HTTPException(status_code=403, detail="invalid upload path")
+
+        written = 0
+        try:
+            with open(dest, "wb") as out_f:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > MAX_UPLOAD_BYTES:
+                        raise HTTPException(status_code=413, detail="Upload exceeds 2 GiB cap")
+                    out_f.write(chunk)
+        except HTTPException:
+            with suppress(OSError):
+                dest.unlink()
+            raise
+        except Exception as exc:
+            with suppress(OSError):
+                dest.unlink()
+            raise HTTPException(status_code=500, detail=f"Upload failed: {exc}")
+
+        if written == 0:
+            with suppress(OSError):
+                dest.unlink()
+            raise HTTPException(status_code=400, detail="Empty upload body")
+
+        return {
+            "ok": True,
+            "filename": safe_name,
+            "stored_name": unique_name,
+            "path": str(dest),
+            "size_bytes": written,
+        }
+
     # ---- Projects (Read-Only Reuse of Backlot) ---------------------------
 
     @app.get("/api/studio/projects")
     async def studio_projects(request: Request) -> list[dict[str, Any]]:
         require_loopback(request)
         return await asyncio.to_thread(backlot_server._cached_summaries)
+
+    @app.get("/api/studio/library/events")
+    async def studio_library_events(request: Request) -> StreamingResponse:
+        require_loopback(request)
+
+        async def stream():
+            q = backlot_server.hub.subscribe("*")
+            last_hb = time.monotonic()
+            try:
+                yield _sse({"type": "hello", "scope": "library"})
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    try:
+                        await asyncio.wait_for(q.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        now = time.monotonic()
+                        if now - last_hb >= SSE_HEARTBEAT_SECONDS:
+                            last_hb = now
+                            yield _sse({"type": "heartbeat", "ts": time.time()})
+                        continue
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    last_hb = time.monotonic()
+                    yield _sse({"type": "library.change", "ts": time.time()})
+            finally:
+                backlot_server.hub.unsubscribe(q)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/api/studio/project/{project_id}/state")
     async def studio_project_state(project_id: str, request: Request) -> dict[str, Any]:
@@ -378,6 +600,130 @@ def create_app(
         state = await asyncio.to_thread(load_board_state, project_dir)
         state["crop_drafts"] = await asyncio.to_thread(session_store.get_crop_drafts, project_id)
         return state
+
+    @app.get("/api/studio/project/{project_id}/artifacts/{artifact_name}")
+    async def studio_project_artifact(
+        project_id: str, artifact_name: str, request: Request
+    ) -> dict[str, Any]:
+        require_loopback(request)
+        project_dir = backlot_server._safe_project_dir(project_id)
+        if artifact_name not in ARTIFACT_FILES:
+            raise HTTPException(status_code=404, detail=f"Unknown artifact: {artifact_name}")
+        target = project_dir / "artifacts" / ARTIFACT_FILES[artifact_name]
+        if not target.is_file():
+            state = await asyncio.to_thread(load_board_state, project_dir)
+            art = (state.get("artifacts") or {}).get(artifact_name)
+            if art is not None:
+                return {"name": artifact_name, "source": "checkpoint", "data": art}
+            raise HTTPException(status_code=404, detail=f"Artifact not present: {artifact_name}")
+        try:
+            data = json.loads(target.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=500, detail=f"Malformed artifact JSON: {exc}")
+        return {"name": artifact_name, "source": "file", "data": data}
+
+    @app.get("/api/studio/project/{project_id}/history")
+    async def studio_project_history(project_id: str, request: Request) -> dict[str, Any]:
+        require_loopback(request)
+        project_dir = backlot_server._safe_project_dir(project_id)
+        hist = await asyncio.to_thread(_collect_history, project_dir)
+        return {"project_id": project_id, "stages": hist}
+
+    @app.get("/api/studio/project/{project_id}/files")
+    async def studio_project_files(project_id: str, request: Request) -> dict[str, Any]:
+        require_loopback(request)
+        project_dir = backlot_server._safe_project_dir(project_id)
+
+        def _scan() -> list[dict[str, Any]]:
+            out: list[dict[str, Any]] = []
+            exclude = {"node_modules", ".git", "__pycache__", ".cache"}
+            for p in sorted(project_dir.rglob("*")):
+                if any(part in exclude for part in p.parts):
+                    continue
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(project_dir).as_posix()
+                st = p.stat()
+                out.append({
+                    "rel_path": rel,
+                    "name": p.name,
+                    "extension": p.suffix.lower().lstrip("."),
+                    "size_bytes": st.st_size,
+                    "mtime": st.st_mtime,
+                    "media_url": f"/media/{project_id}/{rel}",
+                })
+                if len(out) >= 400:
+                    break
+            return out
+
+        files = await asyncio.to_thread(_scan)
+        return {"project_id": project_id, "count": len(files), "files": files}
+
+    @app.get("/api/studio/project/{project_id}/waveform/{file_path:path}")
+    async def studio_project_waveform(
+        project_id: str, file_path: str, request: Request, bins: int = 400
+    ) -> dict[str, Any]:
+        require_loopback(request)
+        project_dir = backlot_server._safe_project_dir(project_id)
+        target = (project_dir / file_path).resolve()
+        try:
+            target.relative_to(project_dir.resolve())
+        except ValueError:
+            raise HTTPException(status_code=403, detail="path escapes project")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="media not found")
+        return await asyncio.to_thread(extract_waveform_peaks, target, bins=bins)
+
+    @app.get("/api/studio/project/{project_id}/filmstrip/{file_path:path}")
+    async def studio_project_filmstrip(
+        project_id: str,
+        file_path: str,
+        request: Request,
+        count: int = 12,
+        w: int = 180,
+    ) -> dict[str, Any]:
+        require_loopback(request)
+        project_dir = backlot_server._safe_project_dir(project_id)
+        target = (project_dir / file_path).resolve()
+        try:
+            target.relative_to(project_dir.resolve())
+        except ValueError:
+            raise HTTPException(status_code=403, detail="path escapes project")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="media not found")
+        data = await asyncio.to_thread(extract_filmstrip_frames, target, count=count, width=w)
+        key = data["cache_key"]
+
+        def _attach_frames() -> list[dict[str, Any]]:
+            enriched: list[dict[str, Any]] = []
+            for f in data.get("frames", []):
+                idx = int(f["index"])
+                entry = {
+                    **f,
+                    "url": f"/api/studio/filmstrip-frame/{key}/{idx}",
+                }
+                fp = resolve_filmstrip_frame(key, idx)
+                if fp is not None:
+                    try:
+                        b64 = base64.b64encode(fp.read_bytes()).decode("ascii")
+                        entry["data_url"] = f"data:image/jpeg;base64,{b64}"
+                    except OSError:
+                        pass
+                enriched.append(entry)
+            return enriched
+
+        frames = await asyncio.to_thread(_attach_frames)
+        return {**data, "frames": frames}
+
+    @app.get("/api/studio/filmstrip-frame/{cache_key}/{frame_idx}")
+    async def studio_filmstrip_frame(
+        cache_key: str, frame_idx: int, request: Request
+    ) -> FileResponse:
+        require_loopback(request)
+        frame = resolve_filmstrip_frame(cache_key, frame_idx)
+        if frame is None:
+            raise HTTPException(status_code=404, detail="filmstrip frame not found")
+        return FileResponse(frame, media_type="image/jpeg")
 
     @app.get("/api/studio/project/{project_id}/transcript")
     async def studio_project_transcript(
@@ -396,21 +742,26 @@ def create_app(
 
         async def stream():
             q = backlot_server.hub.subscribe(project_id)
+            last_hb = time.monotonic()
             try:
                 yield _sse({"type": "hello", "project_id": project_id})
                 while True:
                     if await request.is_disconnected():
                         return
                     try:
-                        await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT_SECONDS)
+                        await asyncio.wait_for(q.get(), timeout=1.0)
                     except asyncio.TimeoutError:
-                        yield _sse({"type": "heartbeat", "ts": time.time()})
+                        now = time.monotonic()
+                        if now - last_hb >= SSE_HEARTBEAT_SECONDS:
+                            last_hb = now
+                            yield _sse({"type": "heartbeat", "ts": time.time()})
                         continue
                     while not q.empty():
                         try:
                             q.get_nowait()
                         except asyncio.QueueEmpty:
                             break
+                    last_hb = time.monotonic()
                     yield _sse({"type": "change", "project_id": project_id})
             finally:
                 backlot_server.hub.unsubscribe(q)
@@ -458,6 +809,7 @@ def create_app(
         async def stream():
             q = mgr.subscribe(session_id)
             sent_msg_ids: set[int] = set()
+            last_hb = time.monotonic()
             try:
                 yield _sse({"type": "hello", "session_id": session_id, "status": session["status"]})
                 replayed = await asyncio.to_thread(session_store.list_messages, session_id, after_id)
@@ -468,10 +820,14 @@ def create_app(
                     if await request.is_disconnected():
                         return
                     try:
-                        evt = await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT_SECONDS)
+                        evt = await asyncio.wait_for(q.get(), timeout=1.0)
                     except asyncio.TimeoutError:
-                        yield _sse({"type": "heartbeat", "ts": time.time()})
+                        now = time.monotonic()
+                        if now - last_hb >= SSE_HEARTBEAT_SECONDS:
+                            last_hb = now
+                            yield _sse({"type": "heartbeat", "ts": time.time()})
                         continue
+                    last_hb = time.monotonic()
                     msg_obj = evt.get("message") if isinstance(evt, dict) else None
                     if isinstance(msg_obj, dict) and msg_obj.get("id") is not None:
                         mid = int(msg_obj["id"])
@@ -515,6 +871,61 @@ def create_app(
                 style_preset=body.style_preset,
                 layout_mode=body.layout_mode,
                 enable_punch_in=body.enable_punch_in,
+            )
+        except Exception as exc:
+            raise _map_supervisor_errors(exc)
+
+    @app.post("/api/studio/productions", status_code=201)
+    async def create_production(body: StartProductionRequest, request: Request) -> dict[str, Any]:
+        require_studio_write(request, token)
+        _validate_preset(body.style_preset)
+        try:
+            return await mgr.start_production(
+                pipeline_type=body.pipeline_type,
+                brief_prompt=body.brief_prompt,
+                project_id=body.project_id,
+                source_input=body.source_input,
+                reference_url=body.reference_url,
+                style_playbook=body.style_playbook,
+                media_profile=body.media_profile,
+                render_runtime=body.render_runtime,
+                style_preset=body.style_preset,
+                budget_usd=body.budget_usd,
+                clip_count=body.clip_count,
+                layout_mode=body.layout_mode,
+                enable_punch_in=body.enable_punch_in,
+            )
+        except Exception as exc:
+            raise _map_supervisor_errors(exc)
+
+    @app.post("/api/studio/sessions", status_code=201)
+    async def create_session(body: CreateSessionRequest, request: Request) -> dict[str, Any]:
+        require_studio_write(request, token)
+        try:
+            return await mgr.create_session(title=body.title, project_id=body.project_id)
+        except Exception as exc:
+            raise _map_supervisor_errors(exc)
+
+    @app.delete("/api/studio/sessions/{session_id}")
+    async def delete_session(session_id: str, request: Request) -> dict[str, Any]:
+        require_studio_write(request, token)
+        deleted = await mgr.delete_session(session_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Unknown session")
+        return {"ok": True, "session_id": session_id}
+
+    @app.post("/api/studio/sessions/{session_id}/gate", status_code=202)
+    async def post_gate_decision(
+        session_id: str, body: GateDecisionRequest, request: Request
+    ) -> dict[str, Any]:
+        require_studio_write(request, token)
+        try:
+            return await mgr.send_gate_decision(
+                session_id,
+                stage=body.stage,
+                decision=body.decision,
+                notes=body.notes,
+                project_id=body.project_id,
             )
         except Exception as exc:
             raise _map_supervisor_errors(exc)
@@ -661,25 +1072,62 @@ def create_app(
             raise HTTPException(status_code=404, detail="media not found")
         return FileResponse(target)
 
-    # ---- Studio UI -------------------------------------------------------
+    @app.get("/fonts/{font_name}")
+    async def studio_font(font_name: str, request: Request) -> FileResponse:
+        """Serve bundled OpenMontage fonts for exact WYSIWYG subtitle preview."""
+        require_loopback(request)
+        if "/" in font_name or "\\" in font_name or ".." in font_name:
+            raise HTTPException(status_code=400, detail="invalid font name")
+        target = (FONTS_DIR / font_name).resolve()
+        try:
+            target.relative_to(FONTS_DIR.resolve())
+        except ValueError:
+            raise HTTPException(status_code=403, detail="path escapes fonts")
+        if not target.is_file() or target.suffix.lower() not in {".ttf", ".otf", ".woff2"}:
+            raise HTTPException(status_code=404, detail="font not found")
+        return FileResponse(target, headers={"Cache-Control": "public, max-age=86400"})
+
+    @app.get("/music/{file_path:path}")
+    async def studio_music_file(file_path: str, request: Request) -> FileResponse:
+        """Stream local royalty-free music tracks from music_library/."""
+        require_loopback(request)
+        lib_dir = get_music_library_dir()
+        target = (lib_dir / file_path).resolve()
+        try:
+            target.relative_to(lib_dir.resolve())
+        except ValueError:
+            raise HTTPException(status_code=403, detail="path escapes music_library")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="music track not found")
+        return FileResponse(target)
+
+    # ---- Studio UI (Vite React SPA + Static Assets) ----------------------
+
+    @app.get("/ui/{asset_path:path}")
+    async def studio_ui_asset(asset_path: str, request: Request) -> FileResponse:
+        require_loopback(request)
+        target = (STUDIO_UI_DIR / asset_path).resolve()
+        try:
+            target.relative_to(STUDIO_UI_DIR.resolve())
+        except ValueError:
+            raise HTTPException(status_code=403, detail="path escapes ui")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="ui asset not found")
+        return FileResponse(target, headers={"Cache-Control": "no-cache"})
+
+    if BACKLOT_UI_DIR.is_dir():
+        app.mount("/backlot-ui", StaticFiles(directory=BACKLOT_UI_DIR), name="backlot_ui")
 
     @app.get("/")
     async def studio_index(request: Request) -> HTMLResponse:
         require_loopback(request)
         return _render_index_html()
 
-    if STUDIO_UI_DIR.is_dir():
-        app.mount("/ui", StaticFiles(directory=STUDIO_UI_DIR), name="studio_ui")
-    if BACKLOT_UI_DIR.is_dir():
-        app.mount("/backlot-ui", StaticFiles(directory=BACKLOT_UI_DIR), name="backlot_ui")
-
-    @app.middleware("http")
-    async def ui_no_cache(request: Request, call_next):
-        response = await call_next(request)
-        path = request.url.path
-        if path == "/" or path.startswith("/ui") or path.startswith("/backlot-ui"):
-            response.headers["Cache-Control"] = "no-cache"
-        return response
+    @app.get("/project/{rest:path}")
+    @app.get("/system")
+    async def studio_spa_fallback(request: Request, rest: str = "") -> HTMLResponse:
+        require_loopback(request)
+        return _render_index_html()
 
     app.add_middleware(
         TrustedHostMiddleware,
