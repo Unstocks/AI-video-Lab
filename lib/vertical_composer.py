@@ -480,6 +480,26 @@ class VerticalClipComposer:
                         if backup.exists():
                             os.replace(backup, final_path)
                     raise
+            try:
+                from lib.events import emit_event, infer_project_dir
+
+                proj_dir = infer_project_dir({"output_path": str(output_path), "output_dir": str(destination)})
+                if proj_dir is not None:
+                    layout_summary: dict[str, int] = {}
+                    for r in active_layout_ranges or []:
+                        lbl = str(r.get("layout", "track"))
+                        layout_summary[lbl] = layout_summary.get(lbl, 0) + 1
+                    emit_event(proj_dir, {
+                        "type": "clip_rendered",
+                        "candidate_id": candidate_id,
+                        "encoder_used": effective_codec,
+                        "layout_mode": config.layout_mode,
+                        "layout_summary": layout_summary,
+                        "punch_in_count": len(reframed_result.data.get("punch_ins") or []),
+                        "output": str(output_path),
+                    })
+            except Exception:
+                pass
             return ClipRenderResult(
                 candidate_id, True, str(output_path), str(subtitle_path) if subtitle_result else None,
                 source_used, config.layout_mode, media_duration, width, height,

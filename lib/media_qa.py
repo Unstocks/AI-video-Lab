@@ -42,6 +42,8 @@ class MediaQAConfig:
     require_subtitles: bool = False
     freeze_diff_threshold: float = 1.0
     min_speech_lufs_std: float = 0.5
+    enforce_loudnorm_window: bool = False
+    verify_metadata_scrubbed: bool = False
 
     def __post_init__(self) -> None:
         get_profile(self.profile_name)
@@ -129,6 +131,23 @@ class MediaQAInspector:
             if result.returncode == 0 and frame.is_file() and frame.stat().st_size > 0:
                 frames.append(frame)
         return frames
+
+    def _audio_metrics(self, path: Path) -> tuple[Optional[float], Optional[float]]:
+        """Extract exact EBU R128 Summary integrated LUFS and true-peak dBTP."""
+        result = self._run([
+            self.ffmpeg, "-hide_banner", "-nostats", "-i", str(path), "-vn",
+            "-af", "ebur128=peak=true", "-f", "null", "-",
+        ], timeout=60)
+        if result.returncode != 0:
+            return None, None
+        log = result.stderr or ""
+        summary_idx = log.rfind("Summary:")
+        summary = log[summary_idx:] if summary_idx != -1 else log
+        m_i = re.search(r"\bI:\s*(-?\d+(?:\.\d+)?)\s*LUFS", summary)
+        m_tp = re.search(r"\bPeak:\s*(-?\d+(?:\.\d+)?)\s*(?:dBFS|dBTP)", summary)
+        integrated = float(m_i.group(1)) if m_i and math.isfinite(float(m_i.group(1))) else None
+        true_peak = float(m_tp.group(1)) if m_tp and math.isfinite(float(m_tp.group(1))) else None
+        return integrated, true_peak
 
     def _audio_active(self, path: Path, threshold: float, clipping_threshold: float) -> tuple[bool, bool, Optional[float], bool, list[str]]:
         result = self._run([
@@ -368,6 +387,8 @@ class MediaQAInspector:
         speech_modulation: Optional[str] = None
         audio_profile_checked = False
         peak_checked = False
+        integrated_lufs: Optional[float] = None
+        true_peak_dbtp: Optional[float] = None
         verified_silence = bool(config.require_audio and not has_audio)
         if not has_audio:
             if config.require_audio:
@@ -376,6 +397,7 @@ class MediaQAInspector:
             audio_audible, clipping_detected, loudness_std, peak_checked, audio_measure_issues = self._audio_active(
                 path, config.min_audible_lufs, config.max_peak_clipping_lufs,
             )
+            integrated_lufs, true_peak_dbtp = self._audio_metrics(path)
             audio_issues.extend(audio_measure_issues)
             audio_profile_checked = not audio_measure_issues
             if audio_profile_checked and audio_audible is False:
@@ -394,8 +416,28 @@ class MediaQAInspector:
                 audio_issues.append("audio stream is silent or below audible threshold")
             if clipping_detected:
                 audio_issues.append("audio peak reaches the clipping threshold")
-        audio = {"unexpected_silence": verified_silence,
-                 "clipping_detected": clipping_detected, "issues": audio_issues}
+            if config.enforce_loudnorm_window:
+                if integrated_lufs is None or not (-16.5 <= integrated_lufs <= -11.5):
+                    audio_issues.append(f"integrated loudness {integrated_lufs} LUFS outside broadcast window [-16.5, -11.5]")
+                if true_peak_dbtp is not None and true_peak_dbtp > -1.0:
+                    audio_issues.append(f"true peak {true_peak_dbtp} dBTP exceeds -1.0 dBTP ceiling")
+        if config.verify_metadata_scrubbed and path.is_file():
+            try:
+                fmt_tags = {k.lower(): v for k, v in (self._probe(path).get("format") or {}).get("tags", {}).items()}
+                leaked = [k for k in ("title", "comment", "artist", "album") if k in fmt_tags]
+                if leaked:
+                    tech_issues.append(f"unscrubbed source metadata tags present: {', '.join(leaked)}")
+            except Exception:
+                pass
+        audio: dict[str, Any] = {
+            "unexpected_silence": verified_silence,
+            "clipping_detected": clipping_detected,
+            "issues": audio_issues,
+        }
+        if integrated_lufs is not None:
+            audio["integrated_lufs"] = round(integrated_lufs, 2)
+        if true_peak_dbtp is not None:
+            audio["true_peak_dbtp"] = round(true_peak_dbtp, 2)
         if narration_present is not None:
             audio["narration_present"] = narration_present
 

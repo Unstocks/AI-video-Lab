@@ -587,6 +587,10 @@ def _last_activity(project_dir: Path) -> float:
         art = project_dir / "artifacts"
         if art.is_dir():
             candidates.extend(art.glob("*.json"))
+        renders = project_dir / "renders"
+        if renders.is_dir():
+            candidates.extend(renders.glob("*.mp4"))
+            candidates.extend(renders.glob("*.layout.json"))
         for p in candidates:
             try:
                 latest = max(latest, p.stat().st_mtime)
@@ -595,6 +599,229 @@ def _last_activity(project_dir: Path) -> float:
     except OSError:
         pass
     return latest
+
+
+def _find_clip_plan_json(project_dir: Path, artifacts: dict[str, Any]) -> Optional[dict[str, Any]]:
+    for key in ("clip_selection_plan", "clip_plan"):
+        if isinstance(artifacts.get(key), dict):
+            return artifacts[key]
+    for rel in (
+        "artifacts/clip_selection_plan.json",
+        "clip_selection_plan.json",
+        "artifacts/clip_plan.json",
+    ):
+        data = _read_json(project_dir / rel)
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _build_clip_studio(
+    project_dir: Path,
+    artifacts: dict[str, Any],
+    media: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Read-only Clip Studio projection joining plan, script, renders, .layout.json, QA & exports.
+
+    Returns ``None`` for projects that have no clip-factory artifacts or rendered layout sidecars.
+    Never writes to disk and never raises.
+    """
+    from lib import layout_ranges as _lr
+
+    plan = _find_clip_plan_json(project_dir, artifacts)
+    script = artifacts.get("script") if isinstance(artifacts.get("script"), dict) else (
+        _read_json(project_dir / "artifacts" / "script.json")
+        or _read_json(project_dir / "script.json")
+    )
+    final_review = artifacts.get("final_review") if isinstance(artifacts.get("final_review"), dict) else (
+        _read_json(project_dir / "artifacts" / "final_review.json")
+    )
+    export_manifest = (
+        _read_json(project_dir / "exports" / "export_manifest.json")
+        or _read_json(project_dir / "artifacts" / "export_manifest.json")
+    )
+    source_manifest = _read_json(project_dir / "source" / "source_manifest.json")
+
+    renders_dir = project_dir / "renders"
+    render_mp4s: dict[str, Path] = {}
+    if renders_dir.is_dir():
+        try:
+            for f in sorted(renders_dir.iterdir()):
+                if f.is_file() and f.suffix.lower() == ".mp4":
+                    render_mp4s[f.stem] = f
+        except OSError:
+            pass
+
+    plan_candidates = list(plan.get("candidates") or []) if isinstance(plan, dict) else []
+    script_candidates = list(script.get("candidates") or []) if isinstance(script, dict) else []
+    has_layout_sidecars = any(_lr.sidecar_path(p).is_file() for p in render_mp4s.values())
+
+    if not plan_candidates and not script_candidates and not has_layout_sidecars:
+        return None
+
+    # Index QA reports by candidate_id
+    qa_by_id: dict[str, dict[str, Any]] = {}
+    if isinstance(final_review, dict):
+        for item in (final_review.get("clip_reports") or final_review.get("clips") or []):
+            if isinstance(item, dict) and item.get("candidate_id"):
+                qa_by_id[str(item["candidate_id"])] = item
+        if final_review.get("candidate_id") and str(final_review["candidate_id"]) not in qa_by_id:
+            qa_by_id[str(final_review["candidate_id"])] = final_review
+
+    # Index exported paths by candidate_id
+    exports_by_id: dict[str, list[str]] = {}
+    if isinstance(export_manifest, dict):
+        for item in (export_manifest.get("clips") or export_manifest.get("exports") or []):
+            if isinstance(item, dict) and item.get("candidate_id"):
+                cid = str(item["candidate_id"])
+                paths = []
+                for k in ("export_path", "video_path", "path"):
+                    if isinstance(item.get(k), str) and item[k]:
+                        paths.append(item[k])
+                if paths:
+                    exports_by_id.setdefault(cid, []).extend(paths)
+
+    # Check SHA-256 sync between script.json and clip_selection_plan.json if recorded
+    plan_sha_synced: Optional[bool] = None
+    if isinstance(plan, dict) and isinstance(script, dict):
+        p_sha = plan.get("source_transcript_sha256") or plan.get("plan_sha256")
+        s_sha = script.get("source_transcript_sha256") or script.get("plan_sha256")
+        if p_sha and s_sha:
+            plan_sha_synced = (str(p_sha) == str(s_sha))
+
+    # Merge candidate order from plan + script + orphan renders
+    ordered_ids: list[str] = []
+    plan_by_id: dict[str, dict[str, Any]] = {}
+    script_by_id: dict[str, dict[str, Any]] = {}
+    for c in plan_candidates:
+        if isinstance(c, dict) and c.get("candidate_id"):
+            cid = str(c["candidate_id"])
+            plan_by_id[cid] = c
+            if cid not in ordered_ids:
+                ordered_ids.append(cid)
+    for c in script_candidates:
+        if isinstance(c, dict) and c.get("candidate_id"):
+            cid = str(c["candidate_id"])
+            script_by_id[cid] = c
+            if cid not in ordered_ids:
+                ordered_ids.append(cid)
+    for stem in sorted(render_mp4s.keys()):
+        if stem not in ordered_ids:
+            ordered_ids.append(stem)
+
+    clips_out: list[dict[str, Any]] = []
+    for cid in ordered_ids:
+        pc = plan_by_id.get(cid) or {}
+        sc = script_by_id.get(cid) or {}
+        merged = {**sc, **pc}
+
+        start_s = float(merged.get("start_seconds") or 0.0)
+        end_s = float(merged.get("end_seconds") or 0.0)
+        dur_s = round(max(0.0, end_s - start_s), 2) if end_s > start_s else float(merged.get("duration_seconds") or 0.0)
+
+        review_state = str(
+            merged.get("review_state")
+            or ("HUMAN_APPROVED" if merged.get("human_approved") else "AWAITING_HUMAN")
+        ).upper()
+
+        mp4_path = render_mp4s.get(cid)
+        video_rel: Optional[str] = _rel(project_dir, mp4_path) if mp4_path else None
+        video_mtime: Optional[float] = None
+        if mp4_path:
+            try:
+                video_mtime = mp4_path.stat().st_mtime
+            except OSError:
+                pass
+
+        sub_path: Optional[Path] = None
+        if mp4_path:
+            for ext in (".ass", ".srt"):
+                cand_sub = mp4_path.with_suffix(ext)
+                if cand_sub.is_file():
+                    sub_path = cand_sub
+                    break
+        sub_rel = _rel(project_dir, sub_path) if sub_path else None
+        seam_used = False
+        if sub_path and sub_path.suffix.lower() == ".ass":
+            try:
+                seam_used = "Style: Seam," in sub_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                pass
+
+        sidecar_payload = _lr.read_payload(mp4_path) if mp4_path else {"ranges": [], "punch_ins": []}
+
+        qa_raw = qa_by_id.get(cid)
+        qa_summary: Optional[dict[str, Any]] = None
+        if isinstance(qa_raw, dict):
+            tp = qa_raw.get("technical_probe") if isinstance(qa_raw.get("technical_probe"), dict) else {}
+            au = qa_raw.get("audio_spotcheck") if isinstance(qa_raw.get("audio_spotcheck"), dict) else {}
+            qa_summary = {
+                "status": qa_raw.get("status"),
+                "production_state": qa_raw.get("production_state"),
+                "resolution": tp.get("resolution"),
+                "codec": tp.get("codec") or tp.get("video_codec"),
+                "pix_fmt": tp.get("pix_fmt") or ("yuv420p" if tp.get("pixel_format_ok") else None),
+                "integrated_lufs": au.get("integrated_lufs") if au.get("integrated_lufs") is not None else au.get("mean_lufs"),
+                "true_peak_dbtp": au.get("true_peak_dbtp") if au.get("true_peak_dbtp") is not None else au.get("peak_lufs"),
+                "issues": list(qa_raw.get("issues") or []),
+            }
+
+        exported_paths = exports_by_id.get(cid, [])
+        if exported_paths:
+            prod_state = "EXPORTED"
+        elif qa_summary and qa_summary.get("production_state"):
+            prod_state = str(qa_summary["production_state"])
+        elif mp4_path:
+            prod_state = "RENDERED"
+        else:
+            prod_state = str(merged.get("production_state") or "PLANNED")
+
+        clips_out.append({
+            "candidate_id": cid,
+            "editorial_title": str(merged.get("editorial_title") or merged.get("title") or cid),
+            "start_seconds": round(start_s, 3),
+            "end_seconds": round(end_s, 3),
+            "duration_seconds": round(dur_s, 2),
+            "review_state": review_state,
+            "production_state": prod_state,
+            "spoken_hook": merged.get("spoken_hook") if isinstance(merged.get("spoken_hook"), dict) else None,
+            "spoken_opening": merged.get("spoken_opening"),
+            "original_spoken_dialogue": merged.get("original_spoken_dialogue"),
+            "cold_viewer_audit": (
+                merged.get("cold_viewer_audit")
+                if isinstance(merged.get("cold_viewer_audit"), dict)
+                else None
+            ),
+            "video_path": video_rel,
+            "video_mtime": video_mtime,
+            "subtitle_path": sub_rel,
+            "seam_subtitles_used": seam_used,
+            "layout_ranges": sidecar_payload["ranges"],
+            "punch_ins": sidecar_payload["punch_ins"],
+            "qa": qa_summary,
+            "exported_paths": exported_paths,
+        })
+
+    # Locate source video for ReframeModal
+    source_video_rel: Optional[str] = None
+    for candidate_src in (
+        project_dir / "source" / "source_video.mp4",
+        project_dir / "source" / "source_video_h264.mp4",
+    ):
+        if candidate_src.is_file():
+            source_video_rel = _rel(project_dir, candidate_src)
+            break
+
+    return {
+        "source_video": source_video_rel,
+        "source_manifest": source_manifest if isinstance(source_manifest, dict) else None,
+        "plan_sha256_synced": plan_sha_synced,
+        "awaiting_approval_count": sum(1 for c in clips_out if c["review_state"] in ("AWAITING_HUMAN", "PENDING_REVIEW")),
+        "approved_count": sum(1 for c in clips_out if c["review_state"] == "HUMAN_APPROVED"),
+        "qa_passed_count": sum(1 for c in clips_out if c["production_state"] in ("QA_PASSED", "EXPORTED")),
+        "exported_count": sum(1 for c in clips_out if c["production_state"] == "EXPORTED"),
+        "clips": clips_out,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +852,7 @@ def load_board_state(project_dir: Path) -> dict[str, Any]:
     events = read_events(project_dir, limit=250)
     storyboard = _build_storyboard(project_dir, artifacts, events)
     media = _scan_media(project_dir)
+    clip_studio = _build_clip_studio(project_dir, artifacts, media)
 
     stages = _build_stage_rail(pipeline_meta, checkpoints, history)
 
@@ -666,6 +894,7 @@ def load_board_state(project_dir: Path) -> dict[str, Any]:
         "artifacts": artifacts,
         "storyboard": storyboard,
         "media": media,
+        "clip_studio": clip_studio,
         "events": events,
         "cost": cost,
         "last_activity": last_activity,
