@@ -3,6 +3,7 @@
 import json
 import shutil
 import subprocess
+from types import SimpleNamespace
 from fractions import Fraction
 
 import pytest
@@ -16,6 +17,16 @@ pytestmark = pytest.mark.skipif(
 
 def run(command):
     return subprocess.run(command, check=True, capture_output=True, timeout=10).stdout
+
+
+def test_rotation_metadata_swaps_effective_display_dimensions(monkeypatch, tmp_path):
+    reframe = AutoReframe()
+    payload = {"streams": [{
+        "width": 1920, "height": 1080, "r_frame_rate": "30/1", "sample_aspect_ratio": "1:1",
+        "side_data_list": [{"rotation": 90}], "tags": {},
+    }]}
+    monkeypatch.setattr(reframe, "run_command", lambda *_args, **_kwargs: SimpleNamespace(stdout=json.dumps(payload)))
+    assert reframe._get_video_info(tmp_path / "rotated.mp4") == (1080, 1920, 30.0, 1.0)
 
 
 @pytest.mark.parametrize(

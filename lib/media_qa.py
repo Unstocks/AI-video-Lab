@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional, Sequence
 
-from PIL import Image, ImageStat
+from PIL import Image, ImageChops, ImageStat
 
 from lib.media_profiles import get_profile
 from lib.models.clip_plan import ClipSelectionPlan
@@ -25,6 +25,7 @@ from schemas.artifacts import validate_artifact
 
 Runtime = Literal["ffmpeg", "remotion", "hyperframes"]
 QAStatus = Literal["pass", "revise", "fail"]
+CheckStatus = Literal["PASS", "FAIL", "WARNING", "NOT_CHECKED", "INDETERMINATE"]
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,8 @@ class MediaQAConfig:
     max_av_sync_drift_seconds: float = 0.25
     sample_frame_count: int = 4
     require_subtitles: bool = False
+    freeze_diff_threshold: float = 1.0
+    min_speech_lufs_std: float = 0.5
 
     def __post_init__(self) -> None:
         get_profile(self.profile_name)
@@ -47,6 +50,7 @@ class MediaQAConfig:
         for name in (
             "min_audible_lufs", "max_peak_clipping_lufs", "black_frame_luma_threshold",
             "duration_tolerance_seconds", "max_av_sync_drift_seconds",
+            "freeze_diff_threshold", "min_speech_lufs_std",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -55,6 +59,8 @@ class MediaQAConfig:
             raise ValueError("black_frame_luma_threshold must be within [0, 255]")
         if self.duration_tolerance_seconds < 0 or self.max_av_sync_drift_seconds < 0:
             raise ValueError("duration and AV sync tolerances must be non-negative")
+        if self.freeze_diff_threshold < 0 or self.min_speech_lufs_std < 0:
+            raise ValueError("freeze and speech modulation thresholds must be non-negative")
         if isinstance(self.sample_frame_count, bool) or not isinstance(self.sample_frame_count, int) or self.sample_frame_count < 4:
             raise ValueError("sample_frame_count must be an integer >= 4")
 
@@ -72,6 +78,8 @@ class ClipQAReport:
     promise_preservation: dict[str, Any]
     issues: tuple[str, ...]
     recommended_action: str
+    video_sha256: str
+    check_statuses: dict[str, CheckStatus]
     final_review_artifact: dict[str, Any]
 
 
@@ -122,18 +130,24 @@ class MediaQAInspector:
                 frames.append(frame)
         return frames
 
-    def _audio_active(self, path: Path, threshold: float, clipping_threshold: float) -> tuple[bool, bool, list[str]]:
+    def _audio_active(self, path: Path, threshold: float, clipping_threshold: float) -> tuple[bool, bool, Optional[float], bool, list[str]]:
         result = self._run([
-            self.ffmpeg, "-hide_banner", "-nostats", "-i", str(path), "-vn", "-af", "ebur128=framelog=verbose",
+            self.ffmpeg, "-hide_banner", "-loglevel", "verbose", "-nostats", "-i", str(path), "-vn",
+            "-af", "ebur128=framelog=verbose:peak=true",
             "-f", "null", "-",
         ], timeout=60)
         log = result.stderr or ""
         values = []
         for line in log.splitlines():
-            match = re.search(r"\bM:\s*(-?\d+(?:\.\d+)?)\s*LUFS", line)
+            match = re.search(r"\bM:\s*(-?\d+(?:\.\d+)?)", line)
             if match:
                 value = float(match.group(1))
-                if math.isfinite(value) and value > -119.9:
+                timestamp = re.search(r"\bt:\s*(\d+(?:\.\d+)?)", line)
+                # Ignore the filter's startup window, where its 400 ms
+                # integration window is still filling and creates a false
+                # loudness swing on otherwise constant tones.
+                after_startup = timestamp is not None and float(timestamp.group(1)) >= 0.4
+                if math.isfinite(value) and value > -119.9 and after_startup:
                     values.append(value)
         if not values:
             for line in log.splitlines():
@@ -143,7 +157,7 @@ class MediaQAInspector:
                     if math.isfinite(value) and value > -119.9:
                         values.append(value)
         if result.returncode != 0:
-            return False, False, ["unable to measure audio loudness"]
+            return False, False, None, False, ["unable to measure audio loudness"]
         peak_values = []
         for line in log.splitlines():
             match = re.search(r"\bPeak:\s*(-?\d+(?:\.\d+)?)\s*(?:LUFS|dBFS)", line)
@@ -151,7 +165,39 @@ class MediaQAInspector:
                 value = float(match.group(1))
                 if math.isfinite(value) and value > -119.9:
                     peak_values.append(value)
-        return any(value >= threshold for value in values), any(value >= clipping_threshold for value in peak_values), []
+        spread = None
+        if len(values) >= 2:
+            mean = sum(values) / len(values)
+            spread = math.sqrt(sum((value - mean) ** 2 for value in values) / len(values))
+        elif values:
+            spread = 0.0
+        return (any(value >= threshold for value in values),
+                any(value >= clipping_threshold for value in peak_values), spread,
+                bool(peak_values), [])
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        if not path.is_file():
+            return ""
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(64 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _verified_silence(self, path: Path, duration: float) -> bool:
+        """Return true only when FFmpeg detects near-total silence for the clip."""
+        if duration <= 0:
+            return False
+        result = self._run([
+            self.ffmpeg, "-hide_banner", "-nostats", "-i", str(path), "-vn",
+            "-af", "silencedetect=noise=-60dB:d=0.25", "-f", "null", "-",
+        ], timeout=60)
+        if result.returncode != 0:
+            return False
+        starts = [float(value) for value in re.findall(r"silence_start:\s*(-?\d+(?:\.\d+)?)", result.stderr or "")]
+        ends = [float(value) for value in re.findall(r"silence_end:\s*(-?\d+(?:\.\d+)?)", result.stderr or "")]
+        return bool(starts and starts[0] <= 0.05 and ends and ends[-1] >= duration - 0.10)
 
     @staticmethod
     def _subtitle_cues(path: Path) -> list[tuple[float, float]]:
@@ -192,6 +238,12 @@ class MediaQAInspector:
         resolution = ""
         codec = ""
         valid_container = False
+        pixel_format_ok = False
+        resolution_ok = False
+        codec_ok = False
+        duration_valid = False
+        av_sync_checked = False
+        av_sync_ok = False
         if not path.is_file() or path.stat().st_size <= 0:
             tech_issues.append("video file is missing or empty")
         else:
@@ -226,11 +278,16 @@ class MediaQAInspector:
                     if not math.isfinite(duration) or duration <= 0:
                         tech_issues.append("video duration is unknown or invalid")
                         duration = 0.0
-                    if (width, height) != (profile.width, profile.height):
+                    else:
+                        duration_valid = True
+                    resolution_ok = (width, height) == (profile.width, profile.height)
+                    if not resolution_ok:
                         tech_issues.append(f"resolution {resolution} does not match {profile.width}x{profile.height}")
-                    if stream_video.get("pix_fmt") != "yuv420p":
+                    pixel_format_ok = stream_video.get("pix_fmt") == "yuv420p"
+                    if not pixel_format_ok:
                         tech_issues.append("pixel format is not yuv420p")
-                    if codec != "h264":
+                    codec_ok = codec == "h264"
+                    if not codec_ok:
                         tech_issues.append(f"video codec is {codec or 'unknown'}, expected h264")
                     if not math.isfinite(fps) or fps <= 0:
                         tech_issues.append("video frame rate is unknown or invalid")
@@ -245,8 +302,11 @@ class MediaQAInspector:
                     try:
                         vd = float(stream_video.get("duration", duration))
                         ad = float(stream_audio.get("duration", fmt.get("duration", duration)))
-                        if math.isfinite(vd) and math.isfinite(ad) and abs(vd - ad) > config.max_av_sync_drift_seconds:
-                            tech_issues.append("audio/video stream duration drift exceeds tolerance")
+                        if math.isfinite(vd) and math.isfinite(ad):
+                            av_sync_checked = True
+                            av_sync_ok = abs(vd - ad) <= config.max_av_sync_drift_seconds
+                            if not av_sync_ok:
+                                tech_issues.append("audio/video stream duration drift exceeds tolerance")
                     except (TypeError, ValueError):
                         tech_issues.append("unable to determine audio/video stream duration drift")
             except Exception as exc:
@@ -262,14 +322,24 @@ class MediaQAInspector:
                 except Exception as exc:
                     visual_issues.append(f"frame extraction failed: {exc}")
             frame_lumas: list[float] = []
+            frame_diffs: list[float] = []
+            previous_gray = None
             for frame in frames:
                 try:
                     with Image.open(frame) as image:
                         gray = image.convert("L")
                         frame_lumas.append(float(ImageStat.Stat(gray).mean[0]))
+                        if previous_gray is not None:
+                            difference = ImageChops.difference(previous_gray, gray)
+                            frame_diffs.append(float(ImageStat.Stat(difference).mean[0]))
+                            difference.close()
+                            previous_gray.close()
+                        previous_gray = gray.copy()
                         gray.close()
                 except Exception as exc:
                     visual_issues.append(f"unable to read sampled frame: {exc}")
+            if previous_gray is not None:
+                previous_gray.close()
             if len(frame_lumas) >= 4:
                 black = bool(frame_lumas and (frame_lumas[0] < config.black_frame_luma_threshold or
                                                sum(x < config.black_frame_luma_threshold for x in frame_lumas) > len(frame_lumas) / 2))
@@ -278,10 +348,11 @@ class MediaQAInspector:
             else:
                 black = False
                 visual_issues.append("unable to sample four frames: video unreadable")
-            visual: dict[str, Any] = {
-                "black_frames_detected": black, "broken_overlays": False, "missing_assets": False,
-                "unreadable_text": False, "issues": visual_issues,
-            }
+            freeze = bool(duration >= 2.0 and len(frame_diffs) >= 3 and
+                          all(value < config.freeze_diff_threshold for value in frame_diffs))
+            if freeze:
+                visual_issues.append("frozen/static video frames detected")
+            visual: dict[str, Any] = {"black_frames_detected": black, "issues": visual_issues}
             if len(frame_lumas) >= 4:
                 visual["frames_sampled"] = len(frame_lumas)
             if frames_output_dir is not None:
@@ -291,28 +362,42 @@ class MediaQAInspector:
                 frame_dir_ctx.cleanup()
 
         has_audio = stream_audio is not None
-        narration_present = False
+        audio_audible: Optional[bool] = None
+        narration_present: Optional[bool] = None
         clipping_detected = False
+        speech_modulation: Optional[str] = None
+        audio_profile_checked = False
+        peak_checked = False
+        verified_silence = bool(config.require_audio and not has_audio)
         if not has_audio:
             if config.require_audio:
                 audio_issues.append("missing audio stream")
         elif path.is_file():
-            narration_present, clipping_detected, audio_measure_issues = self._audio_active(
+            audio_audible, clipping_detected, loudness_std, peak_checked, audio_measure_issues = self._audio_active(
                 path, config.min_audible_lufs, config.max_peak_clipping_lufs,
             )
             audio_issues.extend(audio_measure_issues)
-            if not narration_present:
+            audio_profile_checked = not audio_measure_issues
+            if audio_profile_checked and audio_audible is False:
+                verified_silence = self._verified_silence(path, duration)
+            if audio_audible and loudness_std is not None and loudness_std < config.min_speech_lufs_std:
+                narration_present = None
+                speech_modulation = "INDETERMINATE"
+                audio_issues.append("flat audio loudness profile; speech presence not verified")
+            elif audio_audible:
+                narration_present = True
+                speech_modulation = "PASS"
+            elif audio_profile_checked and audio_audible is False:
+                narration_present = False
+                speech_modulation = "FAIL"
+            if audio_audible is False:
                 audio_issues.append("audio stream is silent or below audible threshold")
             if clipping_detected:
                 audio_issues.append("audio peak reaches the clipping threshold")
-        audio = {
-            "narration_present": narration_present,
-            "music_present": False,
-            "unexpected_silence": bool(config.require_audio and not narration_present),
-            "clipping_detected": clipping_detected,
-            "mix_intelligible": bool(narration_present),
-            "issues": audio_issues,
-        }
+        audio = {"unexpected_silence": verified_silence,
+                 "clipping_detected": clipping_detected, "issues": audio_issues}
+        if narration_present is not None:
+            audio["narration_present"] = narration_present
 
         subtitle_file = Path(subtitle_path).expanduser() if subtitle_path else None
         subtitles_present = False
@@ -361,6 +446,51 @@ class MediaQAInspector:
             "silent_downgrade_detected": False,
             "issues": promise_issues,
         }
+        video_sha256 = self._sha256(path)
+        check_statuses: dict[str, CheckStatus] = {
+            "technical_container": "PASS" if valid_container else "FAIL",
+            "video_codec": "PASS" if codec_ok else "FAIL",
+            "resolution": "PASS" if resolution_ok else "FAIL",
+            "pixel_format": "PASS" if pixel_format_ok else "FAIL",
+            "duration_match": ("NOT_CHECKED" if expected_duration_seconds is None else
+                               "PASS" if duration_valid and not any("render duration" in issue for issue in tech_issues) else "FAIL"),
+            "av_sync": "PASS" if av_sync_checked and av_sync_ok else "FAIL" if av_sync_checked else "NOT_CHECKED",
+            "frame_sampling": "PASS" if len(frame_lumas) >= 4 else "INDETERMINATE",
+            "black_frame_check": "PASS" if len(frame_lumas) >= 4 and not black else "FAIL" if black else "INDETERMINATE",
+            "freeze_frame_check": ("INDETERMINATE" if len(frame_lumas) < 4 else
+                                   "FAIL" if freeze else "PASS"),
+            "audio_presence": "PASS" if has_audio else "FAIL",
+            "audio_audible": ("INDETERMINATE" if not audio_profile_checked or audio_audible is None else
+                              "PASS" if audio_audible else "FAIL"),
+            "audio_clipping": ("INDETERMINATE" if not peak_checked else
+                               "FAIL" if clipping_detected else "PASS"),
+            "runtime_preservation": "NOT_CHECKED" if not locked_runtime else "FAIL" if runtime_swap else "PASS",
+            "broken_overlays": "NOT_CHECKED", "missing_assets": "NOT_CHECKED",
+            "unreadable_text": "NOT_CHECKED", "music_present": "NOT_CHECKED",
+            "mix_intelligible": "NOT_CHECKED",
+        }
+        if subtitle["subtitles_expected"]:
+            check_statuses["subtitle_timing"] = "FAIL" if timing_drift or not subtitles_present else "PASS"
+        mandatory = {
+            "technical_container", "video_codec", "resolution", "pixel_format", "duration_match",
+            "av_sync", "frame_sampling", "black_frame_check", "freeze_frame_check", "audio_presence",
+            "audio_audible", "audio_clipping", "runtime_preservation",
+        }
+        if subtitle["subtitles_expected"]:
+            mandatory.add("subtitle_timing")
+        check_statuses["aggregate_mandatory_checks"] = (
+            "PASS" if all(check_statuses.get(name) == "PASS" for name in mandatory) else "FAIL"
+        )
+        if speech_modulation:
+            audio["speech_modulation"] = speech_modulation
+        mandatory_failed = check_statuses["aggregate_mandatory_checks"] != "PASS"
+        # The following checks require human or dedicated vision/audio models.
+        # Their absence is visible in check_statuses and never presented as success.
+        critical = bool(mandatory_failed or tech_issues or visual_issues or black or runtime_swap)
+        if audio_issues and check_statuses["audio_audible"] == "FAIL":
+            critical = True
+        if subtitle_issues and subtitle["subtitles_expected"]:
+            critical = True
         technical = {
             "valid_container": valid_container,
             "duration_seconds": duration,
@@ -373,12 +503,23 @@ class MediaQAInspector:
         }
         for group in (tech_issues, visual_issues, audio_issues, subtitle_issues, promise_issues):
             issues.extend(group)
-        critical = bool(tech_issues or visual_issues or black or audio_issues or (config.require_subtitles and subtitle_issues) or timing_drift or runtime_swap)
+        single_metadata = {
+            "passed_clip_ids": [candidate_id] if not critical else [],
+            "failed_clip_ids": [candidate_id] if critical else [],
+            "unchecked_checks": sorted(name for name, value in check_statuses.items() if value == "NOT_CHECKED"),
+            "clip_reports": {candidate_id: {
+                "video_path": str(path), "video_sha256": video_sha256, "file_size_bytes": size,
+                "status": "fail" if critical else "pass",
+                "production_state": "QA_FAILED" if critical else "QA_PASSED",
+                "check_statuses": check_statuses, "issues": list(issues),
+            }},
+        }
         status: QAStatus = "fail" if critical else "pass"
         action = "block" if runtime_swap else "re_render" if critical else "present_to_user"
         final = self._final_review(
             output_path=str(path), status=status, technical=technical, visual=visual,
             audio=audio, promise=promise, subtitle=subtitle, issues=issues, recommended_action=action,
+            metadata=single_metadata,
         )
         validate_artifact("final_review", final)
         return ClipQAReport(
@@ -386,7 +527,7 @@ class MediaQAInspector:
             production_state="QA_FAILED" if critical else "QA_PASSED", technical_probe=technical,
             visual_spotcheck=visual, audio_spotcheck=audio, subtitle_check=subtitle,
             promise_preservation=promise, issues=tuple(issues), recommended_action=action,
-            final_review_artifact=final,
+            video_sha256=video_sha256, check_statuses=check_statuses, final_review_artifact=final,
         )
 
     @staticmethod
@@ -435,7 +576,7 @@ class MediaQAInspector:
             reports.append(self.inspect_clip(
                 candidate_id=candidate_id, video_path=media_path,
                 expected_duration_seconds=data.get("duration_seconds"), subtitle_path=data.get("subtitle_path"),
-                frames_output_dir=frame_output, config=config,
+                frames_output_dir=frame_output, config=config, locked_runtime=data.get("locked_runtime"),
             ))
         passed = tuple(r.candidate_id for r in reports if r.production_state == "QA_PASSED")
         failed = tuple(r.candidate_id for r in reports if r.production_state == "QA_FAILED")
@@ -449,21 +590,23 @@ class MediaQAInspector:
         issues = [f"{r.candidate_id}: {issue}" for r in reports for issue in r.issues]
         plan_sha = None
         if plan is not None:
-            if isinstance(plan, dict):
-                plan_dict = plan
-            elif hasattr(plan, "model_dump"):
-                plan_dict = plan.model_dump(mode="json")
-            else:
-                plan_dict = plan.to_dict()
-            plan_sha = hashlib.sha256(json.dumps(plan_dict, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            normalized_plan = plan if isinstance(plan, ClipSelectionPlan) else ClipSelectionPlan.model_validate(plan)
+            plan_sha = normalized_plan.compute_plan_sha256()
+        clip_reports = {
+            r.candidate_id: {
+                "video_path": r.video_path, "video_sha256": r.video_sha256,
+                "file_size_bytes": r.technical_probe.get("file_size_bytes", 0),
+                "status": r.status, "production_state": r.production_state,
+                "check_statuses": r.check_statuses, "issues": list(r.issues),
+            }
+            for r in reports
+        }
         metadata = {
             "batch_summary": {"project_id": project_id, "passed_count": len(passed), "failed_count": len(failed)},
-            "clip_reports": [{
-                "candidate_id": r.candidate_id, "video_path": r.video_path, "status": r.status,
-                "production_state": r.production_state, "issues": list(r.issues),
-                "checks": r.final_review_artifact["checks"],
-            } for r in reports],
+            "clip_reports": clip_reports,
             "passed_clip_ids": list(passed), "failed_clip_ids": list(failed),
+            "unchecked_checks": sorted({name for report in reports for name, value in report.check_statuses.items()
+                                         if value == "NOT_CHECKED"}),
         }
         if plan_sha:
             metadata["plan_sha256"] = plan_sha

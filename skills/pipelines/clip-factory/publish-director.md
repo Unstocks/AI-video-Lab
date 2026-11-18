@@ -39,7 +39,7 @@ Use `export_bundle` batch mode with `clips=[...]` to group by platform and inclu
 
 ### 4. Enforce The Automated QA Gate
 
-Read `final_review.json` before packaging. A clip listed in `metadata.failed_clip_ids` or marked `qa_passed: false` must never be copied into the export folder. Record it as `status: "failed"` with the QA reason in `publish_log.json`; continue exporting other QA-passed clips. If no clips pass QA, stop and surface that result.
+Read the schema-valid `final_review.json` before packaging. Pass `final_review`, the approved `clip_selection_plan`, the synchronized approved `script`, and `plan_sha256` to `export_bundle`. Only clips explicitly listed in `metadata.passed_clip_ids` with a passing per-clip report whose SHA-256 matches the current file may export. A failed, missing, stale, or unapproved clip must remain excluded with its reason recorded in `publish_log.json`. If no clips pass QA, stop and surface that result.
 
 ### 5. Preserve Batch Truth
 

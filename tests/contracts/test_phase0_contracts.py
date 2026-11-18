@@ -455,12 +455,45 @@ class TestToolRegistry:
         assert len(reg.get_by_tier(ToolTier.CORE)) == 1
         assert len(reg.find_by_capability("test")) == 1
 
-    def test_support_envelope(self):
+    def test_support_envelope(self, monkeypatch):
         reg = ToolRegistry()
         reg.register(DummyTool())
         envelope = reg.support_envelope()
         assert "dummy" in envelope
         assert envelope["dummy"]["status"] == "available"
+
+        # HyperFrames preflight is part of the registry support envelope, so
+        # assert that its cache-miss path is offline and bounded as well.
+        import subprocess
+        import time
+
+        import tools.video.hyperframes_compose as hf_module
+        from tools.video.hyperframes_compose import HyperFramesCompose
+
+        calls = []
+
+        def local_probe(command, **kwargs):
+            calls.append(list(command))
+            if command[0] == "node":
+                return subprocess.CompletedProcess(command, 0, stdout="v24.22.1", stderr="")
+            assert "--offline" in command, "support discovery must never fetch npm packages"
+            assert kwargs.get("timeout", 0) <= 2
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="ENOTCACHED")
+
+        monkeypatch.setattr(hf_module.shutil, "which", lambda name: name)
+        monkeypatch.setattr(hf_module.subprocess, "run", local_probe)
+        registry = ToolRegistry()
+        registry._discovered_packages.add("tools")
+        registry.register(HyperFramesCompose())
+        start = time.perf_counter()
+        envelope = registry.support_envelope()
+        elapsed = time.perf_counter() - start
+
+        runtime = envelope["hyperframes_compose"]["hyperframes_runtime"]
+        assert runtime["runtime_available"] is False
+        assert any("not cached locally" in reason for reason in runtime["reasons"])
+        assert calls and all("--offline" in call for call in calls if call[0] != "node")
+        assert elapsed < 5
 
     def test_discovers_concrete_tools_from_package(self, tmp_path, monkeypatch):
         package_dir = tmp_path / "demo_tools"

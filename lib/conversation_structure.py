@@ -71,6 +71,18 @@ class ConversationTopology:
         return min(overlaps, key=lambda item: (-item[0], item[1]))[2] if overlaps else None
 
 
+@dataclass(frozen=True)
+class CandidateWindowSeed:
+    seed_id: str
+    start_seconds: float
+    end_seconds: float
+    source_kind: str
+    evidence_turn_ids: tuple[int, ...]
+    transcript_revision_id: str
+
+
+
+
 _QUESTION_START = re.compile(
     r"^(?:(?:what|why|how|when|who|where|which|do you|did you|can you|could you|is it|are you|kya|kyun|kaise|kab|kaun|kahan)(?:$|\s|[?!])|"
     r"(?:क्या|क्यों|कैसे|कब|कौन|कहाँ|कहां)(?:$|\s|[?!।॥]))",
@@ -151,3 +163,57 @@ class ConversationStructureAnalyzer:
         speakers = tuple(dict.fromkeys(t.speaker for t in turns if t.speaker))
         duration = max((s.end_seconds for s in sentences), default=0.0)
         return ConversationTopology(transcript.raw_document.transcript_revision_id or "", tuple(turns), tuple(qa), tuple(blocks), duration, speakers, bool(speakers))
+
+    def propose_candidate_windows(
+        self, normalized: NormalizedTranscriptResult, topology: ConversationTopology,
+        acoustic_profile=None, *, min_duration_seconds: float = 15.0, max_duration_seconds: float = 90.0,
+    ) -> tuple[CandidateWindowSeed, ...]:
+        """Propose deterministic, evidence-backed Q&A and monologue windows."""
+        for value, name in ((min_duration_seconds, "min_duration_seconds"), (max_duration_seconds, "max_duration_seconds")):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if max_duration_seconds < min_duration_seconds:
+            raise ValueError("max_duration_seconds must be >= min_duration_seconds")
+        turn_by_id = {turn.turn_id: turn for turn in topology.turns}
+        proposals: list[tuple[float, float, str, tuple[int, ...]]] = []
+        for pair in topology.qa_pairs:
+            turn_ids = (pair.question_turn_id, *pair.answer_turn_ids)
+            proposals.append((pair.start_seconds, pair.end_seconds, "qa_pair", turn_ids))
+        for block in topology.blocks:
+            if block.qa_pairs:
+                continue
+            proposals.append((block.start_seconds, block.end_seconds, "monologue_arc", block.turn_ids))
+        boundaries = sorted({point for sentence in normalized.sentences
+                             for point in (sentence.start_seconds, sentence.end_seconds)})
+        silences = getattr(acoustic_profile, "silences", ()) if acoustic_profile is not None else ()
+
+        def snap(value: float) -> float:
+            nearby_sentences = [point for point in boundaries if abs(point - value) <= 1.5]
+            if nearby_sentences:
+                value = min(nearby_sentences, key=lambda point: (abs(point - value), point))
+            if silences:
+                nearby = []
+                for silence in silences:
+                    for point in (silence.start_seconds, silence.end_seconds):
+                        if abs(point - value) <= 1.0:
+                            nearby.append((abs(point - value), point))
+                if nearby:
+                    value = min(nearby)[1]
+            return max(0.0, float(value))
+
+        seeds = []
+        seen = set()
+        for start, end, kind, turn_ids in proposals:
+            start, end = snap(start), snap(end)
+            if end - start < min_duration_seconds or end - start > max_duration_seconds:
+                continue
+            key = (round(start, 3), round(end, 3), kind)
+            if key in seen:
+                continue
+            seen.add(key)
+            seeds.append(CandidateWindowSeed(
+                seed_id=f"window-{len(seeds) + 1:03d}", start_seconds=start, end_seconds=end,
+                source_kind=kind, evidence_turn_ids=tuple(turn_ids),
+                transcript_revision_id=topology.transcript_revision_id,
+            ))
+        return tuple(seeds)

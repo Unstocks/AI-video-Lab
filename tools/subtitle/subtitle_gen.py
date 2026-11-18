@@ -7,6 +7,8 @@ import math
 from html import escape
 import time
 import copy
+import os
+import re
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -147,6 +149,7 @@ class SubtitleGen(BaseTool):
             "play_res_x": {"type": "integer", "default": 1080},
             "play_res_y": {"type": "integer", "default": 1920},
             "font_name": {"type": "string", "default": "Noto Sans Devanagari"},
+            "fonts_dir": {"type": "string"},
             "font_size": {"type": "integer", "default": 64},
             "margin_v": {"type": "integer", "default": 320},
             "margin_l": {"type": "integer", "default": 80},
@@ -223,6 +226,29 @@ class SubtitleGen(BaseTool):
 
         # Build cues from word-level timestamps
         cues = self._build_cues(segments, max_words, max_chars)
+        font_name = inputs.get("font_name", preset.font_name if preset else "Noto Sans Devanagari")
+        font_size = inputs.get("font_size", preset.font_size if preset else 64)
+        margin_l = inputs.get("margin_l", preset.margin_l if preset else 80)
+        margin_r = inputs.get("margin_r", preset.margin_r if preset else 120)
+        play_res_x = inputs.get("play_res_x", 1080)
+        longest = max((len(line) for cue in cues for line in str(cue.get("text", "")).splitlines()), default=0)
+        if longest * font_size * 0.58 > play_res_x - margin_l - margin_r:
+            warnings.append("estimated subtitle line width exceeds the available play width; inspect for overflow")
+        if fmt == "ass":
+            font_dirs = []
+            if inputs.get("fonts_dir"):
+                font_dirs.append(Path(inputs["fonts_dir"]).expanduser())
+            if os.name == "nt":
+                font_dirs.extend([Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"])
+            else:
+                font_dirs.extend([Path("/usr/share/fonts"), Path("/usr/local/share/fonts"), Path.home() / ".fonts"])
+            inspectable = [directory for directory in font_dirs if directory.is_dir()]
+            normalized_family = re.sub(r"[^a-z0-9]", "", font_name.casefold())
+            found = any(normalized_family in re.sub(r"[^a-z0-9]", "", font_file.stem.casefold())
+                        for directory in inspectable for font_file in directory.rglob("*")
+                        if font_file.suffix.casefold() in {".ttf", ".otf", ".ttc"})
+            if inspectable and not found:
+                warnings.append(f"font '{font_name}' was not found in configured or inspectable system font directories")
 
         if fmt == "srt":
             content = self._render_srt(cues, effective_highlight_style)
@@ -237,8 +263,8 @@ class SubtitleGen(BaseTool):
             content = self._render_ass(
                 cues, effective_highlight_style,
                 play_res_x=inputs.get("play_res_x", 1080), play_res_y=inputs.get("play_res_y", 1920),
-                font_name=inputs.get("font_name", preset.font_name if preset else "Noto Sans Devanagari"),
-                font_size=inputs.get("font_size", preset.font_size if preset else 64),
+                font_name=font_name,
+                font_size=font_size,
                 margin_v=inputs.get("margin_v", preset.margin_v if preset else 320),
                 margin_l=inputs.get("margin_l", preset.margin_l if preset else 80),
                 margin_r=inputs.get("margin_r", preset.margin_r if preset else 120),

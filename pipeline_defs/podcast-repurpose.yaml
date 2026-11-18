@@ -70,15 +70,16 @@ stages:
     produces:
       - script
       - clip_selection_plan
-    required_tools:
-      - transcriber
     optional_tools:
+      - transcriber
       - audio_enhance
+      - transcript_fetcher
       - clip_selector
       - silence_cutter
       - audio_energy
     tools_available:
       - transcriber
+      - transcript_fetcher
       - audio_enhance
       - clip_selector
       - silence_cutter
@@ -184,11 +185,15 @@ stages:
     optional_tools:
       - video_trimmer
       - audio_enhance
+      - vertical_clip_composer
+      - media_qa
     tools_available:
       - video_compose
       - audio_mixer
       - video_trimmer
       - audio_enhance
+      - vertical_clip_composer
+      - media_qa
     checkpoint_required: true
     human_approval_default: false
     review_focus:
@@ -208,7 +213,8 @@ stages:
       - brief
     produces:
       - publish_log
-    tools_available: []
+    tools_available:
+      - export_bundle
     checkpoint_required: true
     human_approval_default: true
     review_focus:

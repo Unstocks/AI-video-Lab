@@ -69,8 +69,8 @@ def test_clip_factory_render_qa_export_and_backlot(tmp_path):
     source = tmp_path / "source.mp4"
     _run([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "lavfi", "-i", "color=c=0x3296c8:s=1920x1080:r=25:d=6",
-        "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+        "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=25:duration=6",
+        "-f", "lavfi", "-i", "aevalsrc=0.25*sin(2*PI*440*t)*(0.2+0.8*abs(sin(2*PI*0.7*t))):s=48000:d=6",
         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(source),
     ])
     transcript_text = [
@@ -116,7 +116,7 @@ def test_clip_factory_render_qa_export_and_backlot(tmp_path):
         "-i", "sine=frequency=440:duration=2", "-c:v", "libx264", "-preset", "ultrafast",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(black),
     ])
-    render_results = [*rendered.clips, {
+    render_results = [{**clip.__dict__, "locked_runtime": "ffmpeg"} for clip in rendered.clips] + [{
         "candidate_id": "bad-black", "video_path": str(black), "success": True,
         "duration_seconds": 2.0,
     }]
@@ -143,11 +143,14 @@ def test_clip_factory_render_qa_export_and_backlot(tmp_path):
     exported = ExportBundle().execute({
         "clips": clips, "final_review": qa.final_review, "export_dir": str(project_dir / "exports"),
         "project_name": project_id, "plan_sha256": rendered.plan_sha256,
+        "clip_selection_plan": plan.to_dict(), "script": script,
         "timestamp": "2026-11-17T12:30:00+00:00",
     })
     assert exported.success, exported.error
     assert exported.data["exported_count"] == 2
     assert exported.data["skipped_failed_clips"] == ["bad-black"]
+    assert exported.data["batch_status"] == "partial"
+    assert exported.data["failed_count"] == 1
     export_root = Path(exported.data["export_path"])
     assert len(list((export_root / "clips").glob("01_*/video.mp4"))) == 1
     assert len(list((export_root / "clips").glob("02_*/video.mp4"))) == 1
@@ -185,3 +188,17 @@ def test_clip_factory_render_qa_export_and_backlot(tmp_path):
     assert {"final_review", "publish_log", "clip_selection_plan", "script"}.issubset(board["artifacts"])
     publish_stage = next(stage for stage in board["stages"] if stage["name"] == "publish")
     assert publish_stage["gate_skipped"] is False
+
+    # Re-export without overwrite is non-destructive: colliding destinations
+    # are reported as failed, and the existing manifest/packages remain intact.
+    previous_manifest = (export_root / "manifest.json").read_bytes()
+    previous_video = (export_root / "clips" / "01_lesson-one" / "video.mp4").read_bytes()
+    repeated = ExportBundle().execute({
+        "clips": clips, "final_review": qa.final_review, "export_dir": str(export_root),
+        "project_name": project_id, "plan_sha256": rendered.plan_sha256,
+        "clip_selection_plan": plan.to_dict(), "script": script,
+    })
+    assert not repeated.success
+    assert repeated.data["batch_status"] == "failed"
+    assert (export_root / "manifest.json").read_bytes() == previous_manifest
+    assert (export_root / "clips" / "01_lesson-one" / "video.mp4").read_bytes() == previous_video

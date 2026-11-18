@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
 """QA Test 09: HyperFrames end-to-end — scaffold + lint + validate + render.
 
-This test hits the real HyperFrames CLI via `npx @hyperframes/cli`. On first
-run, npm fetches the package (slow — ~30-90s) and then Chrome downloads its
-browser for validation (~30s extra, cached thereafter). Skip unless
-HYPERFRAMES_QA=1 is set so CI doesn't pay the cost on every run.
-
-The test is still valuable even without `--render`:
-  - scaffold_workspace proves the workspace generator emits a contract-valid
-    composition.
-  - lint exercises the static contract checker.
-  - validate exercises the browser-based contract + contrast audit.
-
-Full render (operation='render') is optional and gated on HYPERFRAMES_QA_RENDER=1.
+Scaffold contract validation runs offline on every test run. The real
+HyperFrames CLI may fetch npm packages and a browser on a cold cache, so lint
+and browser validation are opt-in with HYPERFRAMES_QA=1. Full render is further
+gated on HYPERFRAMES_QA_RENDER=1.
 """
 
 from __future__ import annotations
@@ -37,7 +29,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 
 _SKIP_REASON = (
-    "HyperFrames QA is opt-in. Set HYPERFRAMES_QA=1 to run scaffold+lint+validate, "
+    "HyperFrames CLI QA is opt-in. Set HYPERFRAMES_QA=1 to run lint+validate, "
     "and HYPERFRAMES_QA_RENDER=1 to additionally run the real render."
 )
 
@@ -103,16 +95,10 @@ def _minimal_scenario(workspace: Path, asset: Path) -> dict:
     }
 
 
-@pytest.mark.skipif(not os.environ.get("HYPERFRAMES_QA"), reason=_SKIP_REASON)
-def test_hyperframes_scaffold_lint_validate(tmp_path: Path):
-    if not _runtime_ready():
-        pytest.skip("HyperFrames runtime floor not met (node>=22 + ffmpeg + npx).")
-
+def _scaffold_fixture_workspace(tmp_path: Path) -> Path:
     asset = _make_fixture_asset(tmp_path / "assets_src")
     workspace = tmp_path / "hyperframes"
     inputs = _minimal_scenario(workspace, asset)
-
-    # 1. Scaffold
     scaffold = HyperFramesCompose().execute(
         {**inputs, "operation": "scaffold_workspace"}
     )
@@ -120,8 +106,22 @@ def test_hyperframes_scaffold_lint_validate(tmp_path: Path):
     assert (workspace / "index.html").is_file()
     assert (workspace / "assets" / "hero.png").is_file()
     assert (workspace / "hyperframes.json").is_file()
+    return workspace
 
-    # 2. Lint — the CLI fetch happens here on cold cache. Allow plenty of time.
+
+def test_hyperframes_scaffold_contract_offline(tmp_path: Path):
+    """Workspace generation is deterministic and does not need the CLI runtime."""
+    _scaffold_fixture_workspace(tmp_path)
+
+
+@pytest.mark.skipif(not os.environ.get("HYPERFRAMES_QA"), reason=_SKIP_REASON)
+def test_hyperframes_lint_validate(tmp_path: Path):
+    if not _runtime_ready():
+        pytest.skip("HyperFrames runtime floor not met (node>=22 + ffmpeg + npx).")
+
+    workspace = _scaffold_fixture_workspace(tmp_path)
+
+    # Lint can fetch the CLI on a cold cache, so it remains explicitly opt-in.
     lint = HyperFramesCompose().execute(
         {"operation": "lint", "workspace_path": str(workspace)}
     )
@@ -133,7 +133,7 @@ def test_hyperframes_scaffold_lint_validate(tmp_path: Path):
         f"Stderr tail: {lint.data.get('stderr_tail')}"
     )
 
-    # 3. Validate — browser-based. Skip contrast since our placeholder colors
+    # Validate is browser-based. Skip contrast since our placeholder colors
     # aren't tuned for WCAG.
     validate = HyperFramesCompose().execute(
         {

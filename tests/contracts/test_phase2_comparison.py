@@ -16,11 +16,6 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-FOOTAGE = Path(
-    r"C:\Users\ishan\Documents\SocialMedia\IshanAIVideos\pipeline\2026-03-08\seg1_intro.mp4"
-)
-
-
 def _has_ffmpeg() -> bool:
     import shutil
     return shutil.which("ffmpeg") is not None
@@ -42,8 +37,6 @@ def _get_file_size_mb(path: str) -> float:
 @pytest.fixture(scope="module")
 def comparison_outputs(tmp_path_factory):
     """Run compose handler twice: baseline and enhanced."""
-    if not FOOTAGE.exists():
-        pytest.skip("Test footage not available")
     if not _has_ffmpeg():
         pytest.skip("FFmpeg not available")
 
@@ -53,6 +46,17 @@ def comparison_outputs(tmp_path_factory):
     from tools.audio.audio_enhance import AudioEnhance
 
     tmp = tmp_path_factory.mktemp("comparison")
+    footage = tmp / "synthetic_talking_head.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i",
+            "testsrc2=size=640x360:rate=24:duration=3",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-shortest", str(footage),
+        ],
+        capture_output=True, text=True, check=True, timeout=60,
+    )
     results = {}
 
     # Phase 1 baseline: just encode
@@ -60,7 +64,7 @@ def comparison_outputs(tmp_path_factory):
     baseline_path = str(tmp / "phase1_baseline.mp4")
     r = composer.execute({
         "operation": "encode",
-        "input_path": str(FOOTAGE),
+        "input_path": str(footage),
         "output_path": baseline_path,
         "codec": "libx264",
         "crf": 20,
@@ -69,7 +73,7 @@ def comparison_outputs(tmp_path_factory):
     results["baseline"] = baseline_path
 
     # Phase 2 enhanced: face -> color -> audio
-    current = str(FOOTAGE)
+    current = str(footage)
     enhancements = []
 
     face = FaceEnhance()

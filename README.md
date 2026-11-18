@@ -2,7 +2,7 @@
 ### Powered by OpenMontage | Local-First Architecture
 
 [![Tests](https://img.shields.io/badge/tests-22%20passed-brightgreen.svg)]()
-[![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)]()
+[![Python 3.11–3.14 core](https://img.shields.io/badge/python-3.11--3.14-blue.svg)]()
 [![License: AGPLv3](https://img.shields.io/badge/license-AGPLv3-blue.svg)](LICENSE)
 [![Architecture](https://img.shields.io/badge/architecture-local--first%20agentic-purple.svg)]()
 
@@ -130,9 +130,10 @@ AI-Video-Lab/
 ## 🚀 Quick Start
 
 ### 1. Prerequisites
-- **Python 3.12+**
-- **FFmpeg & FFprobe** installed and on `PATH`
-- **Node.js 18+** (for Remotion composer and Backlot UI)
+- **Core offline studio:** Python 3.11, 3.12, or 3.14 with FFmpeg/FFprobe 7.0 or later (libass and libx264 recommended). Python 3.14 supports the core offline FFmpeg workflows; optional ML wheels may not be available.
+- **Optional local ML/GPU:** use a dedicated Python 3.11 or 3.12 environment for faster-whisper, WhisperX, and MediaPipe integrations.
+- **Optional Remotion/HyperFrames:** Node.js 22 or 24 LTS. HyperFrames preflight checks the local npm cache and does not fetch packages while checking support. Install project packages separately when network access is available.
+- **Optional NVIDIA encoding:** FFmpeg builds with `h264_nvenc` may accelerate encoding; composition falls back to `libx264` when NVENC cannot run.
 
 ### 2. Environment Setup
 ```bash

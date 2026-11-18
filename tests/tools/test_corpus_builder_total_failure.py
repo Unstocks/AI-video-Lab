@@ -27,6 +27,7 @@ class _Source:
 
 @pytest.fixture
 def run_builder(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENMONTAGE_CACHE_DIR", str(tmp_path / "shared-cache"))
     def run(count: int, processor, existing: tuple[str, ...] = ()):
         monkeypatch.setattr(stock_sources, "available_sources", lambda: [_Source(count)])
         monkeypatch.setattr(stock_sources, "source_summary", lambda: {})

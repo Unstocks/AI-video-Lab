@@ -1,0 +1,10 @@
+{
+  "episode_id": "gold-multilingual-hinglish",
+  "title": "Synthetic Hinglish interview",
+  "archetype": "multilingual_hinglish",
+  "languages": ["hi", "hinglish", "en"],
+  "transcript_format": "youtube",
+  "transcript": {"transcript": [{"text": "जब हमने users से बात की, तब समझ आया ki onboarding simple honi chahiye.", "start": 0, "duration": 29}]},
+  "gold_clips": [{"gold_id": "hinglish-gold", "start_seconds": 0, "end_seconds": 29, "archetype": "multilingual_hinglish", "expected_hook_substring": "users से बात की"}],
+  "trap_moments": [{"trap_id": "hinglish-trap", "start_seconds": 50, "end_seconds": 65, "trap_reason": "Duplicate paraphrase of the onboarding moment", "expected_failure_gate": "duplicate"}]
+}

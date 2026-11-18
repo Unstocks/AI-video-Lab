@@ -1,0 +1,10 @@
+{
+  "episode_id": "gold-guest-qa",
+  "title": "Synthetic guest Q&A",
+  "archetype": "guest_qa",
+  "languages": ["en"],
+  "transcript_format": "youtube",
+  "transcript": {"transcript": [{"text": "What changed after the launch? We listened to customers and removed the confusing setup step.", "start": 0, "duration": 32}]},
+  "gold_clips": [{"gold_id": "guest-gold", "start_seconds": 0, "end_seconds": 32, "archetype": "guest_qa", "expected_hook_substring": "We listened to customers"}],
+  "trap_moments": [{"trap_id": "guest-dangling-pronoun", "start_seconds": 45, "end_seconds": 60, "trap_reason": "Answer begins with an unresolved this", "expected_failure_gate": "incomplete_thought"}]
+}

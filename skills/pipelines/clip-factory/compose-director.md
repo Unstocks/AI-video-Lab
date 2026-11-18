@@ -18,10 +18,12 @@ This pipeline uses the approved Remotion or FFmpeg routes. For vertical clip pro
 |-------|----------|---------|
 | Schema | `schemas/artifacts/render_report.schema.json` | Artifact validation |
 | Prior artifacts | `state.artifacts["edit"]["edit_decisions"]`, `state.artifacts["assets"]["asset_manifest"]` | Clip edits and assets |
-| Tools | `video_trimmer`, `video_compose`, `audio_mixer`, `color_grade` | Render pipeline |
+| Tools | `vertical_clip_composer`, `media_qa`, `video_trimmer`, `video_compose`, `audio_mixer`, `color_grade` | Render pipeline and final review |
 | Media profiles | `lib/media_profiles.py` | Platform targets |
 
 Before rendering approved clip sections, require `verify_script_plan_sync(..., require_approved=True)` to pass. Prefer a valid `proxy_video_path` from `source_manifest.json` while preserving the master file. Generate clip-rebased subtitles with `subtitle_gen` and burn them via FFmpeg's `ass` or `subtitles` filter. Render each clip independently, probe its final dimensions/codec/duration, and continue after a per-clip failure.
+
+For clip-factory vertical batches, invoke `vertical_clip_composer` in `approved_batch` mode with the approved script and plan. Then invoke `media_qa` in `batch` mode with every render result, the locked runtime, and the plan. Persist its schema-valid `final_review` as `artifacts/final_review.json`. Never mark unchecked QA checks as passing.
 
 ## Process
 

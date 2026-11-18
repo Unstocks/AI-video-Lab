@@ -88,6 +88,7 @@ class VideoDownloader(BaseTool):
                 "default": 600,
                 "description": "Reject videos longer than this (safety limit)",
             },
+            "max_file_size_bytes": {"type": "integer", "minimum": 1, "default": 2147483648},
             "allowed_extractors": {"type": ["array", "null"], "items": {"type": "string"}, "default": None},
         },
     }
@@ -191,6 +192,9 @@ class VideoDownloader(BaseTool):
         dl_format = inputs.get("format", "video")
         max_res = inputs.get("max_resolution", "720p")
         max_duration = inputs.get("max_duration_seconds", 600)
+        max_file_size = inputs.get("max_file_size_bytes", 2 * 1024**3)
+        if isinstance(max_file_size, bool) or not isinstance(max_file_size, int) or max_file_size <= 0:
+            return ToolResult(success=False, error="max_file_size_bytes must be a positive integer")
 
         output_dir.mkdir(parents=True, exist_ok=True)
         platform = self._detect_platform(url)
@@ -199,6 +203,8 @@ class VideoDownloader(BaseTool):
         # Step 1: Always get metadata first
         allowed_extractors = inputs.get("allowed_extractors")
         metadata = self._extract_metadata(url, allowed_extractors)
+        if metadata.get("error"):
+            return ToolResult(success=False, error=str(metadata["error"]), data={"metadata": metadata, "platform": platform})
 
         # Check duration limit
         duration = metadata.get("duration", 0)
@@ -234,12 +240,12 @@ class VideoDownloader(BaseTool):
         try:
             if dl_format == "video":
                 video_path, audio_path = self._download_video(
-                    url, output_dir, max_res, allowed_extractors
+                    url, output_dir, max_res, allowed_extractors, max_file_size
                 )
             elif dl_format == "audio_only":
-                audio_path = self._download_audio(url, output_dir, allowed_extractors)
+                audio_path = self._download_audio(url, output_dir, allowed_extractors, max_file_size)
             elif dl_format == "subtitles_only":
-                subtitle_path = self._download_subtitles(url, output_dir, allowed_extractors)
+                subtitle_path = self._download_subtitles(url, output_dir, allowed_extractors, max_file_size)
         except Exception as e:
             elapsed = time.time() - start
             return ToolResult(
@@ -251,6 +257,12 @@ class VideoDownloader(BaseTool):
 
         elapsed = time.time() - start
         artifacts = [p for p in [video_path, audio_path, subtitle_path] if p]
+        oversized = [p for p in artifacts if Path(p).is_file() and Path(p).stat().st_size > max_file_size]
+        if oversized:
+            for path in oversized:
+                Path(path).unlink(missing_ok=True)
+            return ToolResult(success=False, error=f"Downloaded file exceeds max_file_size_bytes={max_file_size}",
+                              data={"metadata": metadata, "platform": platform}, duration_seconds=round(elapsed, 2))
 
         return ToolResult(
             success=True,
@@ -266,7 +278,8 @@ class VideoDownloader(BaseTool):
         )
 
     def _download_video(
-        self, url: str, output_dir: Path, max_res: str, allowed_extractors: list[str] | None = None
+        self, url: str, output_dir: Path, max_res: str, allowed_extractors: list[str] | None = None,
+        max_file_size_bytes: int = 2 * 1024**3,
     ) -> tuple[str | None, str | None]:
         """Download video + extract audio track."""
         import yt_dlp
@@ -279,6 +292,7 @@ class VideoDownloader(BaseTool):
             "merge_output_format": "mp4",
             "outtmpl": video_out,
             "noplaylist": True,
+            "max_filesize": max_file_size_bytes,
             "quiet": True,
             "no_warnings": True,
             "socket_timeout": 30,
@@ -316,7 +330,8 @@ class VideoDownloader(BaseTool):
 
         return video_path, audio_path
 
-    def _download_audio(self, url: str, output_dir: Path, allowed_extractors: list[str] | None = None) -> str | None:
+    def _download_audio(self, url: str, output_dir: Path, allowed_extractors: list[str] | None = None,
+                        max_file_size_bytes: int = 2 * 1024**3) -> str | None:
         """Download audio only."""
         import yt_dlp
 
@@ -330,6 +345,7 @@ class VideoDownloader(BaseTool):
             }],
             "outtmpl": audio_out,
             "noplaylist": True,
+            "max_filesize": max_file_size_bytes,
             "quiet": True,
             "no_warnings": True,
             "socket_timeout": 30,
@@ -343,7 +359,8 @@ class VideoDownloader(BaseTool):
             ydl.download([url])
         return self._find_downloaded(output_dir, "reference_audio", ["wav", "mp3", "m4a", "opus"])
 
-    def _download_subtitles(self, url: str, output_dir: Path, allowed_extractors: list[str] | None = None) -> str | None:
+    def _download_subtitles(self, url: str, output_dir: Path, allowed_extractors: list[str] | None = None,
+                            max_file_size_bytes: int = 2 * 1024**3) -> str | None:
         """Download subtitles only."""
         import yt_dlp
 
@@ -356,6 +373,7 @@ class VideoDownloader(BaseTool):
             "skip_download": True,
             "outtmpl": sub_out,
             "noplaylist": True,
+            "max_filesize": max_file_size_bytes,
             "quiet": True,
             "no_warnings": True,
         }

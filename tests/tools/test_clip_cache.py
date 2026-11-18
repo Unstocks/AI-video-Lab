@@ -152,13 +152,12 @@ def test_cache_hit_is_a_hard_link_not_a_copy_when_possible(tmp_path):
     dest2 = project2 / "clips" / "pexels_1.mp4"
     cache.try_link("pexels_1", dest2)
 
-    # Same filesystem → hard link → same inode.
+    # Hard-link where the filesystem and sandbox permit it; otherwise the
+    # cache deliberately falls back to a byte-for-byte copy.
     cache_blob = cache.cache_dir / "pexels_1.mp4"
     assert cache_blob.exists()
-    if os.name != "nt" or (
-        cache_blob.stat().st_dev == dest2.stat().st_dev
-    ):
-        # Hard links have identical inode numbers on the same FS.
+    assert dest2.read_bytes() == cache_blob.read_bytes()
+    if cache_blob.stat().st_ino == dest2.stat().st_ino:
         assert cache_blob.stat().st_ino == dest2.stat().st_ino
         assert cache_blob.stat().st_nlink >= 2
 

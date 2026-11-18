@@ -156,6 +156,7 @@ def test_process_candidate_rejects_traversing_clip_id(tmp_path: Path) -> None:
 def test_corpus_builder_execute_skips_and_records_unsafe_candidates(
     monkeypatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv("OPENMONTAGE_CACHE_DIR", str(tmp_path / "shared-cache"))
     corpus_dir = tmp_path / "corpus"
     escape_file = tmp_path / "escaped_clip.mp4"
 

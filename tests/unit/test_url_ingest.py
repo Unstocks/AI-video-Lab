@@ -248,6 +248,65 @@ def test_video_downloader_allowed_extractors_are_opt_in(monkeypatch, tmp_path):
     assert opts_seen[-1]["allowed_extractors"] == ["youtube", "vimeo"]
 
 
+def test_video_downloader_rejects_unknown_duration_and_propagates_metadata_errors(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+    from tools.analysis.video_downloader import VideoDownloader
+
+    download_calls = []
+
+    class YDL:
+        info = {"duration": 0}
+        error = None
+        def __init__(self, _opts): pass
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def extract_info(self, *_args, **_kwargs):
+            if self.error:
+                raise RuntimeError(self.error)
+            return self.info
+        def download(self, _urls): download_calls.append(True)
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=YDL))
+    downloader = VideoDownloader()
+    inputs = {"url": "https://youtube.com/watch?v=abcdefghijk", "format": "video",
+              "output_dir": str(tmp_path)}
+    unknown = downloader.execute(inputs)
+    assert not unknown.success and "duration is unknown" in unknown.error
+    assert download_calls == []
+
+    YDL.error = "extractor timed out"
+    extraction_error = downloader.execute({**inputs, "format": "metadata_only"})
+    assert not extraction_error.success and "extractor timed out" in extraction_error.error
+
+
+def test_video_downloader_size_limit_is_forwarded_and_postchecked(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+    from tools.analysis.video_downloader import VideoDownloader
+
+    seen = []
+
+    class YDL:
+        def __init__(self, options):
+            self.options = options
+            seen.append(options)
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def extract_info(self, *_args, **_kwargs): return {"duration": 1}
+        def download(self, _urls):
+            Path(self.options["outtmpl"].replace("%(ext)s", "mp4")).write_bytes(b"oversized")
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=YDL))
+    result = VideoDownloader().execute({
+        "url": "https://youtube.com/watch?v=abcdefghijk", "format": "video",
+        "output_dir": str(tmp_path), "max_file_size_bytes": 4,
+    })
+    assert not result.success and "exceeds max_file_size_bytes=4" in result.error
+    assert seen[-1]["max_filesize"] == 4 and seen[-1]["noplaylist"] is True
+    assert not list(tmp_path.glob("reference_video.*"))
+
+
 def _mock_intake_registry(adapter, mock_downloader):
     def get_tool(name):
         return mock_downloader if name == "video_downloader" else None
@@ -265,6 +324,33 @@ def test_ingest_url_non_wav_audio_triggers_pcm_fallback(adapter, sample_video_pa
     assert result.success
     stream = next(s for s in adapter.probe_media_file(Path(result.audio_path))["streams"] if s["codec_type"] == "audio")
     assert stream["codec_name"] == "pcm_s16le" and stream["sample_rate"] == "16000" and stream["channels"] == 1
+
+
+def test_ingest_url_accepts_podcast_longer_than_downloader_default(adapter, sample_video_path):
+    url = "https://youtube.com/watch?v=mock1234567"
+    tool = MagicMock()
+    tool.execute.side_effect = [
+        ToolResult(True, {"metadata": {"duration": 1800}}),
+        ToolResult(True, {"video_path": str(sample_video_path), "audio_path": None}),
+    ]
+    registry_patch, discover_patch = _mock_intake_registry(adapter, tool)
+    actual_probe = adapter.probe_media_file
+
+    def probe(path):
+        result = actual_probe(path)
+        if Path(path).name == "source_video.mp4":
+            result["format"]["duration"] = "1800"
+        return result
+
+    adapter.probe_media_file = probe
+    adapter.ensure_valid_mp4 = lambda src, dst: (shutil.copy2(src, dst) and dst)
+    with patch.object(adapter, "validate_url", return_value=url), registry_patch, discover_patch:
+        result = adapter.ingest_url(url, "long-podcast", max_duration_seconds=3600, extract_transcript=False)
+    assert result.success, result.error
+    assert result.duration_seconds == 1800
+    preflight_inputs = tool.execute.call_args_list[0].args[0]
+    assert preflight_inputs["format"] == "metadata_only"
+    assert preflight_inputs["max_duration_seconds"] == 3600
 
 
 def test_ingest_url_bounded_retries(adapter, sample_video_path, monkeypatch):
@@ -343,6 +429,30 @@ def test_validate_url_private_and_link_local_blocked(adapter):
         with patch.object(adapter, "_resolve_host", return_value=[entry]):
             with pytest.raises(URLValidationError, match=expected):
                 adapter.validate_url("https://www.youtube.com/watch?v=123")
+
+
+def test_validate_url_unspecified_and_ipv4_mapped_addresses_blocked(adapter):
+    for address in ("0.0.0.0", "::ffff:127.0.0.1"):
+        family = socket.AF_INET6 if ":" in address else socket.AF_INET
+        sockaddr = (address, 0, 0, 0) if family == socket.AF_INET6 else (address, 0)
+        entry = (family, socket.SOCK_STREAM, 6, "", sockaddr)
+        with patch.object(adapter, "_resolve_host", return_value=[entry]):
+            with pytest.raises(URLValidationError, match="Blocked"):
+                adapter.validate_url("https://www.youtube.com/watch?v=123")
+
+
+def test_local_media_intake_copies_transcript_and_emits_manifest(adapter, sample_video_path):
+    sidecar = sample_video_path.with_suffix(".srt")
+    sidecar.write_text("1\n00:00:00,000 --> 00:00:00,800\nLocal transcript\n", encoding="utf-8")
+    result = adapter.ingest_local_file(sample_video_path, "local-intake", transcript_path=sidecar)
+    assert result.success
+    assert Path(result.video_path).is_file() and Path(result.audio_path).is_file()
+    assert Path(result.transcript_path).read_text(encoding="utf-8").startswith("1\n")
+    manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["pipeline_type"] == adapter.pipeline_type
+    assert manifest["has_native_captions"] is True
+    assert manifest["master_video_path"] == result.video_path
+    assert manifest["proxy_video_path"] is None
 
 
 # --- 4. Disk Space Headroom Checking ---

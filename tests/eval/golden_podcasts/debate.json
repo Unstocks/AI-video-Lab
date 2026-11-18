@@ -1,0 +1,10 @@
+{
+  "episode_id": "gold-debate",
+  "title": "Synthetic debate",
+  "archetype": "debate",
+  "languages": ["en"],
+  "transcript_format": "youtube",
+  "transcript": {"transcript": [{"text": "Growth matters, but retention tells us whether the product solves a real problem.", "start": 0, "duration": 24}]},
+  "gold_clips": [{"gold_id": "debate-gold", "start_seconds": 0, "end_seconds": 24, "archetype": "debate"}],
+  "trap_moments": [{"trap_id": "debate-mid-answer", "start_seconds": 40, "end_seconds": 55, "trap_reason": "Starts after the premise was stated", "expected_failure_gate": "cold_viewer"}]
+}

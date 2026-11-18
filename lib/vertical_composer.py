@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import json
 import os
 import re
 import shutil
@@ -17,6 +18,7 @@ from typing import Any, Literal, Optional, Sequence
 from lib.media_profiles import MediaProfile, get_profile
 from lib.models.clip_plan import ClipSelectionPlan
 from lib.subtitle_styles import get_subtitle_style
+from lib.ffmpeg_utils import escape_ffmpeg_filter_path
 
 
 @dataclass(frozen=True)
@@ -104,8 +106,13 @@ class VerticalClipComposer:
 
     @staticmethod
     def select_editing_source(
-        source_video_path: str | Path, *, source_manifest: Optional[dict[str, Any]] = None,
+        source_video_path: str | Path, *, source_manifest: Optional[dict[str, Any] | str | Path] = None,
     ) -> Path:
+        if isinstance(source_manifest, (str, Path)):
+            loaded = json.loads(Path(source_manifest).expanduser().read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("source_manifest JSON must contain an object")
+            source_manifest = loaded
         if source_manifest:
             proxy = source_manifest.get("proxy_video_path")
             if isinstance(proxy, str) and proxy.strip() and Path(proxy).is_file():
@@ -199,7 +206,7 @@ class VerticalClipComposer:
         config: Optional[VerticalRenderConfig] = None,
         shot_cuts: Optional[Sequence[float]] = None,
         speaker_tracks: Optional[Sequence[dict[str, Any]]] = None,
-        source_manifest: Optional[dict[str, Any]] = None,
+        source_manifest: Optional[dict[str, Any] | str | Path] = None,
     ) -> ClipRenderResult:
         config = config or VerticalRenderConfig()
         source_used = str(source_video_path)
@@ -246,6 +253,8 @@ class VerticalClipComposer:
 
             with tempfile.TemporaryDirectory(prefix=f".{output_stem}-", dir=destination) as workspace:
                 work = Path(workspace)
+                staged_subtitle = work / f"subtitles.{config.subtitle_format}"
+                render_tmp = work / "final.mp4"
                 trimmed = work / "trimmed.mp4"
                 reframed = work / "reframed.mp4"
                 trim_result = self._get_trimmer().execute({
@@ -264,7 +273,19 @@ class VerticalClipComposer:
                     "codec": config.codec, "crf": config.crf,
                 })
                 if not reframed_result.success:
-                    raise RuntimeError(reframed_result.error or "AutoReframe failed")
+                    if config.codec != "h264_nvenc":
+                        raise RuntimeError(reframed_result.error or "AutoReframe failed")
+                    warnings.append("h264_nvenc failed during reframing; retried with libx264")
+                    reframed_result = self._get_reframer().execute({
+                        "input_path": str(trimmed), "output_path": str(reframed),
+                        "target_width": profile.width, "target_height": profile.height,
+                        "layout_mode": config.layout_mode,
+                        "shot_cuts": self._rebase_shot_cuts(shot_cuts, start, end),
+                        "speaker_tracks": self._rebase_speaker_tracks(speaker_tracks, start, end),
+                        "codec": "libx264", "crf": config.crf,
+                    })
+                    if not reframed_result.success:
+                        raise RuntimeError(reframed_result.error or "AutoReframe libx264 fallback failed")
                 warnings.extend(reframed_result.data.get("warnings", []))
                 reframed_source = Path(reframed_result.data.get("output", reframed))
                 if not reframed_source.is_file() or reframed_source.stat().st_size <= 0:
@@ -275,7 +296,7 @@ class VerticalClipComposer:
                     subtitle_inputs: dict[str, Any] = {
                         "segments": list(transcript_segments), "format": config.subtitle_format,
                         "clip_start_seconds": start, "clip_end_seconds": end,
-                        "output_path": str(subtitle_path), "highlight_style": config.highlight_style,
+                        "output_path": str(staged_subtitle), "highlight_style": config.highlight_style,
                     }
                     if config.style_preset is None:
                         subtitle_inputs.update({
@@ -301,6 +322,8 @@ class VerticalClipComposer:
                         subtitle_inputs.update({
                             "play_res_x": profile.width, "play_res_y": profile.height,
                         })
+                        if config.fonts_dir is not None:
+                            subtitle_inputs["fonts_dir"] = config.fonts_dir
                         if config.style_preset is None:
                             subtitle_inputs.update({
                                 "font_name": config.font_name, "font_size": config.font_size,
@@ -316,55 +339,79 @@ class VerticalClipComposer:
                 elif config.burn_subtitles:
                     warnings.append("no transcript segments supplied; subtitle burn skipped")
 
-                if config.burn_subtitles and cue_count > 0 and subtitle_path.is_file():
-                    escaped_subtitle = self._escape_filter_path(subtitle_path)
+                if config.burn_subtitles and cue_count > 0 and staged_subtitle.is_file():
+                    escaped_subtitle = self._escape_filter_path(staged_subtitle)
                     filter_name = "ass" if config.subtitle_format == "ass" else "subtitles"
                     vf = f"{filter_name}='{escaped_subtitle}'"
                     if fonts_directory is not None and config.subtitle_format == "ass":
                         escaped_fonts = self._escape_filter_path(fonts_directory)
                         vf = f"ass='{escaped_subtitle}':fontsdir='{escaped_fonts}'"
-                    render_tmp = work / "final.mp4"
                     command = [
                         "ffmpeg", "-y", "-i", str(reframed_source),
                         "-map", "0:v:0", "-map", "0:a?", "-vf", vf,
-                        "-c:v", config.codec, "-crf", str(config.crf), "-preset", "fast",
+                        "-fps_mode", "cfr", "-c:v", config.codec, "-crf", str(config.crf), "-preset", "fast",
                         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                         "-c:a", "aac", "-b:a", "192k", str(render_tmp),
                     ]
-                    self._run_ffmpeg(command, timeout=600)
+                    try:
+                        self._run_ffmpeg(command, timeout=600)
+                    except Exception:
+                        if config.codec != "h264_nvenc":
+                            raise
+                        warnings.append("h264_nvenc failed during subtitle encoding; retried with libx264")
+                        command[command.index("h264_nvenc")] = "libx264"
+                        self._run_ffmpeg(command, timeout=600)
                     if not render_tmp.is_file() or render_tmp.stat().st_size <= 0:
                         raise RuntimeError("subtitle burn produced no output file")
-                    os.replace(render_tmp, output_path)
                 else:
-                    intermediate = work / "final.mp4"
-                    shutil.copy2(reframed_source, intermediate)
-                    os.replace(intermediate, output_path)
+                    shutil.copy2(reframed_source, render_tmp)
 
-            probe = self._probe_output(output_path)
-            video = next((stream for stream in probe.get("streams", [])
-                          if stream.get("codec_type") == "video"), None)
-            if video is None:
-                raise RuntimeError("ffprobe found no video stream in rendered output")
-            width, height = int(video["width"]), int(video["height"])
-            if (width, height) != (profile.width, profile.height):
-                raise RuntimeError(f"unexpected output size {width}x{height}; expected {profile.width}x{profile.height}")
-            if video.get("pix_fmt") != "yuv420p":
-                raise RuntimeError(f"unexpected pixel format {video.get('pix_fmt')!r}; expected 'yuv420p'")
-            video_codec = video.get("codec_name")
-            if config.codec == "libx264" and video_codec != "h264":
-                raise RuntimeError(f"unexpected video codec {video_codec!r}; expected h264")
-            media_duration = float(probe.get("format", {}).get("duration", 0))
-            if not math.isfinite(media_duration) or media_duration <= 0:
-                raise RuntimeError("ffprobe returned an invalid output duration")
-            if abs(media_duration - duration) > max(0.35, duration * 0.05):
-                warnings.append(
-                    f"rendered duration {media_duration:.3f}s differs from requested {duration:.3f}s"
-                )
-            audio_streams = [stream for stream in probe.get("streams", []) if stream.get("codec_type") == "audio"]
-            if audio_streams and audio_streams[0].get("codec_name") != "aac":
-                warnings.append(f"audio codec is {audio_streams[0].get('codec_name')}, expected aac")
-            if not audio_streams:
-                warnings.append("rendered clip contains no audio stream")
+                probe = self._probe_output(render_tmp)
+                video = next((stream for stream in probe.get("streams", [])
+                              if stream.get("codec_type") == "video"), None)
+                if video is None:
+                    raise RuntimeError("ffprobe found no video stream in rendered output")
+                width, height = int(video["width"]), int(video["height"])
+                if (width, height) != (profile.width, profile.height):
+                    raise RuntimeError(f"unexpected output size {width}x{height}; expected {profile.width}x{profile.height}")
+                if video.get("pix_fmt") != "yuv420p":
+                    raise RuntimeError(f"unexpected pixel format {video.get('pix_fmt')!r}; expected 'yuv420p'")
+                video_codec = video.get("codec_name")
+                if video_codec != "h264":
+                    raise RuntimeError(f"unexpected video codec {video_codec!r}; expected h264")
+                media_duration = float(probe.get("format", {}).get("duration", 0))
+                if not math.isfinite(media_duration) or media_duration <= 0:
+                    raise RuntimeError("ffprobe returned an invalid output duration")
+                if abs(media_duration - duration) > max(0.35, duration * 0.05):
+                    warnings.append(
+                        f"rendered duration {media_duration:.3f}s differs from requested {duration:.3f}s"
+                    )
+                audio_streams = [stream for stream in probe.get("streams", []) if stream.get("codec_type") == "audio"]
+                if audio_streams and audio_streams[0].get("codec_name") != "aac":
+                    warnings.append(f"audio codec is {audio_streams[0].get('codec_name')}, expected aac")
+                if not audio_streams:
+                    warnings.append("rendered clip contains no audio stream")
+                promotions = [(render_tmp, output_path)]
+                if staged_subtitle.is_file():
+                    promotions.append((staged_subtitle, subtitle_path))
+                backups: dict[Path, Path] = {}
+                installed: list[Path] = []
+                try:
+                    for index, (_, final_path) in enumerate(promotions):
+                        if final_path.exists():
+                            backup = work / f"previous-{index}{final_path.suffix}"
+                            os.replace(final_path, backup)
+                            backups[final_path] = backup
+                    for staged_path, final_path in promotions:
+                        os.replace(staged_path, final_path)
+                        installed.append(final_path)
+                except Exception:
+                    for final_path in reversed(installed):
+                        final_path.unlink(missing_ok=True)
+                    for final_path, backup in backups.items():
+                        if backup.exists():
+                            os.replace(backup, final_path)
+                    raise
             return ClipRenderResult(
                 candidate_id, True, str(output_path), str(subtitle_path) if subtitle_result else None,
                 source_used, config.layout_mode, media_duration, width, height,
@@ -372,7 +419,7 @@ class VerticalClipComposer:
             )
         except Exception as exc:
             return ClipRenderResult(
-                candidate_id, False, None, str(subtitle_path) if subtitle_path and subtitle_path.is_file() else None,
+                candidate_id, False, None, None,
                 source_used, config.layout_mode, None, None, None, cue_count, effective_style,
                 error=str(exc), warnings=tuple(warnings),
             )
@@ -384,7 +431,7 @@ class VerticalClipComposer:
         config: Optional[VerticalRenderConfig] = None,
         shot_cuts: Optional[Sequence[float]] = None,
         speaker_tracks: Optional[Sequence[dict[str, Any]]] = None,
-        source_manifest: Optional[dict[str, Any]] = None,
+        source_manifest: Optional[dict[str, Any] | str | Path] = None,
     ) -> VerticalBatchRenderResult:
         from tools.analysis.clip_selector import verify_script_plan_sync
 
@@ -412,9 +459,7 @@ class VerticalClipComposer:
 
     @staticmethod
     def _escape_filter_path(path: Path) -> str:
-        normalized = str(path.resolve()).replace("\\", "/")
-        return (normalized.replace("\\", r"\\").replace(":", r"\:")
-                .replace("'", r"\'").replace(",", r"\,"))
+        return escape_ffmpeg_filter_path(path)
 
     @staticmethod
     def _run_ffmpeg(command: list[str], *, timeout: int) -> None:

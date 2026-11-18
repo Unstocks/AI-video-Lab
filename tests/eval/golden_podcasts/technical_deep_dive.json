@@ -1,0 +1,10 @@
+{
+  "episode_id": "gold-technical-deep-dive",
+  "title": "Synthetic technical deep dive",
+  "archetype": "technical_deep_dive",
+  "languages": ["en"],
+  "transcript_format": "youtube",
+  "transcript": {"transcript": [{"text": "We reduced database latency by measuring each query before changing the index.", "start": 0, "duration": 28}]},
+  "gold_clips": [{"gold_id": "technical-gold", "start_seconds": 0, "end_seconds": 28, "archetype": "technical_deep_dive", "expected_hook_substring": "measuring each query"}],
+  "trap_moments": [{"trap_id": "technical-hallucinated-hook", "start_seconds": 60, "end_seconds": 75, "trap_reason": "Invented benchmark claim", "expected_failure_gate": "hook_provenance"}]
+}

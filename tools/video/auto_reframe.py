@@ -20,6 +20,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from lib.ffmpeg_utils import escape_ffmpeg_filter_path
 
 from tools.base_tool import (
     BaseTool,
@@ -272,6 +273,8 @@ class AutoReframe(BaseTool):
         warnings = []
         if result.data and result.data.get("fallback"):
             warnings.append(result.data["fallback"])
+        if method == "center_crop":
+            warnings.append("face tracking/speaker tracks unavailable; used static center_crop")
 
         return ToolResult(
             success=True,
@@ -294,7 +297,7 @@ class AutoReframe(BaseTool):
         cmd = [
             "ffprobe", "-v", "quiet",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,r_frame_rate,sample_aspect_ratio",
+            "-show_streams",
             "-of", "json", str(path),
         ]
         try:
@@ -303,6 +306,18 @@ class AutoReframe(BaseTool):
             stream = data["streams"][0]
             w = int(stream["width"])
             h = int(stream["height"])
+            rotation = 0.0
+            for side_data in stream.get("side_data_list", []):
+                if "rotation" in side_data:
+                    rotation = float(side_data["rotation"])
+                    break
+            if not rotation:
+                try:
+                    rotation = float((stream.get("tags") or {}).get("rotate", 0))
+                except (TypeError, ValueError):
+                    rotation = 0.0
+            if int(abs(rotation)) % 180 == 90:
+                w, h = h, w
             # Parse r_frame_rate (e.g. "30000/1001")
             fps_parts = stream["r_frame_rate"].split("/")
             fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) == 2 else float(fps_parts[0])
@@ -631,7 +646,7 @@ class AutoReframe(BaseTool):
             "-i", str(input_path),
             "-map", "0:v:0", "-map", "0:a?",
             "-vf", vf,
-            "-c:v", codec, "-crf", str(crf), "-preset", "fast",
+            "-fps_mode", "cfr", "-c:v", codec, "-crf", str(crf), "-preset", "fast",
             "-c:a", "aac", "-b:a", "192k",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             str(output_path),
@@ -694,7 +709,7 @@ class AutoReframe(BaseTool):
                 cmd = [
                     "ffmpeg", "-y", "-i", str(input_path),
                     "-map", "0:v:0", "-map", "0:a?", "-vf", vf,
-                    "-c:v", codec, "-crf", str(crf), "-preset", "fast",
+                    "-fps_mode", "cfr", "-c:v", codec, "-crf", str(crf), "-preset", "fast",
                     "-c:a", "aac", "-b:a", "192k",
                     "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path),
                 ]
@@ -713,8 +728,7 @@ class AutoReframe(BaseTool):
 
     @staticmethod
     def _escape_ffmpeg_filter_path(path: Path) -> str:
-        normalized = str(path.resolve()).replace("\\", "/")
-        return normalized.replace(":", r"\:").replace("'", r"\'")
+        return escape_ffmpeg_filter_path(path)
 
     def _render_blurred_pillarbox(
         self, input_path: Path, output_path: Path, out_w: int, out_h: int,
@@ -766,7 +780,7 @@ class AutoReframe(BaseTool):
     ) -> ToolResult:
         cmd = [
             "ffmpeg", "-y", "-i", str(input_path), "-filter_complex", vf,
-            "-map", "[vout]", "-map", "0:a?", "-c:v", codec, "-crf", str(crf), "-preset", "fast",
+            "-map", "[vout]", "-map", "0:a?", "-fps_mode", "cfr", "-c:v", codec, "-crf", str(crf), "-preset", "fast",
             "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             str(output_path),
         ]

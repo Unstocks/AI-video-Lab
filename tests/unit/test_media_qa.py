@@ -15,7 +15,7 @@ from schemas.artifacts import validate_artifact
 pytestmark = pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg/ffprobe required")
 
 
-def _render(path: Path, *, video: str = "color=c=0x36a7d8:s=1080x1920:r=25:d=3", audio: str | None = "sine=frequency=440:duration=3") -> Path:
+def _render(path: Path, *, video: str = "testsrc2=size=1080x1920:rate=25:duration=3", audio: str | None = "aevalsrc=0.25*sin(2*PI*440*t)*(0.2+0.8*abs(sin(2*PI*0.7*t))):s=48000:d=3") -> Path:
     args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", video]
     if audio is not None:
         args += ["-f", "lavfi", "-i", audio]
@@ -48,7 +48,7 @@ def test_valid_vertical_render_passes_with_subtitles(tmp_path):
     temp_before = set(temp_root.glob("media_qa_*"))
     report = MediaQAInspector().inspect_clip(
         candidate_id="good", video_path=video, expected_duration_seconds=3, subtitle_path=ass,
-        frames_output_dir=output_frames, config=MediaQAConfig(require_subtitles=True),
+        frames_output_dir=output_frames, config=MediaQAConfig(require_subtitles=True), locked_runtime="ffmpeg",
     )
     assert report.status == "pass"
     assert report.production_state == "QA_PASSED"
@@ -57,6 +57,10 @@ def test_valid_vertical_render_passes_with_subtitles(tmp_path):
     assert report.audio_spotcheck["narration_present"] is True
     assert report.subtitle_check["subtitles_present"] is True
     assert report.subtitle_check["timing_drift_detected"] is False
+    assert report.check_statuses["freeze_frame_check"] == "PASS"
+    assert len(report.video_sha256) == 64
+    assert "broken_overlays" not in report.visual_spotcheck
+    assert report.check_statuses["broken_overlays"] == "NOT_CHECKED"
     validate_artifact("final_review", report.final_review_artifact)
     assert set(temp_root.glob("media_qa_*")) == temp_before
     shutil.rmtree(output_frames)
@@ -123,6 +127,37 @@ def test_runtime_swap_blocks_delivery(tmp_path):
     assert report.promise_preservation["runtime_swap_detected"] is True
     assert report.status == "fail"
     assert report.recommended_action == "block"
+
+
+def test_flat_tone_is_not_reported_as_verified_narration(tmp_path):
+    video = _render(tmp_path / "flat-tone.mp4", video="testsrc2=size=1080x1920:rate=25:duration=3",
+                    audio="sine=frequency=440:duration=3")
+    report = MediaQAInspector().inspect_clip(
+        candidate_id="flat-tone", video_path=video, expected_duration_seconds=3, locked_runtime="ffmpeg",
+    )
+    assert report.audio_spotcheck.get("narration_present") is not True
+    assert report.audio_spotcheck.get("mix_intelligible") is None
+    assert report.audio_spotcheck["speech_modulation"] == "INDETERMINATE"
+    assert report.check_statuses["audio_audible"] == "PASS"
+    assert "flat audio loudness profile; speech presence not verified" in report.issues
+
+
+def test_frozen_static_video_fails_and_batch_forwards_locked_runtime(tmp_path):
+    video = _render(tmp_path / "static.mp4", video="color=c=0x36a7d8:s=1080x1920:r=25:d=3")
+    inspector = MediaQAInspector()
+    report = inspector.inspect_clip(
+        candidate_id="static", video_path=video, expected_duration_seconds=3, locked_runtime="ffmpeg",
+    )
+    assert report.check_statuses["freeze_frame_check"] == "FAIL"
+    assert any("frozen/static" in issue for issue in report.issues)
+    batch = inspector.inspect_batch(project_id="p", render_results=[{
+        "candidate_id": "static", "video_path": str(video), "duration_seconds": 3,
+        "locked_runtime": "remotion",
+    }])
+    assert batch.clip_reports[0].check_statuses["runtime_preservation"] == "FAIL"
+    assert batch.clip_reports[0].production_state == "QA_FAILED"
+    clip_meta = batch.final_review["metadata"]["clip_reports"]["static"]
+    assert clip_meta["video_sha256"] == inspector._sha256(video)
 
 
 def test_invalid_config_rejects_less_than_four_frames():

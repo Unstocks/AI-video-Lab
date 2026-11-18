@@ -5,6 +5,7 @@ schema-valid publish_log, chapter formatting, and the missing-video error path.
 """
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 
@@ -22,6 +23,32 @@ from schemas.artifacts import validate_artifact
 def _make_video(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"\x00\x00\x00\x18ftypmp42fakevideo")
+
+
+def _passing_review(clip_id: str, video: Path) -> dict:
+    digest = hashlib.sha256(video.read_bytes()).hexdigest()
+    return {
+        "version": "1.0", "output_path": str(video), "status": "pass",
+        "checks": {
+            "technical_probe": {}, "visual_spotcheck": {}, "audio_spotcheck": {},
+            "promise_preservation": {}, "subtitle_check": {},
+        },
+        "metadata": {
+            "passed_clip_ids": [clip_id], "failed_clip_ids": [],
+            "clip_reports": {clip_id: {"video_path": str(video), "video_sha256": digest,
+                                        "status": "pass", "production_state": "QA_PASSED"}},
+        },
+    }
+
+
+def _batch_inputs(tmp_path: Path) -> dict:
+    video = tmp_path / "clip.mp4"
+    _make_video(video)
+    return {
+        "clips": [{"clip_id": "approved-clip", "video_path": str(video), "title": "Approved"}],
+        "final_review": _passing_review("approved-clip", video),
+        "export_dir": str(tmp_path / "batch"), "require_approval": False,
+    }
 
 
 def test_contract_metadata():
@@ -153,3 +180,44 @@ def test_registry_discovers_export_bundle():
     reg.discover()
     assert reg.get("export_bundle") is not None
     assert reg.get_by_capability("publish")[0].name == "export_bundle"
+
+
+def test_batch_export_requires_schema_valid_final_review(tmp_path):
+    inputs = _batch_inputs(tmp_path)
+    inputs.pop("final_review")
+    result = ExportBundle().execute(inputs)
+    assert not result.success
+    assert "final_review" in result.error
+    assert not (tmp_path / "batch").exists()
+
+
+@pytest.mark.parametrize("tamper", ["allowlist", "digest", "status"])
+def test_batch_export_fails_closed_on_unverified_or_stale_clip(tmp_path, tamper):
+    inputs = _batch_inputs(tmp_path)
+    video = Path(inputs["clips"][0]["video_path"])
+    if tamper == "allowlist":
+        inputs["final_review"]["metadata"]["passed_clip_ids"] = []
+    elif tamper == "status":
+        inputs["final_review"]["status"] = "fail"
+    else:
+        video.write_bytes(video.read_bytes() + b"changed after review")
+    result = ExportBundle().execute(inputs)
+    assert not result.success
+    assert not (tmp_path / "batch" / "clips").exists()
+
+
+def test_batch_collision_preserves_package_and_does_not_replace_manifest(tmp_path):
+    inputs = _batch_inputs(tmp_path)
+    first = ExportBundle().execute(inputs)
+    assert first.success
+    root = Path(first.data["export_path"])
+    existing_package = root / "clips" / "01_approved-clip"
+    sentinel = existing_package / "keep.txt"
+    sentinel.write_text("preserve", encoding="utf-8")
+    manifest = (root / "manifest.json").read_bytes()
+    second = ExportBundle().execute(inputs)
+    assert not second.success
+    assert second.data["batch_status"] == "failed"
+    assert (second.data["publish_log"]["metadata"]["failed_count"]) == 1
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
+    assert (root / "manifest.json").read_bytes() == manifest

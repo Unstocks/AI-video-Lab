@@ -182,7 +182,8 @@ def _build_stage_rail(
         ):
             saw_wait = any(v.get("status") == "awaiting_human" for v in versions)
             approved = bool(cp.get("human_approved"))
-            entry["gate_skipped"] = not (saw_wait or approved)
+            entry["saw_awaiting_human"] = saw_wait
+            entry["gate_skipped"] = not saw_wait
         rail.append(entry)
 
     # Checkpoints for stages the manifest doesn't declare (legacy runs,
@@ -519,7 +520,10 @@ def _scan_media(project_dir: Path) -> dict[str, list[dict]]:
 
     renders_dir = project_dir / "renders"
     if renders_dir.is_dir():
-        for f in sorted(renders_dir.iterdir()):
+        for f in sorted(renders_dir.rglob("*")):
+            relative = f.relative_to(renders_dir)
+            if len(relative.parts) > 4 or any(part.startswith(".") or part == "qa_frames" for part in relative.parts):
+                continue
             if f.suffix.lower() in MEDIA_VIDEO_EXT and f.is_file():
                 renders.append({"path": _rel(project_dir, f), "size": f.stat().st_size,
                                 "mtime": f.stat().st_mtime})

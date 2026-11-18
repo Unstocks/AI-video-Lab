@@ -14,6 +14,9 @@ import unicodedata
 
 from lib.deduplicator import temporal_iou
 from lib.models.clip_plan import ClipSelectionPlan
+from lib.models.transcript import RawTranscriptDocument, RawTranscriptSegment, TimestampProvenance
+from lib.transcript_normalizer import TranscriptNormalizer
+from lib.hook_validator import validate_hook_provenance
 
 
 EDITORIAL_DIMENSIONS: tuple[str, ...] = (
@@ -168,6 +171,7 @@ class EpisodeEvalMetrics:
     false_positive_traps: tuple[str, ...]
     duplicate_leak_count: int
     hook_integrity_rate: Optional[float]
+    gold_hook_match_rate: Optional[float]
     dimension_averages: dict[str, Optional[float]]
     selected_clip_ids: tuple[str, ...]
     matched_pairs: tuple[tuple[str, str, float], ...]
@@ -184,7 +188,7 @@ class EpisodeEvalMetrics:
             raise ValueError("gold_matched_count cannot exceed gold or selected count")
         if self.trap_rejected_count > self.trap_count:
             raise ValueError("trap_rejected_count cannot exceed trap_count")
-        for name in ("gold_recall", "selected_precision", "mean_matched_boundary_iou", "trap_rejection_rate", "hook_integrity_rate"):
+        for name in ("gold_recall", "selected_precision", "mean_matched_boundary_iou", "trap_rejection_rate", "hook_integrity_rate", "gold_hook_match_rate"):
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1):
                 raise ValueError(f"{name} must be a finite ratio in [0, 1] or None")
@@ -337,13 +341,38 @@ class GoldenDatasetEvaluator:
                 and clip.validation_state == "VALID" and clip.eligibility_state == "ELIGIBLE"]
 
     @staticmethod
-    def _hook_is_intact(clip: Any) -> bool:
+    def _hook_is_intact(clip: Any, normalized_transcript: Any) -> bool:
         hook = getattr(clip, "spoken_hook", None)
         if hook is None or not hook.text.strip() or not hook.source_spans:
             return False
-        raw = " ".join(unicodedata.normalize("NFC", clip.original_spoken_dialogue).casefold().split())
-        spoken = " ".join(unicodedata.normalize("NFC", hook.text).casefold().split())
-        return bool(spoken and spoken in raw)
+        result = validate_hook_provenance(
+            hook.text, normalized_transcript, clip_start_seconds=clip.start_seconds,
+            clip_end_seconds=clip.end_seconds, source_spans=hook.source_spans,
+            expected_speaker=hook.speaker,
+        )
+        return bool(result.valid)
+
+    @staticmethod
+    def _normalized_fixture_transcript(fixture: GoldenEpisodeFixture):
+        normalizer = TranscriptNormalizer()
+        payload = fixture.transcript
+        if fixture.transcript_format == "youtube":
+            document = normalizer.from_youtube_captions(payload)
+        elif fixture.transcript_format == "whisper":
+            document = normalizer.from_whisper_transcript(payload)
+        elif fixture.transcript_format in {"srt", "vtt"}:
+            document = normalizer.from_srt_or_vtt(payload if isinstance(payload, str) else payload.get("text", ""))
+        elif fixture.transcript_format == "raw_document":
+            if isinstance(payload, dict):
+                document = RawTranscriptDocument.model_validate(payload)
+            else:
+                document = RawTranscriptDocument(segments=(RawTranscriptSegment(
+                    segment_id=0, text=payload, start_seconds=0, end_seconds=1,
+                    timing=TimestampProvenance(timing_source="unknown", alignment_method="unknown", evidence_quality="coarse_segment"),
+                ),))
+        else:
+            raise ValueError(f"unsupported transcript format {fixture.transcript_format!r}")
+        return normalizer.normalize(document)
 
     def evaluate_episode(
         self, fixture: GoldenEpisodeFixture, plan: ClipSelectionPlan | dict[str, Any], *,
@@ -360,6 +389,7 @@ class GoldenDatasetEvaluator:
         if hydrated.project_id != fixture.episode_id:
             raise ValueError(f"plan project_id {hydrated.project_id!r} does not match fixture episode_id {fixture.episode_id!r}")
         selected = self._selected(hydrated)
+        normalized_transcript = self._normalized_fixture_transcript(fixture)
         pairs: list[tuple[float, str, str]] = []
         for clip in selected:
             for gold in fixture.gold_clips:
@@ -387,7 +417,19 @@ class GoldenDatasetEvaluator:
             temporal_iou(left.start_seconds, left.end_seconds, right.start_seconds, right.end_seconds) >= duplicate_threshold
             for index, left in enumerate(selected) for right in selected[index + 1:]
         )
-        hook_count = sum(self._hook_is_intact(clip) for clip in selected)
+        hook_count = sum(self._hook_is_intact(clip, normalized_transcript) for clip in selected)
+        gold_by_id = {gold.gold_id: gold for gold in fixture.gold_clips}
+        gold_hook_rows = [
+            (clip_id, gold_by_id[gold_id].expected_hook_substring)
+            for clip_id, gold_id, _ in matched
+            if gold_by_id[gold_id].expected_hook_substring
+        ]
+        clips_by_id = {clip.candidate_id: clip for clip in selected}
+        gold_hook_rate = (sum(
+            unicodedata.normalize("NFC", expected).casefold() in
+            unicodedata.normalize("NFC", clips_by_id[clip_id].spoken_hook.text).casefold()
+            for clip_id, expected in gold_hook_rows
+        ) / len(gold_hook_rows)) if gold_hook_rows else None
         score_rows: dict[str, list[float]] = {dimension: [] for dimension in EDITORIAL_DIMENSIONS}
         score_sources: list[Sequence[HumanDimensionScore]] = [
             scores for scores in fixture.human_scores.values()
@@ -417,6 +459,7 @@ class GoldenDatasetEvaluator:
             trap_rejection_rate=trap_rejected / len(fixture.trap_moments) if fixture.trap_moments else None,
             false_positive_traps=false_positive_traps, duplicate_leak_count=duplicate_count,
             hook_integrity_rate=hook_count / selected_count if selected_count else None,
+            gold_hook_match_rate=gold_hook_rate,
             dimension_averages=dimension_averages,
             selected_clip_ids=tuple(clip.candidate_id for clip in selected), matched_pairs=tuple(matched),
         )
@@ -430,6 +473,7 @@ class GoldenDatasetEvaluator:
             "trap_rejection_rate": metric.trap_rejection_rate,
             "duplicate_leak_count": float(metric.duplicate_leak_count),
             "hook_integrity_rate": metric.hook_integrity_rate,
+            "gold_hook_match_rate": metric.gold_hook_match_rate,
         }
         values.update({f"dimension_averages.{key}": value for key, value in metric.dimension_averages.items()})
         return values
@@ -466,7 +510,7 @@ class GoldenDatasetEvaluator:
             episodes.append(self.evaluate_episode(fixture, plans_by_episode[fixture.episode_id]))
         values = [self._episode_values(item) for item in episodes]
         metric_names = ["gold_recall", "selected_precision", "mean_matched_boundary_iou", "trap_rejection_rate",
-                        "duplicate_leak_count", "hook_integrity_rate",
+                        "duplicate_leak_count", "hook_integrity_rate", "gold_hook_match_rate",
                         *(f"dimension_averages.{dim}" for dim in EDITORIAL_DIMENSIONS)]
         flat_macro = {}
         for name in metric_names:
@@ -515,7 +559,7 @@ class GoldenDatasetEvaluator:
         regressions: list[str] = []
         higher_is_better = {
             "gold_recall", "selected_precision", "mean_matched_boundary_iou", "trap_rejection_rate",
-            "hook_integrity_rate", *(f"dimension_averages.{dim}" for dim in EDITORIAL_DIMENSIONS),
+            "hook_integrity_rate", "gold_hook_match_rate", *(f"dimension_averages.{dim}" for dim in EDITORIAL_DIMENSIONS),
         }
         for name in names:
             left, right = before.get(name), after.get(name)

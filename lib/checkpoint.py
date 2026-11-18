@@ -7,6 +7,8 @@ checkpoints to resume pipelines and to present state at human checkpoints.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
@@ -121,6 +123,22 @@ def _load_checkpoint_schema() -> dict[str, Any]:
         return json.load(f)
 
 
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON beside its destination and atomically replace the old file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as output:
+            json.dump(payload, output, indent=2, ensure_ascii=False)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def _validate_artifacts_for_stage(
     stage: str,
     status: str,
@@ -155,6 +173,15 @@ def _validate_artifacts_for_stage(
                 "A completed proposal checkpoint must include a proposal_packet "
                 "with approval.status 'approved' or 'approved_with_changes'"
             )
+
+    if stage == "script" and status == "completed" and "clip_selection_plan" in artifacts:
+        try:
+            from tools.analysis.clip_selector import verify_script_plan_sync
+            verify_script_plan_sync(artifacts.get("script"), artifacts["clip_selection_plan"], require_approved=True)
+        except Exception as exc:
+            raise CheckpointValidationError(
+                f"Completed script checkpoint must contain an approved, synchronized script and plan: {exc}"
+            ) from exc
 
     for artifact_name, artifact_data in artifacts.items():
         if artifact_name not in ARTIFACT_NAMES:
@@ -262,8 +289,7 @@ def init_project(
     if series is not None:
         marker["series"] = series
 
-    with open(marker_path, "w", encoding="utf-8") as f:
-        json.dump(marker, f, indent=2)
+    _atomic_write_json(marker_path, marker)
 
     return project_dir
 
@@ -434,9 +460,7 @@ def _merge_decision_log(
         if decision.get("decision_id") not in existing_ids:
             existing["decisions"].append(decision)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(existing, f, indent=2)
+    _atomic_write_json(path, existing)
 
 
 def write_checkpoint(

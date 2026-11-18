@@ -259,7 +259,7 @@ class HyperFramesCompose(BaseTool):
             return None
         try:
             out = subprocess.run(
-                [node, "--version"], capture_output=True, text=True, timeout=5
+                [node, "--version"], capture_output=True, text=True, timeout=1
             )
             if out.returncode != 0:
                 return None
@@ -348,7 +348,7 @@ class HyperFramesCompose(BaseTool):
                 [npx, "--offline", cls._NPM_PACKAGE, "--version"],
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=8,
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -398,10 +398,8 @@ class HyperFramesCompose(BaseTool):
     def _runtime_check(self) -> dict[str, Any]:
         """Return availability state for the HyperFrames runtime.
 
-        Checks BOTH local binaries (node >= 22, ffmpeg, npx) AND that the
-        `hyperframes` npm package actually resolves. A missing/404 package
-        counts as unavailable — `runtime_available: True` means the runtime
-        can genuinely run end-to-end, not just that the local tooling exists.
+        Checks local binaries and a cached CLI only. It never fetches a package
+        during support/preflight checks; cold offline machines report unavailable.
         """
         node_major = self._node_major_version()
         ffmpeg_ok = shutil.which("ffmpeg") is not None
@@ -419,22 +417,9 @@ class HyperFramesCompose(BaseTool):
         if not ffmpeg_ok:
             reasons.append("ffmpeg not found on PATH")
 
-        # Only probe npm if the local tooling is actually usable — otherwise
-        # a missing-node run would also show a confusing npm error.
-        npm_resolve: dict[str, str] = {}
-        if not reasons:
-            npm_resolve = self._resolve_npm_package()
-            if "error" in npm_resolve:
-                reasons.append(
-                    f"npm package `{self._NPM_PACKAGE}` not resolvable: "
-                    f"{npm_resolve['error']}"
-                )
-
-        cli_probe: dict[str, str] = {}
-        if not reasons:
-            cli_probe = self._probe_cli()
-            if "error" in cli_probe:
-                reasons.append(f"published CLI is not executable: {cli_probe['error']}")
+        cached_cli = self._cached_cli_version() if not reasons else None
+        if not reasons and cached_cli is None:
+            reasons.append("HyperFrames CLI is not cached locally; preflight skipped network package fetch")
 
         return {
             "runtime_available": not reasons,
@@ -442,10 +427,10 @@ class HyperFramesCompose(BaseTool):
             "ffmpeg_available": ffmpeg_ok,
             "npx_available": npx_ok,
             "npm_package": self._NPM_PACKAGE,
-            "npm_package_version": npm_resolve.get("version"),
-            "npm_resolve_error": npm_resolve.get("error"),
-            "cli_probe_status": cli_probe.get("status"),
-            "cli_probe_error": cli_probe.get("error"),
+            "npm_package_version": cached_cli,
+            "npm_resolve_error": None,
+            "cli_probe_status": "cached" if cached_cli else None,
+            "cli_probe_error": None,
             "reasons": reasons,
         }
 

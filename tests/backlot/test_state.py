@@ -107,6 +107,7 @@ class TestBoardState:
         s = load_board_state(p)
         script_stage = next(x for x in s["stages"] if x["name"] == "script")
         assert script_stage["gate_skipped"] is True
+        assert script_stage["saw_awaiting_human"] is False
 
         # with an archived awaiting_human version, the gate was honored
         _write(p / "history" / "checkpoint_script_20260101.json", {
@@ -115,6 +116,21 @@ class TestBoardState:
         s2 = load_board_state(p)
         script_stage2 = next(x for x in s2["stages"] if x["name"] == "script")
         assert script_stage2["gate_skipped"] is False
+        assert script_stage2["saw_awaiting_human"] is True
+
+    def test_nested_render_discovery_ignores_hidden_and_qa_frames(self, projects_root):
+        project = _make_project(projects_root, "nested-render")
+        nested = project / "renders" / "clip-a" / "variants"
+        nested.mkdir(parents=True)
+        (nested / "final.mp4").write_bytes(b"video")
+        hidden = project / "renders" / ".staging" / "hidden.mp4"
+        hidden.parent.mkdir()
+        hidden.write_bytes(b"hidden")
+        qa = project / "renders" / "clip-a" / "qa_frames" / "frame.mp4"
+        qa.parent.mkdir()
+        qa.write_bytes(b"qa")
+        state = load_board_state(project)
+        assert [row["path"] for row in state["media"]["renders"]] == ["renders/clip-a/variants/final.mp4"]
 
     def test_generating_state_from_events(self, projects_root):
         p = _make_project(projects_root, "live")

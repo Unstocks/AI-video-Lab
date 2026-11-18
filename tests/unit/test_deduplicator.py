@@ -73,6 +73,11 @@ def test_zero_quota_padding_and_zero_maximum():
     assert zero.selected == () and len(zero.surplus_pending) == 2
 
 
+def test_character_fourgram_similarity_catches_spelling_and_hinglish_variants():
+    score = lexical_similarity("the onboarding setup process", "the on boarding setup process")
+    assert score > 0.70
+
+
 def test_only_gate_passing_candidates_are_accepted_and_invalid_numbers_fail():
     ineligible = clip("bad", 0, 10, "candidate").model_copy(update={"eligibility_state": "REJECTED_COLD_VIEWER"})
     with pytest.raises(ValueError, match="did not pass"):

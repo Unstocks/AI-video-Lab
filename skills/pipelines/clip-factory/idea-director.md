@@ -6,11 +6,9 @@ Use this pipeline when the source is long-form footage and the goal is multiple 
 
 You are not planning one video. You are planning a ranked portfolio of clips.
 
-## Runtime Selection (MANDATORY — present the constraint, don't silently pick)
+## Runtime Selection (ADR-009)
 
-Lock `render_runtime = "remotion"` (for composed clips with word-level captions) or `"ffmpeg"` (for pure concat/trim with no composition). **HyperFrames is NOT a valid runtime on this pipeline in Phase 1** — clip-factory depends on Remotion's word-level caption burn, which has no HyperFrames parity yet.
-
-Per AGENT_GUIDE.md → "Present Both Composition Runtimes (HARD RULE)": do NOT silently lock remotion. Surface the constraint to the user: "HyperFrames is an available runtime on your machine, but clip-factory depends on Remotion caption burn that doesn't have HyperFrames parity yet, so remotion is the only viable choice here — OK to proceed?" Record the decision in `decision_log` with category `render_runtime_selection`, including hyperframes as a rejected option (`rejected_because: "caption-burn parity deferred on clip-factory"`).
+Use the local FFmpeg-first `vertical_clip_composer` route for vertical trim, reframe, and ASS/SRT captions. Remotion is optional when its supported Node runtime and project dependencies are installed. HyperFrames motion composition remains deferred for this pipeline. During planning, present the supported runtime choices and record `render_runtime_selection` (`ffmpeg`, `remotion`, or `hyperframes`) with the requested constraint and fallback. Recommend `ffmpeg` for this pipeline's vertical trim/reframe/caption path; select HyperFrames only when the user explicitly requests a motion-graphics brief and that deferred route has been enabled. Do not claim an unavailable runtime was used.
 
 ## Reference Inputs
 
@@ -38,7 +36,7 @@ When the user provides a video URL (YouTube, Vimeo) rather than a local file pat
    Verify duration, resolution, audio track, and usability before proceeding with clip planning.
 
 3. **When Local Media is Provided**:
-   Place local footage in `projects/<project-id>/source/` and run `review_source_media([path], {"project_dir": project_dir})` directly.
+   Invoke `local_media_intake` with the local video path, project ID, and `pipeline_type="clip-factory"`. It normalizes the source into `projects/<project-id>/source/`, copies an adjacent or supplied `.json`/`.srt`/`.vtt` transcript when available, writes `source_manifest.json`, and creates an H.264 editing proxy when needed. Preserve the original master and then review the normalized source.
 
 ### 1. Understand The Source And The Goal
 

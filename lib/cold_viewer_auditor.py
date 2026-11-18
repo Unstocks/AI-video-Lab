@@ -85,7 +85,8 @@ class ColdViewerAuditor:
             reasons.append("proposed cold-viewer audit marked as failed")
 
         recommended_start: Optional[float] = None
-        framing_supplied = bool(editorial_framing and editorial_framing.strip())
+        framing_text = editorial_framing.strip() if isinstance(editorial_framing, str) else ""
+        framing_supplied = len(framing_text) >= 15 and len(framing_text.split()) >= 3
         if not framing_supplied and not proposed_audit.context_expansion_applied and self._is_dangling_opening(spoken_opening):
             pronouns = False
             flags["pronouns_resolved"] = False

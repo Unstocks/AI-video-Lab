@@ -16,6 +16,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -59,14 +60,16 @@ def ensure_media_tools_on_path() -> None:
         return
 
     workspace_root = Path(__file__).resolve().parent.parent
-    candidate_dirs = [
+    configured_bin = os.environ.get("FFMPEG_BIN_DIR")
+    candidate_dirs = ([Path(configured_bin).expanduser()] if configured_bin else []) + [
         workspace_root / ".runtime" / "tools" / "bin",
         workspace_root / ".venv" / "Scripts",
-        Path(os.path.expandvars(r"%LOCALAPPDATA%\ffmpeg\ffmpeg-7.1-essentials_build\bin")),
     ]
 
     for c_dir in candidate_dirs:
-        if (c_dir / "ffmpeg.exe").is_file() and (c_dir / "ffprobe.exe").is_file():
+        ffmpeg_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+        ffprobe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        if (c_dir / ffmpeg_name).is_file() and (c_dir / ffprobe_name).is_file():
             os.environ["PATH"] = str(c_dir) + os.pathsep + os.environ.get("PATH", "")
             logger.info("Prepended media tools to PATH: %s", c_dir)
             break
@@ -185,24 +188,40 @@ class URLIntakeAdapter:
         # Anti-SSRF: Resolve IP addresses and block private/loopback/link-local
         try:
             addr_info = self._resolve_host(hostname)
+            if not addr_info:
+                raise URLValidationError(f"DNS returned no addresses for approved host '{hostname}'.")
             for item in addr_info:
                 ip_str = item[4][0]
                 ip_obj = ipaddress.ip_address(ip_str)
-                if ip_obj.is_loopback:
-                    raise URLValidationError(f"Blocked loopback destination: {ip_str}")
-                if ip_obj.is_link_local:
-                    raise URLValidationError(f"Blocked link-local destination: {ip_str}")
-                if ip_obj.is_private:
-                    raise URLValidationError(f"Blocked private network destination: {ip_str}")
-                if ip_obj.is_reserved or ip_obj.is_multicast:
-                    raise URLValidationError(f"Blocked reserved/multicast destination: {ip_str}")
-        except socket.gaierror as exc:
+                mapped = getattr(ip_obj, "ipv4_mapped", None)
+                if mapped is not None:
+                    ip_obj = mapped
+                if ip_obj.is_unspecified:
+                    reason = "unspecified"
+                elif ip_obj.is_loopback:
+                    reason = "loopback"
+                elif ip_obj.is_link_local:
+                    reason = "link-local"
+                elif ip_obj.is_private:
+                    reason = "private network"
+                elif ip_obj.is_reserved or ip_obj.is_multicast or not ip_obj.is_global:
+                    reason = "non-global"
+                else:
+                    reason = ""
+                if reason:
+                    raise URLValidationError(f"Blocked {reason} destination: {ip_str}")
+        except URLValidationError:
+            raise
+        except Exception as exc:
             try:
                 ip_obj = ipaddress.ip_address(hostname)
             except ValueError:
                 raise URLValidationError(f"Could not resolve approved host '{hostname}'.") from exc
-            if not ip_obj.is_global:
-                raise URLValidationError(f"Blocked destination IP: {hostname}") from exc
+            mapped = getattr(ip_obj, "ipv4_mapped", None)
+            if mapped is not None:
+                ip_obj = mapped
+            if ip_obj.is_unspecified or not ip_obj.is_global:
+                raise URLValidationError(f"Blocked non-global destination IP: {hostname}") from exc
 
         return url.strip()
 
@@ -337,6 +356,7 @@ class URLIntakeAdapter:
         project_id: str,
         *,
         max_duration_seconds: int = 3600,
+        max_file_size_bytes: int = 2 * 1024**3,
         preferred_quality: str = "720p",
         extract_transcript: bool = True,
         caption_languages: Optional[list[str]] = None,
@@ -366,11 +386,14 @@ class URLIntakeAdapter:
                 "url": validated_url,
                 "output_dir": str(staging_dir),
                 "format": "metadata_only",
+                "max_duration_seconds": max_duration_seconds,
                 "allowed_extractors": ["youtube", "vimeo"],
             })
             metadata = meta_res.data.get("metadata", {}) if meta_res.success else {}
+            if not meta_res.success:
+                raise MediaIngestionError(meta_res.error or metadata.get("error") or "Metadata extraction failed.")
             if metadata.get("error"):
-                logger.warning("Metadata extraction warning: %s", metadata.get("error"))
+                raise MediaIngestionError(str(metadata["error"]))
 
             duration = float(metadata.get("duration") or 0.0)
             if duration <= 0 or duration > max_duration_seconds:
@@ -391,6 +414,7 @@ class URLIntakeAdapter:
                 "format": "video",
                 "max_resolution": preferred_quality,
                 "max_duration_seconds": max_duration_seconds,
+                "max_file_size_bytes": max_file_size_bytes,
                 "allowed_extractors": ["youtube", "vimeo"],
             }
             for attempt in range(3):
@@ -414,6 +438,8 @@ class URLIntakeAdapter:
                     source_url=validated_url,
                     error="Download succeeded but no video file was produced.",
                 )
+            if Path(raw_video_path).stat().st_size > max_file_size_bytes:
+                raise MediaIngestionError(f"Downloaded video exceeds max_file_size_bytes={max_file_size_bytes}.")
 
             # 4. Normalize & Remux Video to standard MP4
             staging_video_mp4 = staging_dir / "source_video.mp4"
@@ -454,6 +480,11 @@ class URLIntakeAdapter:
                             has_native_captions = True
                     except Exception as e:
                         logger.warning("Transcript fetching failed: %s", e)
+
+            # yt-dlp performs its own redirects and socket resolution. This
+            # application preflight blocks known non-global DNS answers but
+            # cannot bind later connections to those answers; run remote intake
+            # inside an OS-level network sandbox for adversarial sources.
 
             # 7. Extract Final Technical Metadata via FFprobe
             video_probe = self.probe_media_file(staging_video_mp4)
@@ -526,7 +557,7 @@ class URLIntakeAdapter:
                 "proxy_video_path": str(source_dir / proxy_path.name) if proxy_path else None,
             }
 
-            tmp_manifest = final_manifest.with_suffix(".json.tmp")
+            tmp_manifest = staging_dir / "source_manifest.json.tmp"
             with open(tmp_manifest, "w", encoding="utf-8") as f:
                 json.dump(manifest_payload, f, indent=2)
             self._commit_bundle({
@@ -566,6 +597,109 @@ class URLIntakeAdapter:
         finally:
             if staging_dir.exists():
                 shutil.rmtree(staging_dir, ignore_errors=True)
+
+    def ingest_local_file(
+        self, local_path: str | Path, project_id: str, *, transcript_path: str | Path | None = None,
+        max_duration_seconds: int = 3600, max_file_size_bytes: int = 2 * 1024**3,
+    ) -> URLIngestResult:
+        """Normalize a local media file into the same atomic source bundle."""
+        self.validate_project_id(project_id)
+        source = Path(local_path).expanduser().resolve()
+        if not source.is_file():
+            raise MediaIngestionError(f"Local media file not found: {source}")
+        if (isinstance(max_file_size_bytes, bool) or not isinstance(max_file_size_bytes, int)
+                or max_file_size_bytes <= 0):
+            raise ValueError("max_file_size_bytes must be a positive integer")
+        if (isinstance(max_duration_seconds, bool) or not isinstance(max_duration_seconds, int)
+                or max_duration_seconds <= 0):
+            raise ValueError("max_duration_seconds must be a positive integer")
+        if source.stat().st_size > max_file_size_bytes:
+            raise MediaIngestionError(f"Local media exceeds max_file_size_bytes={max_file_size_bytes}.")
+        probe = self.probe_media_file(source)
+        streams = probe.get("streams", [])
+        video_stream = next((item for item in streams if item.get("codec_type") == "video"), None)
+        if video_stream is None:
+            raise MediaIngestionError("Local media contains no video stream.")
+        try:
+            duration = float(probe.get("format", {}).get("duration") or video_stream.get("duration") or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        if not math.isfinite(duration) or duration <= 0 or duration > max_duration_seconds:
+            raise MediaIngestionError(f"Local media duration ({duration}s) is unknown or exceeds max_duration_seconds={max_duration_seconds}.")
+
+        source_dir = self.projects_dir / project_id / "source"
+        staging_dir = source_dir / f".staging_{uuid.uuid4().hex[:8]}"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            staged_video = staging_dir / "source_video.mp4"
+            self.ensure_valid_mp4(source, staged_video)
+            staged_audio = staging_dir / "source_audio.wav"
+            self.extract_audio_fallback(staged_video, staged_audio)
+            codec = str(video_stream.get("codec_name") or "unknown")
+            staged_proxy = None
+            if codec != "h264":
+                staged_proxy = staging_dir / "source_video_h264.mp4"
+                process = subprocess.run([
+                    "ffmpeg", "-y", "-i", str(staged_video), "-c:v", "libx264", "-preset", "fast",
+                    "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(staged_proxy),
+                ], capture_output=True, text=True, timeout=600)
+                if process.returncode != 0 or not staged_proxy.is_file():
+                    raise MediaIngestionError(f"H.264 editing proxy creation failed: {process.stderr}")
+
+            sidecar = Path(transcript_path).expanduser() if transcript_path else next(
+                (source.with_suffix(suffix) for suffix in (".json", ".srt", ".vtt") if source.with_suffix(suffix).is_file()), None
+            )
+            staged_transcript = None
+            transcript_suffix = None
+            if sidecar and sidecar.is_file():
+                transcript_suffix = sidecar.suffix.lower()
+                if transcript_suffix not in {".json", ".srt", ".vtt"}:
+                    raise MediaIngestionError("Transcript sidecar must be .json, .srt, or .vtt.")
+                if transcript_suffix == ".json":
+                    json.loads(sidecar.read_text(encoding="utf-8"))
+                staged_transcript = staging_dir / f"transcript{transcript_suffix}"
+                shutil.copy2(sidecar, staged_transcript)
+
+            final_video = source_dir / "source_video.mp4"
+            final_audio = source_dir / "source_audio.wav"
+            final_transcript = source_dir / f"transcript{transcript_suffix}" if staged_transcript else None
+            final_manifest = source_dir / "source_manifest.json"
+            final_proxy = source_dir / "source_video_h264.mp4"
+            video_probe = self.probe_media_file(staged_video)
+            audio_probe = self.probe_media_file(staged_audio)
+            audio_stream = next((item for item in audio_probe.get("streams", []) if item.get("codec_type") == "audio"), {})
+            acquired = datetime.now(timezone.utc).isoformat()
+            manifest = {
+                "version": "1.0", "project_id": project_id, "source_url": source.as_uri(),
+                "acquired_at": acquired, "duration_seconds": duration,
+                "resolution": [int(video_stream.get("width") or 0), int(video_stream.get("height") or 0)],
+                "fps": video_stream.get("r_frame_rate", "0/1"), "video_codec": codec,
+                "audio_codec": audio_stream.get("codec_name", "pcm_s16le"), "sample_rate": 16000,
+                "channels": 1, "file_size_bytes": staged_video.stat().st_size,
+                "has_native_captions": bool(staged_transcript), "video_path": str(final_video),
+                "audio_path": str(final_audio), "transcript_path": str(final_transcript) if final_transcript else None,
+                "metadata": {"source_filename": source.name}, "pipeline_type": self.pipeline_type,
+                "master_video_path": str(final_video), "proxy_video_path": str(final_proxy) if staged_proxy else None,
+            }
+            staged_manifest = staging_dir / "source_manifest.json.tmp"
+            staged_manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._commit_bundle({
+                final_video: staged_video, final_audio: staged_audio, final_proxy: staged_proxy,
+                source_dir / "transcript.json": staged_transcript if transcript_suffix == ".json" else None,
+                source_dir / "transcript.srt": staged_transcript if transcript_suffix == ".srt" else None,
+                source_dir / "transcript.vtt": staged_transcript if transcript_suffix == ".vtt" else None,
+                final_manifest: staged_manifest,
+            })
+            return URLIngestResult(
+                success=True, project_id=project_id, source_url=source.as_uri(), video_path=str(final_video),
+                audio_path=str(final_audio), transcript_path=str(final_transcript) if final_transcript else None,
+                manifest_path=str(final_manifest), has_native_captions=bool(staged_transcript),
+                duration_seconds=duration, resolution=(int(video_stream.get("width") or 0), int(video_stream.get("height") or 0)),
+                video_codec=codec, audio_codec=audio_stream.get("codec_name", "pcm_s16le"),
+                file_size_bytes=final_video.stat().st_size, acquired_at=acquired,
+            )
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
     def review_ingested_media(
         self, ingest_result: URLIngestResult, tool_registry: Any = None

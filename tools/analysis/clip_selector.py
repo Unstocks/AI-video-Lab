@@ -7,6 +7,7 @@ import math
 import os
 import re
 import tempfile
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional, Sequence
@@ -267,13 +268,14 @@ class ClipSelector(BaseTool):
     capabilities = ["clip_selection", "hook_validation", "cold_viewer_audit", "clip_deduplication"]
     input_schema = {
         "type": "object",
-        "required": ["project_id", "source_media_ref", "transcript", "candidates"],
+        "required": ["project_id", "source_media_ref", "transcript"],
         "properties": {
             "project_id": {"type": "string", "pattern": "^[a-zA-Z0-9_-]+$"},
             "source_media_ref": {"type": "string", "minLength": 1},
             "transcript": {"oneOf": [{"type": "object"}, {"type": "string"}]},
             "transcript_format": {"type": "string", "enum": ["youtube", "whisper", "srt", "vtt", "raw_document"], "default": "youtube"},
             "candidates": {"type": "array", "items": {"type": "object"}},
+            "discover_windows": {"type": "boolean", "default": False},
             "title": {"type": "string"}, "audio_path": {"type": "string"},
             "video_path": {"type": "string"}, "output_dir": {"type": "string"},
             "max_clips": {"type": "integer", "minimum": 0},
@@ -299,6 +301,7 @@ class ClipSelector(BaseTool):
             "provisional_script": {"type": ["object", "null"]},
             "plan": {"type": "object"}, "plan_sha256": {"type": "string"},
             "warnings": {"type": "array", "items": {"type": "string"}},
+            "candidate_window_seeds": {"type": "array", "items": {"type": "object"}},
             "surplus_count": {"type": "integer", "minimum": 0},
             "duplicate_count": {"type": "integer", "minimum": 0},
         },
@@ -327,13 +330,23 @@ class ClipSelector(BaseTool):
                 raw_transcript = RawTranscriptDocument.model_validate(raw_transcript)
             normalized = normalizer.ingest_and_normalize(raw_transcript, transcript_format)
             topology = ConversationStructureAnalyzer().analyze(normalized)
-            proposals = tuple(_proposal(item) for item in inputs["candidates"])
+            raw_candidates = inputs.get("candidates", [])
+            if not isinstance(raw_candidates, list):
+                raise ValueError("candidates must be an array")
 
             acoustic_profile = None
             audio_path = inputs.get("audio_path") or inputs.get("video_path")
             video_path = inputs.get("video_path")
             if audio_path:
                 acoustic_profile = AcousticProfiler().profile(audio_path, video_path=video_path)
+
+            discover = bool(inputs.get("discover_windows", False)) or not raw_candidates
+            window_seeds = (ConversationStructureAnalyzer().propose_candidate_windows(
+                normalized, topology, acoustic_profile,
+                min_duration_seconds=inputs.get("min_duration_seconds", 15.0),
+                max_duration_seconds=inputs.get("max_duration_seconds", 90.0),
+            ) if discover else ())
+            proposals = tuple(_proposal(item) for item in raw_candidates)
 
             max_duration = inputs.get("max_duration_seconds", 120.0)
             preferred_max_duration = inputs.get("preferred_max_duration_seconds", min(90.0, max_duration))
@@ -397,6 +410,7 @@ class ClipSelector(BaseTool):
                 "plan": plan_data,
                 "plan_sha256": plan_sha256,
                 "warnings": warnings,
+                "candidate_window_seeds": [asdict(seed) for seed in window_seeds],
             }
             return ToolResult(success=True, data=data, artifacts=artifacts)
         except (ValueError, TypeError, KeyError, PydanticValidationError,

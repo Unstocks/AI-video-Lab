@@ -117,15 +117,20 @@ def pytest_configure(config):
         "live_api: test performs a real, billable API call. Skipped unless "
         f"{_ALLOW_ENV_FLAG}=1 is set.",
     )
+    config.addinivalue_line(
+        "markers",
+        "network: test requires external network access. Skipped unless "
+        f"{_ALLOW_ENV_FLAG}=1 is set.",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
-    """Skip live_api tests unless the operator explicitly opted in."""
+    """Skip network and live_api tests unless the operator explicitly opts in."""
     if _network_allowed():
         return
     skip = pytest.mark.skip(
         reason=f"live API test — costs money; set {_ALLOW_ENV_FLAG}=1 to run"
     )
     for item in items:
-        if "live_api" in item.keywords:
+        if "live_api" in item.keywords or "network" in item.keywords:
             item.add_marker(skip)

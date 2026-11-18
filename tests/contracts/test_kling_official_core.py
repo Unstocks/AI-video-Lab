@@ -193,9 +193,9 @@ def test_turbo_create_and_poll_parse_result_paths(monkeypatch):
 def test_schema_snapshot_contains_phase1_contract_fields():
     fixture = PROJECT_ROOT / "tests/fixtures/kling_official/schema_snapshot.json"
     data = json.loads(fixture.read_text())
-    assert data["build_id"] == "97939672"
-    assert "index-0m3slU3p.js" in data["chunk_names"]
-    assert "document-navigation-Dk7H_V3n.js" in data["chunk_names"]
+    assert data["build_id"] == "109802701"
+    assert "index-C61xwMtA.js" in data["chunk_names"]
+    assert "DocumentNavigation-DUU7TRpt.js" in data["chunk_names"]
     assert data["api_base"]["auth_env"] == "KLING_API_KEY"
     assert data["task_statuses"]["classic"] == ["submitted", "processing", "succeed", "failed"]
     assert data["task_statuses"]["turbo"] == ["submitted", "processing", "succeeded", "failed"]
@@ -215,6 +215,7 @@ def test_schema_snapshot_contains_phase1_contract_fields():
     assert data["core_field_enums"]["avatar_mode"] == ["std", "pro"]
 
 
+@pytest.mark.network
 def test_optional_live_doc_snapshot_check():
     if os.environ.get("RUN_KLING_DOC_LIVE_CHECK") != "1":
         pytest.skip("Set RUN_KLING_DOC_LIVE_CHECK=1 to compare fixture against current Kling docs HTML.")

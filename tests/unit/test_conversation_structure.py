@@ -85,3 +85,18 @@ def test_containing_block_uses_maximum_overlap_and_requires_intersection():
     ])
     assert t.get_containing_block(3, 11).block_id == 0  # equal overlap, earlier block wins
     assert t.get_containing_block(8, 9) is None
+
+
+def test_candidate_window_proposals_cover_qa_and_monologue_arcs():
+    doc = RawTranscriptDocument(segments=(
+        RawTranscriptSegment(segment_id=0, speaker="host", text="How did the team change the product?", start_seconds=0, end_seconds=5),
+        RawTranscriptSegment(segment_id=1, speaker="guest", text="We interviewed customers, simplified setup, and measured activation every week.", start_seconds=6, end_seconds=22),
+        RawTranscriptSegment(segment_id=2, speaker="solo", text="Later I learned to write down the question before opening the data dashboard.", start_seconds=32, end_seconds=55),
+    ))
+    normalized = TranscriptNormalizer().normalize(doc)
+    analyzer = ConversationStructureAnalyzer()
+    result = analyzer.analyze(normalized)
+    seeds = analyzer.propose_candidate_windows(normalized, result, min_duration_seconds=15, max_duration_seconds=90)
+    assert {seed.source_kind for seed in seeds} == {"qa_pair", "monologue_arc"}
+    assert all(seed.transcript_revision_id == result.transcript_revision_id for seed in seeds)
+    assert all(15 <= seed.end_seconds - seed.start_seconds <= 90 for seed in seeds)

@@ -52,6 +52,16 @@ def test_explicit_editorial_framing_allows_anaphoric_opening():
     assert result.passed and result.audit.pronouns_resolved
 
 
+def test_trivial_editorial_framing_does_not_bypass_structural_check():
+    result = ColdViewerAuditor().audit(
+        spoken_opening="That's why he quit the company.",
+        original_spoken_dialogue="That's why he quit the company.",
+        start_seconds=3, end_seconds=20, proposed_audit=audit(), editorial_framing="cool",
+    )
+    assert not result.passed
+    assert result.audit.pronouns_resolved is False
+
+
 def test_mid_answer_fragment_requires_triggering_question():
     result = ColdViewerAuditor().audit(
         spoken_opening="Yes, because we burned through our runway.",

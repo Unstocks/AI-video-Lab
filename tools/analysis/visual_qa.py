@@ -39,6 +39,7 @@ class VisualQA(BaseTool):
     dependencies = ["cmd:ffmpeg", "cmd:ffprobe"]
     install_instructions = "Install FFmpeg: https://ffmpeg.org/download.html"
     agent_skills = ["ffmpeg"]
+    not_good_for = ["clip-factory production authorization or final_review.json; use media_qa for deterministic post-render QA"]
 
     capabilities = [
         "extract_review_frames",

@@ -732,7 +732,6 @@ def test_coverr_requests_download_urls_and_reads_max_dimensions(monkeypatch):
 
 def _mixkit_json_ld_search(monkeypatch, extra_fields=""):
     # Mixkit's current markup has no result cards, only schema.org JSON-LD.
-    pytest.importorskip("bs4")
     html = """<html><head><script type="application/ld+json">
     {"@graph": [
       {"@type": "BreadcrumbList"},

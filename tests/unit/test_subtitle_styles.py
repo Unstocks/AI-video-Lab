@@ -139,6 +139,21 @@ def test_legacy_ass_output_is_unchanged_when_style_preset_omitted(tmp_path):
     assert "style_preset" not in result.data
 
 
+def test_subtitle_gen_warns_for_unavailable_font_and_estimated_overflow(tmp_path):
+    fonts = tmp_path / "empty-fonts"
+    fonts.mkdir()
+    result = SubtitleGen().execute({
+        "segments": [{"text": "This deliberately long subtitle line should overflow", "start": 0, "end": 2}],
+        "format": "ass", "output_path": str(tmp_path / "overflow.ass"),
+        "font_name": "Font That Does Not Exist", "fonts_dir": str(fonts),
+        "font_size": 40, "play_res_x": 200, "margin_l": 0, "margin_r": 0,
+    })
+    assert result.success, result.error
+    warnings = result.data["warnings"]
+    assert any("estimated subtitle line width exceeds" in warning for warning in warnings)
+    assert any("Font That Does Not Exist" in warning and "not found" in warning for warning in warnings)
+
+
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg/ffprobe required")
 def test_real_vertical_composer_burns_preset_and_fontsdir(tmp_path, monkeypatch):
     source = tmp_path / "wide.mp4"
@@ -175,8 +190,7 @@ def test_real_vertical_composer_burns_preset_and_fontsdir(tmp_path, monkeypatch)
     assert result.success, result.error
     assert Path(result.output_video_path).is_file()
     vf = next(command[index + 1] for command in observed_commands for index, value in enumerate(command) if value == "-vf")
-    assert "fontsdir=" in vf
-    assert "\\:" in vf
+    assert f"fontsdir='{VerticalClipComposer._escape_filter_path(fonts)}'" in vf
     ass_text = Path(result.subtitle_path).read_text(encoding="utf-8")
     assert r"\fscx118" in ass_text
     probe = json.loads(subprocess.run(
@@ -185,3 +199,8 @@ def test_real_vertical_composer_burns_preset_and_fontsdir(tmp_path, monkeypatch)
     ).stdout)
     video = next(stream for stream in probe["streams"] if stream["codec_type"] == "video")
     assert (video["width"], video["height"], video["codec_name"], video["pix_fmt"]) == (1080, 1920, "h264", "yuv420p")
+
+
+def test_vertical_composer_filter_path_escapes_windows_drive_and_filter_delimiters(monkeypatch):
+    monkeypatch.setattr(Path, "resolve", lambda self: Path("C:/tmp/my,fonts'dir"))
+    assert VerticalClipComposer._escape_filter_path(Path("ignored")) == r"C\:/tmp/my\,fonts\'dir"

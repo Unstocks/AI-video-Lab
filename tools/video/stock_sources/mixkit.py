@@ -107,21 +107,20 @@ class MixkitSource:
     provider = "envato"
     priority = 19
     install_instructions = (
-        "Mixkit works without an API key. Scrapes the Mixkit website. "
-        "Requires beautifulsoup4: pip install beautifulsoup4"
+        "Mixkit works without an API key. Structured JSON-LD results use the "
+        "standard library; beautifulsoup4 enables legacy card markup parsing."
     )
     supports = {"video": True, "image": False}
 
     def is_available(self) -> bool:
         try:
-            import bs4  # noqa: F401
+            import requests  # noqa: F401
             return True
         except ImportError:
             return False
 
     def search(self, query: str, filters: SearchFilters) -> list[Candidate]:
         import requests
-        from bs4 import BeautifulSoup
 
         kind = (filters.kind or "video").lower()
         if kind == "image":
@@ -143,6 +142,12 @@ class MixkitSource:
             # transport failure has to propagate. See `base.StockSource`.
             _log.warning("Mixkit search failed: %s", e)
             raise
+
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            # Structured metadata remains usable without the optional parser.
+            return self._parse_json_ld(r.text, query, filters)
 
         soup = BeautifulSoup(r.text, "html.parser")
         out: list[Candidate] = []
@@ -208,26 +213,26 @@ class MixkitSource:
             )
 
         if not out:
-            out = self._parse_json_ld(soup, query, filters)
+            out = self._parse_json_ld(r.text, query, filters)
         return out
 
-    def _parse_json_ld(self, soup, query: str, filters: SearchFilters) -> list[Candidate]:
+    def _parse_json_ld(self, html: str, query: str, filters: SearchFilters) -> list[Candidate]:
         """Read results from the page's schema.org VideoObject entries.
 
         Mixkit's current markup no longer exposes the card classes above, but
         every result is still described in JSON-LD with a direct contentUrl.
         """
-        import json
-
         out: list[Candidate] = []
-        for script in soup.select('script[type="application/ld+json"]'):
+        for block in _JSON_LD_RE.findall(html):
             try:
-                data = json.loads(script.string or "")
+                data = json.loads(block)
             except (ValueError, TypeError):
                 continue
             nodes = data.get("@graph", [data]) if isinstance(data, dict) else data
             for node in nodes if isinstance(nodes, list) else []:
-                if not isinstance(node, dict) or node.get("@type") != "VideoObject":
+                node_types = node.get("@type", []) if isinstance(node, dict) else []
+                node_types = node_types if isinstance(node_types, list) else [node_types]
+                if not isinstance(node, dict) or "VideoObject" not in node_types:
                     continue
                 content_url = node.get("contentUrl") or ""
                 if not content_url.lower().endswith(".mp4"):

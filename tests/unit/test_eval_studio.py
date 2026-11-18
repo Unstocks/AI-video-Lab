@@ -161,6 +161,36 @@ def test_zero_denominators_and_unrated_dimensions_remain_none():
     assert all(value is None for value in metrics.dimension_averages.values())
 
 
+def test_fabricated_dialogue_and_hook_fail_transcript_span_verification():
+    fixture, plan = _selector_fixture_and_plan()
+    candidates = []
+    for candidate in plan.candidates:
+        if candidate.candidate_id == "good":
+            fake_hook = candidate.spoken_hook.model_copy(update={"text": "Invented evidence that is absent."})
+            candidate = candidate.model_copy(update={
+                "original_spoken_dialogue": "Invented evidence that is absent.", "spoken_hook": fake_hook,
+            })
+        candidates.append(candidate)
+    forged_plan = plan.model_copy(update={"candidates": tuple(candidates)})
+    metrics = GoldenDatasetEvaluator().evaluate_episode(fixture, forged_plan)
+    assert metrics.hook_integrity_rate == 0.0
+    assert metrics.gold_hook_match_rate == 0.0
+
+
+def test_synthetic_golden_podcast_pack_loads_and_evaluates_all_archetypes():
+    from pathlib import Path
+
+    root = Path(__file__).parents[1] / "eval" / "golden_podcasts"
+    fixtures = tuple(GoldenDatasetEvaluator.load_fixture(path) for path in sorted(root.glob("*.json")))
+    assert len(fixtures) == 5
+    plans = {fixture.episode_id: _empty_plan(fixture.episode_id) for fixture in fixtures}
+    report = GoldenDatasetEvaluator().evaluate_suite(fixtures, plans, run_id="synthetic-pack", generated_at="2026-11-18T00:00:00Z")
+    assert report.episode_count == 5
+    assert {metric.archetype for metric in report.episode_metrics} == set(PODCAST_ARCHETYPES) - {
+        "solo_monologue", "personal_narrative", "comedy_banter"
+    } | {"comedy_banter"}
+
+
 def test_suite_aggregation_atomic_json_markdown_and_ab_report_diff(tmp_path):
     fixture, selected_plan = _selector_fixture_and_plan()
     empty_fixture = GoldenEpisodeFixture(

@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from lib.media_profiles import YOUTUBE_SHORTS
+from lib.vertical_composer import VerticalClipComposer, VerticalRenderConfig
+from tools.base_tool import ToolResult
 from tools.subtitle.subtitle_gen import SubtitleGen, rebase_segments_to_clip
 from tools.video.auto_reframe import AutoReframe
 
@@ -117,7 +119,8 @@ def test_ass_text_escaping_and_karaoke_guard(tmp_path):
     })
     assert result.success, result.error
     assert result.data["effective_highlight_style"] == "none"
-    assert result.data["warnings"] == ["highlight_style downgraded to 'none': word-level timestamps unavailable"]
+    assert "highlight_style downgraded to 'none': word-level timestamps unavailable" in result.data["warnings"]
+    assert any("font 'Noto Sans Devanagari' was not found" in warning for warning in result.data["warnings"])
     content = output.read_text(encoding="utf-8")
     assert r"\{tag\}" in content and r"\\ literal\Nदूसरी पंक्ति" in content
 
@@ -198,3 +201,79 @@ def test_dynamic_crop_uses_track_timestamps_and_cleans_sendcmd_workspace(tmp_pat
     assert result.data["method"] == "face_tracked"
     assert output.is_file()
     assert not list(tmp_path.glob(".reframe-*"))
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg required")
+def test_vertical_composer_converts_vfr_input_to_cfr(tmp_path, monkeypatch):
+    source = tmp_path / "variable-rate.mp4"
+    _run([
+        "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+        "testsrc2=size=320x180:rate=30:duration=2",
+        "-vf", "select='eq(n,0)+eq(n,1)+eq(n,4)+eq(n,5)+eq(n,10)+eq(n,20)+eq(n,30)+eq(n,40)'",
+        "-fps_mode", "vfr", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ])
+    original_run = VerticalClipComposer._run_ffmpeg
+    commands = []
+
+    def observe(command, *, timeout):
+        commands.append(list(command))
+        return original_run(command, timeout=timeout)
+
+    monkeypatch.setattr(VerticalClipComposer, "_run_ffmpeg", staticmethod(observe))
+    result = VerticalClipComposer().render_clip(
+        candidate_id="cfr", source_video_path=source, start_seconds=0, end_seconds=1.3,
+        output_dir=tmp_path / "cfr", transcript_segments=[{"text": "Convert variable frame timing", "start": 0, "duration": 1.2}],
+        config=VerticalRenderConfig(subtitle_format="srt", burn_subtitles=True),
+    )
+    assert result.success, result.error
+    assert any("-fps_mode" in command and command[command.index("-fps_mode") + 1] == "cfr" for command in commands)
+    assert Path(result.output_video_path).is_file()
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg required")
+def test_vertical_composer_nvenc_failure_retries_with_libx264(tmp_path, monkeypatch):
+    source = tmp_path / "source.mp4"
+    _run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+          "testsrc2=size=320x180:rate=10:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)])
+    original_execute = AutoReframe.execute
+    codecs = []
+
+    def fail_nvenc(self, inputs):
+        codecs.append(inputs.get("codec"))
+        if inputs.get("codec") == "h264_nvenc":
+            return ToolResult(success=False, error="synthetic NVENC unavailable")
+        return original_execute(self, inputs)
+
+    monkeypatch.setattr(AutoReframe, "execute", fail_nvenc)
+    result = VerticalClipComposer().render_clip(
+        candidate_id="nvenc-fallback", source_video_path=source, start_seconds=0, end_seconds=1,
+        output_dir=tmp_path / "fallback", config=VerticalRenderConfig(codec="h264_nvenc", burn_subtitles=False),
+    )
+    assert result.success, result.error
+    assert codecs == ["h264_nvenc", "libx264"]
+    assert any("h264_nvenc failed during reframing" in warning for warning in result.warnings)
+    video = next(stream for stream in _probe(Path(result.output_video_path)) if stream["codec_type"] == "video")
+    assert (video["codec_name"], video["pix_fmt"]) == ("h264", "yuv420p")
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg required")
+def test_vertical_composer_render_failure_leaves_no_orphan_files(tmp_path, monkeypatch):
+    source = tmp_path / "source.mp4"
+    _run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+          "testsrc2=size=320x180:rate=10:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)])
+    output_dir = tmp_path / "failed-render"
+
+    def fail_burn(_command, *, timeout):
+        raise RuntimeError("synthetic subtitle burn failure")
+
+    monkeypatch.setattr(VerticalClipComposer, "_run_ffmpeg", staticmethod(fail_burn))
+    result = VerticalClipComposer().render_clip(
+        candidate_id="no-orphans", source_video_path=source, start_seconds=0, end_seconds=1,
+        output_dir=output_dir, transcript_segments=[{"text": "Caption text", "start": 0, "duration": 1}],
+        config=VerticalRenderConfig(subtitle_format="srt", burn_subtitles=True),
+    )
+    assert not result.success and "synthetic subtitle burn failure" in result.error
+    assert not list(output_dir.glob("*.mp4"))
+    assert not list(output_dir.glob("*.ass"))
+    assert not list(output_dir.glob("*.srt"))
+    assert not list(output_dir.glob(".*"))

@@ -44,7 +44,18 @@ def lexical_similarity(text_a: str, text_b: str) -> float:
     if not tokens_a and not tokens_b:
         return 0.0
     union = tokens_a | tokens_b
-    return len(tokens_a & tokens_b) / len(union) if union else 0.0
+    token_score = len(tokens_a & tokens_b) / len(union) if union else 0.0
+    # Compact whitespace for character shingles so spelling variants that
+    # insert/remove a token boundary ("onboarding" / "on boarding") retain
+    # their shared character evidence. Word-token Jaccard above still captures
+    # the lexical boundary difference independently.
+    normalized_a = "".join(_TOKENS.findall(text_a.casefold()))
+    normalized_b = "".join(_TOKENS.findall(text_b.casefold()))
+    grams_a = {normalized_a[index:index + 4] for index in range(max(0, len(normalized_a) - 3))}
+    grams_b = {normalized_b[index:index + 4] for index in range(max(0, len(normalized_b) - 3))}
+    char_union = grams_a | grams_b
+    char_score = len(grams_a & grams_b) / len(char_union) if char_union else 0.0
+    return max(token_score, 0.85 * char_score)
 
 
 class ClipDeduplicator:

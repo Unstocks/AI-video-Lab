@@ -235,8 +235,8 @@ class TestDiagramGenUnit:
     @pytest.fixture
     def has_deps(self):
         tool = DiagramGen()
-        if tool.get_status() != ToolStatus.AVAILABLE:
-            pytest.skip("No diagram renderer available")
+        if not tool._has_pillow():
+            pytest.skip("Pillow is required for the deterministic diagram fallback")
 
     def test_render_box_diagram(self, has_deps, tmp_path):
         tool = DiagramGen()
@@ -262,9 +262,13 @@ class TestDiagramGenUnit:
     def test_render_mermaid_fallback(self, has_deps, tmp_path):
         """If mmdc not installed, falls back to text card."""
         tool = DiagramGen()
+        tool._has_mermaid = lambda: False
         r = tool.execute({
             "diagram_type": "mermaid",
             "definition": "graph TD\n  A[Start] --> B[End]",
+            "allow_text_fallback": True,
             "output_path": str(tmp_path / "mermaid.png"),
         })
         assert r.success
+        assert r.data["method"] == "text_card"
+        assert Path(r.data["output"]).is_file()

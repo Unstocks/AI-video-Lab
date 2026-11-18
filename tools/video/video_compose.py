@@ -34,6 +34,7 @@ import contextlib
 import json
 import hashlib
 import logging
+import math
 import secrets
 import shutil
 import subprocess
@@ -429,6 +430,17 @@ class VideoCompose(BaseTool):
         if not audio.is_file():
             return ToolResult(success=False, error=f"Mixed audio not found: {audio}")
 
+        try:
+            probe = self.run_command([
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=nw=1:nk=1", str(video_path),
+            ], timeout=10)
+            video_duration = float(probe.stdout.strip())
+            if not math.isfinite(video_duration) or video_duration <= 0:
+                raise ValueError("source video duration is not a positive finite number")
+        except Exception as exc:
+            return ToolResult(success=False, error=f"Could not determine video duration for audio mux: {exc}")
+
         temp_output = video_path.with_name(
             f".{video_path.stem}.audio-mux-{time.time_ns()}{video_path.suffix}"
         )
@@ -442,11 +454,16 @@ class VideoCompose(BaseTool):
                 "-c:v", "copy",
                 "-c:a", "aac",
                 "-b:a", "192k",
-                "-af", "apad",
+                # `apad` without a bound is infinite; paired with `-shortest`
+                # it can keep muxing forever when a copied video stream does
+                # not signal EOF as expected. Bound padding and the output to
+                # the probed master duration.
+                "-af", f"apad=pad_dur={video_duration:.6f}",
                 "-shortest",
+                "-t", f"{video_duration:.6f}",
                 "-movflags", "+faststart",
                 str(temp_output),
-            ])
+            ], timeout=max(30, int(video_duration * 2 + 15)))
             if not temp_output.is_file():
                 return ToolResult(
                     success=False,

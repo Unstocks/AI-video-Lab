@@ -96,6 +96,10 @@ def test_real_checkpoint_backlot_and_clip_selector_human_gate(tmp_path):
         write_checkpoint(pipeline_dir, project_id, "script", "completed",
                          {"script": provisional, "clip_selection_plan": plan},
                          pipeline_type="clip-factory", human_approved=False)
+    with pytest.raises(CheckpointValidationError, match="approved, synchronized"):
+        write_checkpoint(pipeline_dir, project_id, "script", "completed",
+                         {"script": provisional, "clip_selection_plan": plan},
+                         pipeline_type="clip-factory", human_approved=True)
 
     board = load_board_state(project_dir)
     assert board["artifacts"]["clip_selection_plan"]["version"] == "1.0"

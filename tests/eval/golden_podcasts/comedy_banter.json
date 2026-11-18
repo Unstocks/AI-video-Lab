@@ -1,0 +1,10 @@
+{
+  "episode_id": "gold-comedy-banter",
+  "title": "Synthetic comedy banter",
+  "archetype": "comedy_banter",
+  "languages": ["en"],
+  "transcript_format": "youtube",
+  "transcript": {"transcript": [{"text": "I bought a smart coffee machine, and it sent me a software update before my first cup.", "start": 0, "duration": 26}]},
+  "gold_clips": [{"gold_id": "comedy-gold", "start_seconds": 0, "end_seconds": 26, "archetype": "comedy_banter", "expected_hook_substring": "smart coffee machine"}],
+  "trap_moments": [{"trap_id": "comedy-duplicate", "start_seconds": 0, "end_seconds": 26, "trap_reason": "Same anecdote repeated in the episode", "expected_failure_gate": "duplicate"}]
+}

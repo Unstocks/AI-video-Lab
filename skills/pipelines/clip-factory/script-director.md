@@ -2,7 +2,7 @@
 
 ## Purpose and contracts
 
-This stage turns the source transcript into an evidence-backed candidate dossier and a script view. Read and emit both `schemas/artifacts/clip_selection_plan.schema.json` and `schemas/artifacts/script.schema.json`. Use `transcriber`, `clip_selector`, and the available `scene_detect`, `silence_cutter`, and `audio_energy` tools as appropriate.
+This stage turns the source transcript into an evidence-backed candidate dossier and a script view. Read and emit both `schemas/artifacts/clip_selection_plan.schema.json` and `schemas/artifacts/script.schema.json`. Prefer native source captions through `transcript_fetcher`; `transcriber` is optional when native captions are absent. If neither source captions nor an available local STT provider exists, surface a structured blocker instead of inventing dialogue or timestamps. Use `clip_selector` and available `scene_detect`, `silence_cutter`, and `audio_energy` tools as appropriate.
 
 The `clip_selection_plan` is the authoritative editorial record. The `script` is a downstream-facing projection whose metadata must carry the plan SHA-256 and transcript revision. Never invent timestamps, hook wording, evidence, or candidate quality to meet a requested clip count.
 
