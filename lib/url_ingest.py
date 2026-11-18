@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+from lib import ssrf_guard
 from tools.tool_registry import registry
 
 logger = logging.getLogger(__name__)
@@ -356,6 +357,9 @@ class URLIntakeAdapter:
         project_id: str,
         *,
         max_duration_seconds: int = 3600,
+        min_duration_seconds: int = 0,
+        min_quality_height: int = 0,
+        strict_quality_gate: bool = False,
         max_file_size_bytes: int = 2 * 1024**3,
         preferred_quality: str = "720p",
         extract_transcript: bool = True,
@@ -381,14 +385,15 @@ class URLIntakeAdapter:
         staging_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            # 1. Preflight Metadata Inspection
-            meta_res = video_downloader.execute({
-                "url": validated_url,
-                "output_dir": str(staging_dir),
-                "format": "metadata_only",
-                "max_duration_seconds": max_duration_seconds,
-                "allowed_extractors": ["youtube", "vimeo"],
-            })
+            # 1. Preflight Metadata Inspection (inside connect-time SSRF guard)
+            with ssrf_guard.guarded():
+                meta_res = video_downloader.execute({
+                    "url": validated_url,
+                    "output_dir": str(staging_dir),
+                    "format": "metadata_only",
+                    "max_duration_seconds": max_duration_seconds,
+                    "allowed_extractors": ["youtube", "vimeo"],
+                })
             metadata = meta_res.data.get("metadata", {}) if meta_res.success else {}
             if not meta_res.success:
                 raise MediaIngestionError(meta_res.error or metadata.get("error") or "Metadata extraction failed.")
@@ -403,11 +408,36 @@ class URLIntakeAdapter:
                     source_url=validated_url,
                     error=f"Video metadata duration ({duration}s) is unknown or exceeds max limit ({max_duration_seconds}s).",
                 )
+            if min_duration_seconds > 0 and duration < min_duration_seconds:
+                return URLIngestResult(
+                    success=False,
+                    project_id=project_id,
+                    source_url=validated_url,
+                    error=(
+                        f"Video duration ({duration:.1f}s) is shorter than "
+                        f"min_duration_seconds ({min_duration_seconds}s)."
+                    ),
+                )
+
+            max_avail_h = int(metadata.get("max_available_height") or 0)
+            if min_quality_height > 0 and 0 < max_avail_h < min_quality_height:
+                msg = (
+                    f"Source max available height ({max_avail_h}p) is below "
+                    f"min_quality_height ({min_quality_height}p)."
+                )
+                if strict_quality_gate:
+                    return URLIngestResult(
+                        success=False,
+                        project_id=project_id,
+                        source_url=validated_url,
+                        error=msg,
+                    )
+                logger.warning(msg)
 
             # 2. Check Disk Space Headroom
             self.check_disk_headroom(source_dir, estimated_duration_seconds=duration or 600.0)
 
-            # 3. Download Source Media via video_downloader
+            # 3. Download Source Media via video_downloader (connect-time SSRF guarded)
             dl_inputs = {
                 "url": validated_url,
                 "output_dir": str(staging_dir),
@@ -418,7 +448,8 @@ class URLIntakeAdapter:
                 "allowed_extractors": ["youtube", "vimeo"],
             }
             for attempt in range(3):
-                dl_res = video_downloader.execute(dl_inputs)
+                with ssrf_guard.guarded():
+                    dl_res = video_downloader.execute(dl_inputs)
                 if dl_res.success or attempt == 2 or not self._transient_error(dl_res.error):
                     break
                 time.sleep(0.25 * (2 ** attempt))
@@ -470,10 +501,11 @@ class URLIntakeAdapter:
                 transcript_fetcher = registry.get("transcript_fetcher")
                 if transcript_fetcher:
                     try:
-                        tf_res = transcript_fetcher.execute({
-                            "url_or_video_id": validated_url,
-                            "languages": caption_languages or ["en", "hi"],
-                        })
+                        with ssrf_guard.guarded():
+                            tf_res = transcript_fetcher.execute({
+                                "url_or_video_id": validated_url,
+                                "languages": caption_languages or ["en", "hi"],
+                            })
                         if tf_res.success and tf_res.data.get("transcript"):
                             with open(staging_transcript, "w", encoding="utf-8") as f:
                                 json.dump(tf_res.data, f, indent=2)

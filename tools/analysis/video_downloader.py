@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from lib import ssrf_guard
 from tools.base_tool import (
     BaseTool,
     Determinism,
@@ -152,6 +153,23 @@ class VideoDownloader(BaseTool):
             return "twitter"
         return "other_url"
 
+    @staticmethod
+    def _max_available_height(info: dict[str, Any]) -> int:
+        best = 0
+        for fmt in info.get("formats") or ():
+            if not isinstance(fmt, dict):
+                continue
+            if fmt.get("vcodec") == "none":
+                continue
+            h = fmt.get("height")
+            if isinstance(h, (int, float)) and h > best:
+                best = int(h)
+        if best == 0:
+            h = info.get("height")
+            if isinstance(h, (int, float)) and h > 0:
+                best = int(h)
+        return best
+
     def _extract_metadata(self, url: str, allowed_extractors: list[str] | None = None) -> dict:
         """Extract metadata without downloading."""
         import yt_dlp
@@ -159,6 +177,7 @@ class VideoDownloader(BaseTool):
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
+            "noplaylist": True,
             "socket_timeout": 30,
             "extractor_retries": 2,
             "fragment_retries": 2,
@@ -168,21 +187,24 @@ class VideoDownloader(BaseTool):
         if allowed_extractors:
             ydl_opts["allowed_extractors"] = allowed_extractors
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if info is None:
-                    return {"error": "No info extracted", "title": "", "duration": 0}
-                return {
-                    "title": info.get("title", ""),
-                    "duration": info.get("duration", 0),
-                    "uploader": info.get("uploader", info.get("channel", "")),
-                    "upload_date": info.get("upload_date", ""),
-                    "description": (info.get("description", "") or "")[:500],
-                    "view_count": info.get("view_count", 0),
-                    "like_count": info.get("like_count", 0),
-                    "resolution": f"{info.get('width', 0)}x{info.get('height', 0)}",
-                    "fps": info.get("fps", 0),
-                }
+            with ssrf_guard.guarded():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info is None:
+                        return {"error": "No info extracted", "title": "", "duration": 0}
+                    ssrf_guard.assert_public_urls(info, resolve_dns=False)
+                    return {
+                        "title": info.get("title", ""),
+                        "duration": info.get("duration", 0),
+                        "uploader": info.get("uploader", info.get("channel", "")),
+                        "upload_date": info.get("upload_date", ""),
+                        "description": (info.get("description", "") or "")[:500],
+                        "view_count": info.get("view_count", 0),
+                        "like_count": info.get("like_count", 0),
+                        "resolution": f"{info.get('width', 0)}x{info.get('height', 0)}",
+                        "max_available_height": self._max_available_height(info),
+                        "fps": info.get("fps", 0),
+                    }
         except Exception as e:
             return {"error": str(e), "title": "", "duration": 0}
 
@@ -302,8 +324,9 @@ class VideoDownloader(BaseTool):
         }
         if allowed_extractors:
             ydl_opts["allowed_extractors"] = allowed_extractors
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        with ssrf_guard.guarded():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
 
         # Find the downloaded video file
         video_path = self._find_downloaded(output_dir, "reference_video", ["mp4", "mkv", "webm"])
@@ -355,8 +378,9 @@ class VideoDownloader(BaseTool):
         }
         if allowed_extractors:
             ydl_opts["allowed_extractors"] = allowed_extractors
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        with ssrf_guard.guarded():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
         return self._find_downloaded(output_dir, "reference_audio", ["wav", "mp3", "m4a", "opus"])
 
     def _download_subtitles(self, url: str, output_dir: Path, allowed_extractors: list[str] | None = None,

@@ -617,3 +617,79 @@ def test_handoff_to_source_media_review(adapter, sample_video_path, tmp_path):
     assert file_info["media_type"] == "video"
     assert Path(file_info["path"]).name == "source_video.mp4"
     assert file_info["technical_probe"]["duration_seconds"] > 0
+
+
+# --- 9. Phase 1 Preflight Duration/Quality Gates & SSRF Guard ---
+
+def test_ingest_url_enforces_min_duration_and_strict_quality_gate(adapter):
+    url = "https://www.youtube.com/watch?v=mock1234567"
+
+    # Too short when min_duration_seconds is enabled
+    short_tool = MagicMock()
+    short_tool.execute.return_value = ToolResult(
+        True, {"metadata": {"duration": 25, "max_available_height": 1080}}
+    )
+    reg_p, disc_p = _mock_intake_registry(adapter, short_tool)
+    with patch.object(adapter, "validate_url", return_value=url), reg_p, disc_p:
+        res = adapter.ingest_url(url, "too-short", min_duration_seconds=60, extract_transcript=False)
+    assert not res.success
+    assert "min_duration_seconds" in (res.error or "")
+
+    # Low resolution rejected when strict_quality_gate=True
+    lowres_tool = MagicMock()
+    lowres_tool.execute.return_value = ToolResult(
+        True, {"metadata": {"duration": 180, "max_available_height": 360}}
+    )
+    reg_p2, disc_p2 = _mock_intake_registry(adapter, lowres_tool)
+    with patch.object(adapter, "validate_url", return_value=url), reg_p2, disc_p2:
+        res2 = adapter.ingest_url(
+            url,
+            "low-res",
+            min_quality_height=480,
+            strict_quality_gate=True,
+            extract_transcript=False,
+        )
+    assert not res2.success
+    assert "min_quality_height" in (res2.error or "")
+
+
+def test_video_downloader_extract_metadata_blocks_private_format_urls_and_reports_max_height(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from tools.analysis.video_downloader import VideoDownloader
+
+    opts_seen = []
+
+    class YDLGood:
+        def __init__(self, opts):
+            opts_seen.append(opts)
+        def __enter__(self): return self
+        def __exit__(self, *_a): return False
+        def extract_info(self, *_a, **_kw):
+            return {
+                "title": "Podcast",
+                "duration": 900,
+                "formats": [
+                    {"height": 480, "url": "https://rr1.googlevideo.com/480"},
+                    {"height": 1080, "url": "https://rr2.googlevideo.com/1080"},
+                ],
+            }
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=YDLGood))
+    dl = VideoDownloader()
+    meta = dl._extract_metadata("https://www.youtube.com/watch?v=abcdefghijk")
+    assert meta["max_available_height"] == 1080
+    assert opts_seen[-1]["noplaylist"] is True
+
+    class YDLPoisoned(YDLGood):
+        def extract_info(self, *_a, **_kw):
+            return {
+                "title": "Evil",
+                "duration": 120,
+                "formats": [{"height": 720, "url": "http://169.254.169.254/latest/meta-data/"}],
+            }
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=YDLPoisoned))
+    bad_meta = dl._extract_metadata("https://www.youtube.com/watch?v=abcdefghijk")
+    assert "error" in bad_meta and "non-public" in bad_meta["error"]
+

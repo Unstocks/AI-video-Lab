@@ -13,6 +13,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from lib.ffmpeg_profiles import (
+    INTERMEDIATE,
+    METADATA_SCRUB,
+    audio_encode_args,
+    video_encode_args,
+)
 from tools.base_tool import (
     BaseTool,
     Determinism,
@@ -75,10 +81,20 @@ class VideoTrimmer(BaseTool):
                 "type": "string",
                 "default": "auto",
                 "description": (
-                    "auto: stream copy when cutting from 0, otherwise libx264 so the "
-                    "in/out points are frame-accurate. Pass copy explicitly to force the "
-                    "fast path — it snaps the cut to the nearest keyframe."
+                    "auto: stream copy when cutting from 0 (unless normalize_audio is set), "
+                    "otherwise resolves h264_nvenc/libx264 so in/out points are frame-accurate. "
+                    "Pass copy explicitly to force the fast path."
                 ),
+            },
+            "normalize_audio": {
+                "type": "boolean",
+                "default": False,
+                "description": "Apply single-pass -14 LUFS / -2.0 dBTP loudnorm to AAC audio during cut.",
+            },
+            "scrub_metadata": {
+                "type": "boolean",
+                "default": False,
+                "description": "Strip inherited source container and stream metadata tags.",
             },
         },
     }
@@ -122,6 +138,8 @@ class VideoTrimmer(BaseTool):
         start_s = inputs.get("start_seconds", 0)
         end_s = inputs.get("end_seconds")
         codec = inputs.get("codec", "auto")
+        normalize_audio = bool(inputs.get("normalize_audio", False))
+        scrub_metadata = bool(inputs.get("scrub_metadata", False))
         output_path = Path(
             inputs.get("output_path", str(input_path.with_stem(f"{input_path.stem}_cut")))
         )
@@ -142,13 +160,19 @@ class VideoTrimmer(BaseTool):
         # point and cut the wrong length.
         if end_s is not None:
             cmd.extend(["-t", str(max(0, float(end_s) - float(start_s)))])
-        if codec == "copy":
+        if codec == "copy" and not normalize_audio:
             # Stream copy can only start on a keyframe, so the cut snaps to the
             # nearest one at or before start_seconds. make_zero rebases the
             # timestamps so the clip still starts at 0.
             cmd.extend(["-c", "copy", "-avoid_negative_ts", "make_zero"])
+        elif codec == "copy" and normalize_audio:
+            cmd.extend(["-c:v", "copy", "-avoid_negative_ts", "make_zero"])
+            cmd.extend(audio_encode_args(normalize=True))
         else:
-            cmd.extend(["-c:v", codec, "-c:a", "aac"])
+            cmd.extend(video_encode_args(INTERMEDIATE, codec=codec))
+            cmd.extend(audio_encode_args(normalize=normalize_audio))
+        if scrub_metadata:
+            cmd.extend(METADATA_SCRUB)
         cmd.append(str(output_path))
 
         self.run_command(cmd)

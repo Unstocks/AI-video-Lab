@@ -20,6 +20,12 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from lib.ffmpeg_profiles import (
+    METADATA_SCRUB,
+    QUALITY_FAST,
+    blurred_backdrop,
+    video_encode_args,
+)
 from lib.ffmpeg_utils import escape_ffmpeg_filter_path
 
 from tools.base_tool import (
@@ -141,6 +147,8 @@ class AutoReframe(BaseTool):
             "active_speaker_json": {"type": "string"},
             "split_left_center_x": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.25},
             "split_right_center_x": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.75},
+            "audio_copy": {"type": "boolean", "default": False},
+            "scrub_metadata": {"type": "boolean", "default": False},
         },
         "$defs": {"bbox": {"type": "object", "required": ["x", "y", "width", "height"],
                             "properties": {"x": {"type": "number"}, "y": {"type": "number"},
@@ -228,17 +236,21 @@ class AutoReframe(BaseTool):
         # Render via FFmpeg
         codec = inputs.get("codec", "libx264")
         crf = inputs.get("crf", 18)
+        audio_copy = bool(inputs.get("audio_copy", False))
+        scrub_metadata = bool(inputs.get("scrub_metadata", False))
 
         if layout_mode == "blurred_pillarbox":
             method = layout_mode
             result = self._render_blurred_pillarbox(
-                input_path, output_path, out_w, out_h, codec, crf)
+                input_path, output_path, src_w, src_h, out_w, out_h, codec, crf,
+                audio_copy=audio_copy, scrub_metadata=scrub_metadata)
         elif layout_mode == "stacked_split":
             method = layout_mode
             result = self._render_stacked_split(
                 input_path, output_path, src_w, src_h, src_sar, out_w, out_h,
                 inputs.get("split_left_center_x", 0.25),
-                inputs.get("split_right_center_x", 0.75), codec, crf)
+                inputs.get("split_right_center_x", 0.75), codec, crf,
+                audio_copy=audio_copy, scrub_metadata=scrub_metadata)
         else:
             timestamps, crop_xs, crop_ys = self._get_tracking_samples(
                 inputs, input_path, src_fps, src_w, src_h, target_w, target_h, shot_cuts)
@@ -248,6 +260,7 @@ class AutoReframe(BaseTool):
                 result = self._render_dynamic_crop(
                     input_path, output_path, crop_x, crop_y, timestamps,
                     target_w, target_h, out_w, out_h, src_fps, codec, crf,
+                    audio_copy=audio_copy, scrub_metadata=scrub_metadata,
                 )
             elif crop_xs:
                 method = "face_tracked" if timestamps else "center_crop"
@@ -256,6 +269,7 @@ class AutoReframe(BaseTool):
                 result = self._render_static_crop(
                     input_path, output_path, crop_x, crop_y, target_w, target_h,
                     out_w, out_h, codec, crf,
+                    audio_copy=audio_copy, scrub_metadata=scrub_metadata,
                 )
             else:
                 method = "center_crop"
@@ -264,6 +278,7 @@ class AutoReframe(BaseTool):
                 result = self._render_static_crop(
                     input_path, output_path, crop_x, crop_y, target_w, target_h,
                     out_w, out_h, codec, crf,
+                    audio_copy=audio_copy, scrub_metadata=scrub_metadata,
                 )
 
         if not result.success:
@@ -630,6 +645,10 @@ class AutoReframe(BaseTool):
                 result[index] = value
         return result
 
+    @staticmethod
+    def _audio_args(audio_copy: bool) -> list[str]:
+        return ["-c:a", "copy"] if audio_copy else ["-c:a", "aac", "-b:a", "192k"]
+
     def _render_static_crop(
         self,
         input_path: Path, output_path: Path,
@@ -637,6 +656,7 @@ class AutoReframe(BaseTool):
         crop_w: int, crop_h: int,
         out_w: int, out_h: int,
         codec: str, crf: int,
+        *, audio_copy: bool = False, scrub_metadata: bool = False,
     ) -> ToolResult:
         """Render with a static crop position."""
         vf = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale={out_w}:{out_h},setsar=1"
@@ -646,9 +666,11 @@ class AutoReframe(BaseTool):
             "-i", str(input_path),
             "-map", "0:v:0", "-map", "0:a?",
             "-vf", vf,
-            "-fps_mode", "cfr", "-c:v", codec, "-crf", str(crf), "-preset", "fast",
-            "-c:a", "aac", "-b:a", "192k",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-fps_mode", "cfr",
+            *video_encode_args(QUALITY_FAST, codec=codec, crf=crf),
+            *self._audio_args(audio_copy),
+            *(METADATA_SCRUB if scrub_metadata else ()),
+            "-movflags", "+faststart",
             str(output_path),
         ]
 
@@ -668,25 +690,19 @@ class AutoReframe(BaseTool):
         out_w: int, out_h: int,
         fps: float,
         codec: str, crf: int,
+        *, audio_copy: bool = False, scrub_metadata: bool = False,
     ) -> ToolResult:
-        """Render with dynamic crop positions that follow the face.
-
-        Uses FFmpeg's sendcmd filter to update crop position over time.
-        For simplicity and reliability, we interpolate between key positions
-        using FFmpeg expression-based crop.
-        """
-        # Build a piecewise-linear x(t) and y(t) using FFmpeg expressions
-        # We'll sample at the face tracking rate and interpolate between points
+        """Render with dynamic crop positions that follow the face."""
         if not crop_xs:
             return ToolResult(success=False, error="No crop positions computed")
 
-        # If very few data points, fall back to static using average
         if len(crop_xs) < 3:
             avg_x = int(sum(crop_xs) / len(crop_xs))
             avg_y = int(sum(crop_ys) / len(crop_ys))
             return self._render_static_crop(
                 input_path, output_path, avg_x, avg_y,
                 crop_w, crop_h, out_w, out_h, codec, crf,
+                audio_copy=audio_copy, scrub_metadata=scrub_metadata,
             )
 
         if len(timestamps) != len(crop_xs) or len(crop_xs) != len(crop_ys):
@@ -696,9 +712,13 @@ class AutoReframe(BaseTool):
             with tempfile.TemporaryDirectory(prefix=".reframe-", dir=output_path.parent) as workspace:
                 sendcmd_path = Path(workspace) / "crop_commands.txt"
                 lines = []
+                prev_pair: tuple[int, int] | None = None
                 for ts, cx, cy in zip(timestamps, crop_xs, crop_ys):
+                    if prev_pair == (cx, cy):
+                        continue
                     lines.append(f"{ts:.6f} [enter] crop x {cx};")
                     lines.append(f"{ts:.6f} [enter] crop y {cy};")
+                    prev_pair = (cx, cy)
                 sendcmd_path.write_text("\n".join(lines), encoding="utf-8")
                 escaped = self._escape_ffmpeg_filter_path(sendcmd_path)
                 vf = (
@@ -709,16 +729,21 @@ class AutoReframe(BaseTool):
                 cmd = [
                     "ffmpeg", "-y", "-i", str(input_path),
                     "-map", "0:v:0", "-map", "0:a?", "-vf", vf,
-                    "-fps_mode", "cfr", "-c:v", codec, "-crf", str(crf), "-preset", "fast",
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path),
+                    "-fps_mode", "cfr",
+                    *video_encode_args(QUALITY_FAST, codec=codec, crf=crf),
+                    *self._audio_args(audio_copy),
+                    *(METADATA_SCRUB if scrub_metadata else ()),
+                    "-movflags", "+faststart", str(output_path),
                 ]
                 self.run_command(cmd, timeout=600)
         except Exception:
             avg_x = int(sum(crop_xs) / len(crop_xs))
             avg_y = int(sum(crop_ys) / len(crop_ys))
-            result = self._render_static_crop(input_path, output_path, avg_x, avg_y,
-                                              crop_w, crop_h, out_w, out_h, codec, crf)
+            result = self._render_static_crop(
+                input_path, output_path, avg_x, avg_y,
+                crop_w, crop_h, out_w, out_h, codec, crf,
+                audio_copy=audio_copy, scrub_metadata=scrub_metadata,
+            )
             if result.success:
                 result.data = result.data or {}
                 result.data["fallback"] = "sendcmd failed, used static average crop"
@@ -731,21 +756,33 @@ class AutoReframe(BaseTool):
         return escape_ffmpeg_filter_path(path)
 
     def _render_blurred_pillarbox(
-        self, input_path: Path, output_path: Path, out_w: int, out_h: int,
-        codec: str, crf: int,
+        self, input_path: Path, output_path: Path, src_w: int, src_h: int,
+        out_w: int, out_h: int, codec: str, crf: int,
+        *, audio_copy: bool = False, scrub_metadata: bool = False,
     ) -> ToolResult:
+        # Quarter-res gblur (~45% less CPU) + 42%-height landscape foreground
+        # floored at full-width height so portrait sources never shrink.
+        full_w_h = int(round(out_w * src_h / float(src_w))) if src_w and src_h else 0
+        full_w_h += full_w_h % 2
+        fg_h = max(int(out_h * 0.42), full_w_h)
+        fg_h += fg_h % 2
+        fg_h = min(fg_h, out_h)
         vf = (
-            f"[0:v]split=2[bg][fg];[bg]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
-            f"crop={out_w}:{out_h},boxblur=20:5[bgb];"
-            f"[fg]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease[fgs];"
+            f"[0:v]split=2[bg][fg];"
+            f"[bg]{blurred_backdrop(out_w, out_h, 12.0)}[bgb];"
+            f"[fg]scale=-2:{fg_h},crop=w=min(iw\\,{out_w}):h=ih[fgs];"
             "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1[vout]"
         )
-        return self._render_filter_layout(input_path, output_path, vf, codec, crf)
+        return self._render_filter_layout(
+            input_path, output_path, vf, codec, crf,
+            audio_copy=audio_copy, scrub_metadata=scrub_metadata,
+        )
 
     def _render_stacked_split(
         self, input_path: Path, output_path: Path, src_w: int, src_h: int, src_sar: float,
         out_w: int, out_h: int, left_center: float, right_center: float,
         codec: str, crf: int,
+        *, audio_copy: bool = False, scrub_metadata: bool = False,
     ) -> ToolResult:
         half_h = (out_h // 2) - ((out_h // 2) % 2)
         display_ratio = (out_w / half_h) / src_sar
@@ -771,17 +808,24 @@ class AutoReframe(BaseTool):
             f"[0:v]split=2[left][right];"
             f"[left]crop={crop_w}:{crop_h}:{x_for(left_center)}:{y},scale={out_w}:{half_h}[top];"
             f"[right]crop={crop_w}:{crop_h}:{x_for(right_center)}:{y},scale={out_w}:{half_h}[bot];"
-            "[top][bot]vstack=inputs=2,setsar=1[vout]"
+            f"[top][bot]vstack=inputs=2,pad={out_w}:{out_h}:0:0,setsar=1[vout]"
         )
-        return self._render_filter_layout(input_path, output_path, vf, codec, crf)
+        return self._render_filter_layout(
+            input_path, output_path, vf, codec, crf,
+            audio_copy=audio_copy, scrub_metadata=scrub_metadata,
+        )
 
     def _render_filter_layout(
         self, input_path: Path, output_path: Path, vf: str, codec: str, crf: int,
+        *, audio_copy: bool = False, scrub_metadata: bool = False,
     ) -> ToolResult:
         cmd = [
             "ffmpeg", "-y", "-i", str(input_path), "-filter_complex", vf,
-            "-map", "[vout]", "-map", "0:a?", "-fps_mode", "cfr", "-c:v", codec, "-crf", str(crf), "-preset", "fast",
-            "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-map", "[vout]", "-map", "0:a?", "-fps_mode", "cfr",
+            *video_encode_args(QUALITY_FAST, codec=codec, crf=crf),
+            *self._audio_args(audio_copy),
+            *(METADATA_SCRUB if scrub_metadata else ()),
+            "-movflags", "+faststart",
             str(output_path),
         ]
         try:

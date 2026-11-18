@@ -19,6 +19,12 @@ from lib.media_profiles import MediaProfile, get_profile
 from lib.models.clip_plan import ClipSelectionPlan
 from lib.subtitle_styles import get_subtitle_style
 from lib.ffmpeg_utils import escape_ffmpeg_filter_path
+from lib.ffmpeg_profiles import (
+    METADATA_SCRUB,
+    QUALITY,
+    resolve_video_codec,
+    video_encode_args,
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +45,8 @@ class VerticalRenderConfig:
     codec: str = "libx264"
     style_preset: Optional[str] = None
     fonts_dir: Optional[str] = None
+    normalize_audio: bool = True
+    scrub_metadata: bool = True
 
     def __post_init__(self) -> None:
         get_profile(self.profile_name)
@@ -257,10 +265,26 @@ class VerticalClipComposer:
                 render_tmp = work / "final.mp4"
                 trimmed = work / "trimmed.mp4"
                 reframed = work / "reframed.mp4"
+                effective_codec = (
+                    resolve_video_codec("auto")
+                    if config.codec.strip().lower() == "auto"
+                    else config.codec
+                )
+                trim_codec = "libx264" if effective_codec not in ("h264_nvenc", "libx264") else effective_codec
                 trim_result = self._get_trimmer().execute({
                     "operation": "cut", "input_path": str(source), "output_path": str(trimmed),
-                    "start_seconds": start, "end_seconds": end, "codec": "libx264",
+                    "start_seconds": start, "end_seconds": end, "codec": trim_codec,
+                    "normalize_audio": config.normalize_audio,
+                    "scrub_metadata": config.scrub_metadata,
                 })
+                if not trim_result.success and trim_codec == "h264_nvenc":
+                    warnings.append("h264_nvenc failed during trimming; retried with libx264")
+                    trim_result = self._get_trimmer().execute({
+                        "operation": "cut", "input_path": str(source), "output_path": str(trimmed),
+                        "start_seconds": start, "end_seconds": end, "codec": "libx264",
+                        "normalize_audio": config.normalize_audio,
+                        "scrub_metadata": config.scrub_metadata,
+                    })
                 if not trim_result.success or not trimmed.is_file() or trimmed.stat().st_size <= 0:
                     raise RuntimeError(trim_result.error or "VideoTrimmer did not produce a non-empty clip")
 
@@ -270,12 +294,14 @@ class VerticalClipComposer:
                     "layout_mode": config.layout_mode,
                     "shot_cuts": self._rebase_shot_cuts(shot_cuts, start, end),
                     "speaker_tracks": self._rebase_speaker_tracks(speaker_tracks, start, end),
-                    "codec": config.codec, "crf": config.crf,
+                    "codec": effective_codec, "crf": config.crf,
+                    "audio_copy": True, "scrub_metadata": config.scrub_metadata,
                 })
                 if not reframed_result.success:
-                    if config.codec != "h264_nvenc":
+                    if effective_codec != "h264_nvenc":
                         raise RuntimeError(reframed_result.error or "AutoReframe failed")
                     warnings.append("h264_nvenc failed during reframing; retried with libx264")
+                    effective_codec = "libx264"
                     reframed_result = self._get_reframer().execute({
                         "input_path": str(trimmed), "output_path": str(reframed),
                         "target_width": profile.width, "target_height": profile.height,
@@ -283,6 +309,7 @@ class VerticalClipComposer:
                         "shot_cuts": self._rebase_shot_cuts(shot_cuts, start, end),
                         "speaker_tracks": self._rebase_speaker_tracks(speaker_tracks, start, end),
                         "codec": "libx264", "crf": config.crf,
+                        "audio_copy": True, "scrub_metadata": config.scrub_metadata,
                     })
                     if not reframed_result.success:
                         raise RuntimeError(reframed_result.error or "AutoReframe libx264 fallback failed")
@@ -346,21 +373,26 @@ class VerticalClipComposer:
                     if fonts_directory is not None and config.subtitle_format == "ass":
                         escaped_fonts = self._escape_filter_path(fonts_directory)
                         vf = f"ass='{escaped_subtitle}':fontsdir='{escaped_fonts}'"
-                    command = [
-                        "ffmpeg", "-y", "-i", str(reframed_source),
-                        "-map", "0:v:0", "-map", "0:a?", "-vf", vf,
-                        "-fps_mode", "cfr", "-c:v", config.codec, "-crf", str(config.crf), "-preset", "fast",
-                        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                        "-c:a", "aac", "-b:a", "192k", str(render_tmp),
-                    ]
+
+                    def _build_burn_cmd(codec_choice: str) -> list[str]:
+                        cmd = [
+                            "ffmpeg", "-y", "-i", str(reframed_source),
+                            "-map", "0:v:0", "-map", "0:a?", "-vf", vf,
+                            "-fps_mode", "cfr",
+                            *video_encode_args(QUALITY, codec=codec_choice, crf=config.crf),
+                            "-c:a", "copy",
+                            *(METADATA_SCRUB if config.scrub_metadata else ()),
+                            "-movflags", "+faststart", str(render_tmp),
+                        ]
+                        return cmd
+
                     try:
-                        self._run_ffmpeg(command, timeout=600)
+                        self._run_ffmpeg(_build_burn_cmd(effective_codec), timeout=600)
                     except Exception:
-                        if config.codec != "h264_nvenc":
+                        if effective_codec != "h264_nvenc":
                             raise
                         warnings.append("h264_nvenc failed during subtitle encoding; retried with libx264")
-                        command[command.index("h264_nvenc")] = "libx264"
-                        self._run_ffmpeg(command, timeout=600)
+                        self._run_ffmpeg(_build_burn_cmd("libx264"), timeout=600)
                     if not render_tmp.is_file() or render_tmp.stat().st_size <= 0:
                         raise RuntimeError("subtitle burn produced no output file")
                 else:
