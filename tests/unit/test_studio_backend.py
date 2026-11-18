@@ -201,7 +201,13 @@ class TestStudioServerApi:
             cwd=tmp_path,
         )
         token = "test-studio-secret-token"
-        app = create_app(store=store, supervisor=mgr, studio_token=token, enable_watcher=False)
+        app = create_app(
+            store=store,
+            supervisor=mgr,
+            studio_token=token,
+            enable_watcher=False,
+            allowed_hosts=["127.0.0.1", "localhost", "testserver"],
+        )
 
         with TestClient(app) as client:
             # 1. Health & all 8 real presets

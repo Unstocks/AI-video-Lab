@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
-import math
 import json
+import math
 import os
 import re
 import shutil
@@ -293,6 +292,7 @@ class VerticalClipComposer:
                 })
                 if not trim_result.success and trim_codec == "h264_nvenc":
                     warnings.append("h264_nvenc failed during trimming; retried with libx264")
+                    effective_codec = "libx264"
                     trim_result = self._get_trimmer().execute({
                         "operation": "cut", "input_path": str(source), "output_path": str(trimmed),
                         "start_seconds": start, "end_seconds": end, "codec": "libx264",
@@ -315,7 +315,13 @@ class VerticalClipComposer:
                     reframe_inputs["enable_punch_in"] = True
                     reframe_inputs["punch_in_zoom"] = config.punch_in_zoom
                     if config.emphasis_times:
-                        reframe_inputs["emphasis_times"] = list(config.emphasis_times)
+                        rebased_beats = [
+                            round(float(t) - start, 3)
+                            for t in config.emphasis_times
+                            if start <= float(t) <= end
+                        ]
+                        if rebased_beats:
+                            reframe_inputs["emphasis_times"] = rebased_beats
                 if config.layout_mode in ("auto", "speaker_cut") or config.crop_overrides:
                     reframe_inputs["enable_active_speaker"] = config.enable_active_speaker
                     reframe_inputs["speaker_cut_mode"] = (
@@ -398,35 +404,36 @@ class VerticalClipComposer:
                     warnings.append("no transcript segments supplied; subtitle burn skipped")
 
                 if config.burn_subtitles and cue_count > 0 and staged_subtitle.is_file():
-                    # Neutral ASCII staging path avoids Windows apostrophe/Unicode filter quoting traps
-                    burn_sub = work / f"subs_burn.{config.subtitle_format}"
-                    shutil.copy2(staged_subtitle, burn_sub)
-                    escaped_subtitle = self._escape_filter_path(burn_sub)
-                    filter_name = "ass" if config.subtitle_format == "ass" else "subtitles"
-                    vf = f"{filter_name}='{escaped_subtitle}'"
-                    if fonts_directory is not None and config.subtitle_format == "ass":
-                        escaped_fonts = self._escape_filter_path(fonts_directory)
-                        vf = f"ass='{escaped_subtitle}':fontsdir='{escaped_fonts}'"
+                    # Stage in neutral system temp dir (not inside destination) so apostrophes
+                    # or non-ASCII chars in output_dir never touch FFmpeg's ass= filter option.
+                    with tempfile.TemporaryDirectory(prefix="om_sub_") as sub_tmp:
+                        burn_sub = Path(sub_tmp) / f"subs_burn.{config.subtitle_format}"
+                        shutil.copy2(staged_subtitle, burn_sub)
+                        escaped_subtitle = self._escape_filter_path(burn_sub)
+                        filter_name = "ass" if config.subtitle_format == "ass" else "subtitles"
+                        vf = f"{filter_name}='{escaped_subtitle}'"
+                        if fonts_directory is not None and config.subtitle_format == "ass":
+                            escaped_fonts = self._escape_filter_path(fonts_directory)
+                            vf = f"ass='{escaped_subtitle}':fontsdir='{escaped_fonts}'"
 
-                    def _build_burn_cmd(codec_choice: str) -> list[str]:
-                        cmd = [
-                            "ffmpeg", "-y", "-i", str(reframed_source),
-                            "-map", "0:v:0", "-map", "0:a?", "-vf", vf,
-                            "-fps_mode", "cfr",
-                            *video_encode_args(QUALITY, codec=codec_choice, crf=config.crf),
-                            "-c:a", "copy",
-                            *(METADATA_SCRUB if config.scrub_metadata else ()),
-                            "-movflags", "+faststart", str(render_tmp),
-                        ]
-                        return cmd
+                        def _build_burn_cmd(codec_choice: str) -> list[str]:
+                            return [
+                                "ffmpeg", "-y", "-i", str(reframed_source),
+                                "-map", "0:v:0", "-map", "0:a?", "-vf", vf,
+                                "-fps_mode", "cfr",
+                                *video_encode_args(QUALITY, codec=codec_choice, crf=config.crf),
+                                "-c:a", "copy",
+                                *(METADATA_SCRUB if config.scrub_metadata else ()),
+                                "-movflags", "+faststart", str(render_tmp),
+                            ]
 
-                    try:
-                        self._run_ffmpeg(_build_burn_cmd(effective_codec), timeout=600)
-                    except Exception:
-                        if effective_codec != "h264_nvenc":
-                            raise
-                        warnings.append("h264_nvenc failed during subtitle encoding; retried with libx264")
-                        self._run_ffmpeg(_build_burn_cmd("libx264"), timeout=600)
+                        try:
+                            self._run_ffmpeg(_build_burn_cmd(effective_codec), timeout=600)
+                        except Exception:
+                            if effective_codec != "h264_nvenc":
+                                raise
+                            warnings.append("h264_nvenc failed during subtitle encoding; retried with libx264")
+                            self._run_ffmpeg(_build_burn_cmd("libx264"), timeout=600)
                     if not render_tmp.is_file() or render_tmp.stat().st_size <= 0:
                         raise RuntimeError("subtitle burn produced no output file")
                 else:
@@ -551,7 +558,9 @@ class VerticalClipComposer:
 
     @staticmethod
     def _run_ffmpeg(command: list[str], *, timeout: int) -> None:
-        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=timeout)
+        result = subprocess.run(
+            command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout
+        )
         if result.returncode != 0:
             details = (result.stderr or result.stdout or "FFmpeg exited with a non-zero status").strip()
             raise RuntimeError(details[-4000:])
@@ -560,7 +569,7 @@ class VerticalClipComposer:
     def _probe_output(path: Path) -> dict[str, Any]:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
-            capture_output=True, text=True, encoding="utf-8", timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
         if result.returncode != 0:
             raise RuntimeError((result.stderr or "ffprobe failed").strip())

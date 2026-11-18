@@ -146,9 +146,14 @@ class VideoTrimmer(BaseTool):
 
         # Stream copy can only start on a keyframe, so a cut that starts partway
         # into the source snaps to the nearest one and returns the wrong range.
-        # Cutting from zero has no such problem, so copy stays the fast path there.
+        # Cutting from zero without loudnorm stays a fast stream-copy; otherwise
+        # resolve hardware NVENC -> libx264 via ffmpeg_profiles.
         if codec == "auto":
-            codec = "copy" if float(start_s) == 0 else "libx264"
+            if float(start_s) == 0 and not normalize_audio:
+                codec = "copy"
+            else:
+                from lib.ffmpeg_profiles import resolve_video_codec
+                codec = resolve_video_codec("auto")
 
         # -ss must precede -i: as an output option it makes ffmpeg keep the
         # source timestamps, so the clip's frames start at their original PTS

@@ -247,6 +247,11 @@ class AutoReframe(BaseTool):
                     audio_copy=bool(inputs.get("audio_copy", False)),
                     scrub_metadata=bool(inputs.get("scrub_metadata", True)),
                     shot_cuts=shot_cuts or None,
+                    forced_layout=(
+                        layout_mode
+                        if layout_mode in {"single_crop", "blurred_pillarbox", "stacked_split"}
+                        else None
+                    ),
                     enable_punch_in=bool(inputs.get("enable_punch_in", False)),
                     punch_in_zoom=inputs.get("punch_in_zoom"),
                     emphasis_times=inputs.get("emphasis_times"),
@@ -390,6 +395,9 @@ class AutoReframe(BaseTool):
         except Exception:
             pass
 
+        legacy_artifacts = [str(output_path)]
+        if sidecar_str:
+            legacy_artifacts.append(sidecar_str)
         return ToolResult(
             success=True,
             data={
@@ -404,7 +412,7 @@ class AutoReframe(BaseTool):
                 "layout_sidecar": sidecar_str,
                 "warnings": warnings,
             },
-            artifacts=[str(output_path)],
+            artifacts=legacy_artifacts,
             duration_seconds=round(elapsed, 2),
         )
 

@@ -210,6 +210,10 @@ class VideoDownloader(BaseTool):
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         url = inputs["url"]
+        try:
+            ssrf_guard.assert_public_url(url, resolve_dns=False)
+        except ssrf_guard.SSRFBlockedError as exc:
+            return ToolResult(success=False, error=str(exc))
         output_dir = Path(inputs["output_dir"])
         dl_format = inputs.get("format", "video")
         max_res = inputs.get("max_resolution", "720p")
@@ -398,14 +402,21 @@ class VideoDownloader(BaseTool):
             "outtmpl": sub_out,
             "noplaylist": True,
             "max_filesize": max_file_size_bytes,
+            "socket_timeout": 30,
+            "extractor_retries": 2,
+            "fragment_retries": 2,
+            "file_access_retries": 1,
             "quiet": True,
             "no_warnings": True,
         }
         if allowed_extractors:
             ydl_opts["allowed_extractors"] = allowed_extractors
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            with ssrf_guard.guarded():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+        except ssrf_guard.SSRFBlockedError:
+            raise
         except Exception:
             pass
         return self._find_downloaded(output_dir, "reference_subs", ["srt", "vtt", "ass"])

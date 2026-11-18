@@ -627,6 +627,7 @@ def _build_clip_studio(
     Never writes to disk and never raises.
     """
     from lib import layout_ranges as _lr
+    from lib.vertical_composer import VerticalClipComposer
 
     plan = _find_clip_plan_json(project_dir, artifacts)
     script = artifacts.get("script") if isinstance(artifacts.get("script"), dict) else (
@@ -636,8 +637,13 @@ def _build_clip_studio(
     final_review = artifacts.get("final_review") if isinstance(artifacts.get("final_review"), dict) else (
         _read_json(project_dir / "artifacts" / "final_review.json")
     )
+    publish_log = artifacts.get("publish_log") if isinstance(artifacts.get("publish_log"), dict) else (
+        _read_json(project_dir / "artifacts" / "publish_log.json")
+        or _read_json(project_dir / "publish_log.json")
+    )
     export_manifest = (
-        _read_json(project_dir / "exports" / "export_manifest.json")
+        _read_json(project_dir / "exports" / "manifest.json")
+        or _read_json(project_dir / "exports" / "export_manifest.json")
         or _read_json(project_dir / "artifacts" / "export_manifest.json")
     )
     source_manifest = _read_json(project_dir / "source" / "source_manifest.json")
@@ -653,39 +659,95 @@ def _build_clip_studio(
             pass
 
     plan_candidates = list(plan.get("candidates") or []) if isinstance(plan, dict) else []
-    script_candidates = list(script.get("candidates") or []) if isinstance(script, dict) else []
+    script_candidates: list[dict[str, Any]] = []
+    if isinstance(script, dict):
+        if isinstance(script.get("candidates"), list):
+            script_candidates.extend(c for c in script["candidates"] if isinstance(c, dict))
+        if isinstance(script.get("sections"), list):
+            for sec in script["sections"]:
+                if isinstance(sec, dict) and sec.get("id"):
+                    script_candidates.append({
+                        **sec,
+                        "candidate_id": str(sec["id"]),
+                        "editorial_title": sec.get("label") or sec.get("title") or str(sec["id"]),
+                    })
     has_layout_sidecars = any(_lr.sidecar_path(p).is_file() for p in render_mp4s.values())
 
     if not plan_candidates and not script_candidates and not has_layout_sidecars:
         return None
 
-    # Index QA reports by candidate_id
+    # Index QA reports by candidate_id — supports real MediaQAInspector metadata.clip_reports dict,
+    # single-clip checks fallback, AND legacy list shapes.
     qa_by_id: dict[str, dict[str, Any]] = {}
     if isinstance(final_review, dict):
+        meta_reports = (final_review.get("metadata") or {}).get("clip_reports")
+        top_checks = final_review.get("checks") if isinstance(final_review.get("checks"), dict) else {}
+        if isinstance(meta_reports, dict):
+            single_mode = len(meta_reports) == 1
+            for cid_key, item in meta_reports.items():
+                if not isinstance(item, dict):
+                    continue
+                rec = dict(item)
+                if single_mode and "technical_probe" not in rec and isinstance(top_checks.get("technical_probe"), dict):
+                    rec["technical_probe"] = top_checks["technical_probe"]
+                if single_mode and "audio_spotcheck" not in rec and isinstance(top_checks.get("audio_spotcheck"), dict):
+                    rec["audio_spotcheck"] = top_checks["audio_spotcheck"]
+                qa_by_id[str(cid_key)] = rec
+        elif isinstance(meta_reports, list):
+            for item in meta_reports:
+                if isinstance(item, dict) and (item.get("candidate_id") or item.get("clip_id")):
+                    qa_by_id[str(item.get("candidate_id") or item.get("clip_id"))] = item
         for item in (final_review.get("clip_reports") or final_review.get("clips") or []):
-            if isinstance(item, dict) and item.get("candidate_id"):
-                qa_by_id[str(item["candidate_id"])] = item
+            if isinstance(item, dict) and (item.get("candidate_id") or item.get("clip_id")):
+                key = str(item.get("candidate_id") or item.get("clip_id"))
+                qa_by_id.setdefault(key, item)
         if final_review.get("candidate_id") and str(final_review["candidate_id"]) not in qa_by_id:
             qa_by_id[str(final_review["candidate_id"])] = final_review
 
-    # Index exported paths by candidate_id
+    # Index exported paths by candidate_id / clip_id from exports/manifest.json, publish_log, and legacy manifests
     exports_by_id: dict[str, list[str]] = {}
-    if isinstance(export_manifest, dict):
-        for item in (export_manifest.get("clips") or export_manifest.get("exports") or []):
-            if isinstance(item, dict) and item.get("candidate_id"):
-                cid = str(item["candidate_id"])
-                paths = []
-                for k in ("export_path", "video_path", "path"):
-                    if isinstance(item.get(k), str) and item[k]:
-                        paths.append(item[k])
-                if paths:
-                    exports_by_id.setdefault(cid, []).extend(paths)
 
-    # Check SHA-256 sync between script.json and clip_selection_plan.json if recorded
+    def _collect_export_items(items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            status_val = str(item.get("status") or "exported").lower()
+            if status_val == "failed":
+                continue
+            cid = item.get("clip_id") or item.get("candidate_id")
+            if not cid:
+                continue
+            cid_str = str(cid)
+            for k in ("export_path", "video_path", "path"):
+                val = item.get(k)
+                if isinstance(val, str) and val and val not in exports_by_id.get(cid_str, []):
+                    exports_by_id.setdefault(cid_str, []).append(val)
+
+    if isinstance(export_manifest, dict):
+        _collect_export_items(export_manifest.get("clip_catalog"))
+        _collect_export_items(export_manifest.get("clips"))
+        _collect_export_items(export_manifest.get("exports"))
+    if isinstance(publish_log, dict):
+        _collect_export_items((publish_log.get("metadata") or {}).get("clip_catalog"))
+
+    # Check SHA-256 sync between script.json and clip_selection_plan.json
     plan_sha_synced: Optional[bool] = None
     if isinstance(plan, dict) and isinstance(script, dict):
+        script_meta = script.get("metadata") if isinstance(script.get("metadata"), dict) else {}
+        s_sha = (
+            script_meta.get("clip_selection_plan_sha256")
+            or script.get("source_transcript_sha256")
+            or script.get("plan_sha256")
+        )
         p_sha = plan.get("source_transcript_sha256") or plan.get("plan_sha256")
-        s_sha = script.get("source_transcript_sha256") or script.get("plan_sha256")
+        if s_sha and not p_sha:
+            try:
+                from lib.models.clip_plan import ClipSelectionPlan
+                p_sha = ClipSelectionPlan.model_validate(plan).compute_plan_sha256()
+            except Exception:
+                p_sha = None
         if p_sha and s_sha:
             plan_sha_synced = (str(p_sha) == str(s_sha))
 
@@ -705,8 +767,9 @@ def _build_clip_studio(
             script_by_id[cid] = c
             if cid not in ordered_ids:
                 ordered_ids.append(cid)
+    known_stems = {VerticalClipComposer._output_stem(cid) for cid in ordered_ids} | set(ordered_ids)
     for stem in sorted(render_mp4s.keys()):
-        if stem not in ordered_ids:
+        if stem not in known_stems:
             ordered_ids.append(stem)
 
     clips_out: list[dict[str, Any]] = []
@@ -724,7 +787,7 @@ def _build_clip_studio(
             or ("HUMAN_APPROVED" if merged.get("human_approved") else "AWAITING_HUMAN")
         ).upper()
 
-        mp4_path = render_mp4s.get(cid)
+        mp4_path = render_mp4s.get(cid) or render_mp4s.get(VerticalClipComposer._output_stem(cid))
         video_rel: Optional[str] = _rel(project_dir, mp4_path) if mp4_path else None
         video_mtime: Optional[float] = None
         if mp4_path:
@@ -812,11 +875,12 @@ def _build_clip_studio(
             source_video_rel = _rel(project_dir, candidate_src)
             break
 
+    awaiting_states = {"AWAITING_HUMAN", "PENDING_REVIEW", "SELECTED_FOR_REVIEW"}
     return {
         "source_video": source_video_rel,
         "source_manifest": source_manifest if isinstance(source_manifest, dict) else None,
         "plan_sha256_synced": plan_sha_synced,
-        "awaiting_approval_count": sum(1 for c in clips_out if c["review_state"] in ("AWAITING_HUMAN", "PENDING_REVIEW")),
+        "awaiting_approval_count": sum(1 for c in clips_out if c["review_state"] in awaiting_states),
         "approved_count": sum(1 for c in clips_out if c["review_state"] == "HUMAN_APPROVED"),
         "qa_passed_count": sum(1 for c in clips_out if c["production_state"] in ("QA_PASSED", "EXPORTED")),
         "exported_count": sum(1 for c in clips_out if c["production_state"] == "EXPORTED"),

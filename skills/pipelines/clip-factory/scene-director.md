@@ -25,13 +25,15 @@ Use:
 - `1:1` when speaker plus context both matter,
 - `16:9` when slides, demos, or multi-speaker width are essential.
 
-OpenMontage provides `auto_reframe` for vertical production. Choose its layout honestly:
+OpenMontage provides Smart Reframe v2 via `auto_reframe` (backed by YuNet `face_tracker`, `SmoothedCameraman` heavy-tripod damping, `split_layout`, `active_speaker`, and smoothstep `punch_in`). Choose its `layout_mode` honestly:
 
-- `single_crop` for a clear speaker-centered crop,
+- `auto` (recommended default for podcasts/interviews) — automatically classifies each scene into `TRACK` (single face with 3-frame jump confirm), `SPLIT` (2-speaker stacked vertical gated by `active_speaker.is_conversation()`), or `GENERAL` (42%-height quarter-res blurred backdrop), and writes `<clip>.mp4.layout.json`,
+- `speaker_cut` — hard-cuts between two speakers on active-speaker windows (`ALTERNATE`) instead of stacking,
+- `single_crop` for an explicit single speaker-centered crop,
 - `blurred_pillarbox` for slides, demos, or wide shots where preserving the full frame matters,
-- `stacked_split` for two speakers positioned across a wide frame.
+- `stacked_split` for an explicit two-speaker vertical stack.
 
-Pass `shot_cuts` when scene boundaries are known so crop smoothing resets at edits. Pass pluggable `speaker_tracks` when an upstream diarization/active-speaker source provides them; do not infer active speaker identity from face size alone. If a crop weakens important context, use a layout that preserves it or plan a safer aspect ratio.
+Enable `enable_punch_in=True` for subtle `1.12x` smoothstep emphasis zooms on audio/editorial beats, and pass per-scene `crop_overrides` when the human overrides framing in the Studio UI. Pass `shot_cuts` when scene boundaries are known so crop smoothing resets cleanly at edits. If a crop weakens important context, use a layout that preserves it or plan a safer aspect ratio.
 
 ### 2. Plan First-Second Composition
 

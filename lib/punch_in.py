@@ -181,3 +181,4 @@ def merge_emphasis_times(
 
     accepted.sort()
     return accepted
+

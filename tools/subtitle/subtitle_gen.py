@@ -390,12 +390,16 @@ class SubtitleGen(BaseTool):
             if merged:
                 if uses_leading_space and not raw[0].isspace():
                     is_continuation = True
-                elif stripped[0] in ("-", "'", "\u2019", ".") and len(stripped) >= 1:
-                    # Attach contractions ('s, 't, n't), hyphen suffixes (-hero), decimals (.50)
-                    # Do not attach standalone ellipses "..." or sentence-opening quotes
-                    if not stripped.startswith("..."):
-                        is_continuation = True
-                elif all(ch in ".,!?;:%)]}" for ch in stripped):
+                elif re.fullmatch(r"['\u2019](?:s|t|re|ve|ll|d|m)\b", stripped, re.IGNORECASE):
+                    # Contractions / possessives in stripped streams ('s, 't, 're, 've, 'll, 'd, 'm)
+                    is_continuation = True
+                elif re.fullmatch(r"-\w+", stripped) and not re.fullmatch(r"-\d+(?:\.\d+)?", stripped):
+                    # Hyphenated word suffix (-hero) while preserving negative numbers (-5)
+                    is_continuation = True
+                elif re.fullmatch(r"\.\d+", stripped) and re.search(r"\d$", merged[-1]["word"]):
+                    # Decimal tail (.50) attached to a preceding number ($20 -> $20.50), not .NET
+                    is_continuation = True
+                elif all(ch in ".,!?;:%)]}" for ch in stripped) and not stripped.startswith("..."):
                     is_continuation = True
 
             if is_continuation:

@@ -85,10 +85,17 @@ class VerticalClipCompose(BaseTool):
                 data = asdict(result)
                 artifacts = [clip.output_video_path for clip in result.clips if clip.success and clip.output_video_path]
                 success = result.failed_count == 0 and result.succeeded_count > 0
+                failed_details = [
+                    f"{clip.candidate_id}: {clip.error or 'render failed'}"
+                    for clip in result.clips
+                    if not clip.success
+                ]
+                err_msg = None if success else ("; ".join(failed_details) or "no clips rendered")
             else:
                 data = asdict(result)
                 artifacts = [result.output_video_path] if result.success and result.output_video_path else []
                 success = result.success
-            return ToolResult(success=success, data=data, artifacts=artifacts, error=None if success else getattr(result, "error", "one or more renders failed"))
+                err_msg = None if success else getattr(result, "error", "render failed")
+            return ToolResult(success=success, data=data, artifacts=artifacts, error=err_msg)
         except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
             return ToolResult(success=False, error=str(exc))

@@ -132,24 +132,10 @@ class MediaQAInspector:
                 frames.append(frame)
         return frames
 
-    def _audio_metrics(self, path: Path) -> tuple[Optional[float], Optional[float]]:
-        """Extract exact EBU R128 Summary integrated LUFS and true-peak dBTP."""
-        result = self._run([
-            self.ffmpeg, "-hide_banner", "-nostats", "-i", str(path), "-vn",
-            "-af", "ebur128=peak=true", "-f", "null", "-",
-        ], timeout=60)
-        if result.returncode != 0:
-            return None, None
-        log = result.stderr or ""
-        summary_idx = log.rfind("Summary:")
-        summary = log[summary_idx:] if summary_idx != -1 else log
-        m_i = re.search(r"\bI:\s*(-?\d+(?:\.\d+)?)\s*LUFS", summary)
-        m_tp = re.search(r"\bPeak:\s*(-?\d+(?:\.\d+)?)\s*(?:dBFS|dBTP)", summary)
-        integrated = float(m_i.group(1)) if m_i and math.isfinite(float(m_i.group(1))) else None
-        true_peak = float(m_tp.group(1)) if m_tp and math.isfinite(float(m_tp.group(1))) else None
-        return integrated, true_peak
-
-    def _audio_active(self, path: Path, threshold: float, clipping_threshold: float) -> tuple[bool, bool, Optional[float], bool, list[str]]:
+    def _audio_profile(
+        self, path: Path, threshold: float, clipping_threshold: float
+    ) -> tuple[bool, bool, Optional[float], bool, Optional[float], Optional[float], list[str]]:
+        """Single-pass EBU R128 scan returning audibility, clipping, spread, integrated LUFS, and true peak."""
         result = self._run([
             self.ffmpeg, "-hide_banner", "-loglevel", "verbose", "-nostats", "-i", str(path), "-vn",
             "-af", "ebur128=framelog=verbose:peak=true",
@@ -176,23 +162,45 @@ class MediaQAInspector:
                     if math.isfinite(value) and value > -119.9:
                         values.append(value)
         if result.returncode != 0:
-            return False, False, None, False, ["unable to measure audio loudness"]
+            return False, False, None, False, None, None, ["unable to measure audio loudness"]
         peak_values = []
         for line in log.splitlines():
-            match = re.search(r"\bPeak:\s*(-?\d+(?:\.\d+)?)\s*(?:LUFS|dBFS)", line)
+            match = re.search(r"\bPeak:\s*(-?\d+(?:\.\d+)?)\s*(?:LUFS|dBFS|dBTP)", line)
             if match:
                 value = float(match.group(1))
                 if math.isfinite(value) and value > -119.9:
                     peak_values.append(value)
+        summary_idx = log.rfind("Summary:")
+        summary = log[summary_idx:] if summary_idx != -1 else log
+        m_i = re.search(r"\bI:\s*(-?\d+(?:\.\d+)?)\s*LUFS", summary)
+        m_tp = re.search(r"\bPeak:\s*(-?\d+(?:\.\d+)?)\s*(?:dBFS|dBTP|LUFS)", summary)
+        integrated = float(m_i.group(1)) if m_i and math.isfinite(float(m_i.group(1))) else None
+        true_peak = (
+            float(m_tp.group(1))
+            if m_tp and math.isfinite(float(m_tp.group(1)))
+            else (max(peak_values) if peak_values else None)
+        )
         spread = None
         if len(values) >= 2:
             mean = sum(values) / len(values)
             spread = math.sqrt(sum((value - mean) ** 2 for value in values) / len(values))
         elif values:
             spread = 0.0
-        return (any(value >= threshold for value in values),
-                any(value >= clipping_threshold for value in peak_values), spread,
-                bool(peak_values), [])
+        return (
+            any(value >= threshold for value in values),
+            any(value >= clipping_threshold for value in peak_values),
+            spread,
+            bool(peak_values),
+            integrated,
+            true_peak,
+            [],
+        )
+
+    def _audio_active(self, path: Path, threshold: float, clipping_threshold: float) -> tuple[bool, bool, Optional[float], bool, list[str]]:
+        audible, clipping, spread, peak_checked, _i, _tp, errs = self._audio_profile(
+            path, threshold, clipping_threshold
+        )
+        return audible, clipping, spread, peak_checked, errs
 
     @staticmethod
     def _sha256(path: Path) -> str:
@@ -249,6 +257,7 @@ class MediaQAInspector:
         visual_issues: list[str] = []
         audio_issues: list[str] = []
         subtitle_issues: list[str] = []
+        probe: dict[str, Any] = {}
         stream_video: dict[str, Any] = {}
         stream_audio: dict[str, Any] | None = None
         duration = 0.0
@@ -389,15 +398,23 @@ class MediaQAInspector:
         peak_checked = False
         integrated_lufs: Optional[float] = None
         true_peak_dbtp: Optional[float] = None
+        loudnorm_ok: Optional[bool] = None
         verified_silence = bool(config.require_audio and not has_audio)
         if not has_audio:
             if config.require_audio:
                 audio_issues.append("missing audio stream")
         elif path.is_file():
-            audio_audible, clipping_detected, loudness_std, peak_checked, audio_measure_issues = self._audio_active(
+            (
+                audio_audible,
+                clipping_detected,
+                loudness_std,
+                peak_checked,
+                integrated_lufs,
+                true_peak_dbtp,
+                audio_measure_issues,
+            ) = self._audio_profile(
                 path, config.min_audible_lufs, config.max_peak_clipping_lufs,
             )
-            integrated_lufs, true_peak_dbtp = self._audio_metrics(path)
             audio_issues.extend(audio_measure_issues)
             audio_profile_checked = not audio_measure_issues
             if audio_profile_checked and audio_audible is False:
@@ -417,18 +434,31 @@ class MediaQAInspector:
             if clipping_detected:
                 audio_issues.append("audio peak reaches the clipping threshold")
             if config.enforce_loudnorm_window:
+                loudnorm_ok = True
                 if integrated_lufs is None or not (-16.5 <= integrated_lufs <= -11.5):
-                    audio_issues.append(f"integrated loudness {integrated_lufs} LUFS outside broadcast window [-16.5, -11.5]")
+                    loudnorm_ok = False
+                    audio_issues.append(
+                        f"integrated loudness {integrated_lufs} LUFS outside broadcast window [-16.5, -11.5]"
+                    )
                 if true_peak_dbtp is not None and true_peak_dbtp > -1.0:
-                    audio_issues.append(f"true peak {true_peak_dbtp} dBTP exceeds -1.0 dBTP ceiling")
-        if config.verify_metadata_scrubbed and path.is_file():
-            try:
-                fmt_tags = {k.lower(): v for k, v in (self._probe(path).get("format") or {}).get("tags", {}).items()}
-                leaked = [k for k in ("title", "comment", "artist", "album") if k in fmt_tags]
-                if leaked:
-                    tech_issues.append(f"unscrubbed source metadata tags present: {', '.join(leaked)}")
-            except Exception:
-                pass
+                    loudnorm_ok = False
+                    audio_issues.append(
+                        f"true peak {true_peak_dbtp} dBTP exceeds -1.0 dBTP ceiling"
+                    )
+        if config.verify_metadata_scrubbed and probe:
+            tag_buckets = [(probe.get("format") or {}).get("tags") or {}]
+            for s in probe.get("streams") or []:
+                if isinstance(s, dict) and isinstance(s.get("tags"), dict):
+                    tag_buckets.append(s["tags"])
+            leaked: list[str] = []
+            for bucket in tag_buckets:
+                for k in bucket:
+                    kl = str(k).lower()
+                    if kl in ("title", "comment", "artist", "album", "description", "synopsis", "purl"):
+                        if kl not in leaked:
+                            leaked.append(kl)
+            if leaked:
+                tech_issues.append(f"unscrubbed source metadata tags present: {', '.join(leaked)}")
         audio: dict[str, Any] = {
             "unexpected_silence": verified_silence,
             "clipping_detected": clipping_detected,
@@ -513,6 +543,8 @@ class MediaQAInspector:
         }
         if subtitle["subtitles_expected"]:
             check_statuses["subtitle_timing"] = "FAIL" if timing_drift or not subtitles_present else "PASS"
+        if config.enforce_loudnorm_window:
+            check_statuses["audio_loudnorm"] = "PASS" if loudnorm_ok is True else "FAIL"
         mandatory = {
             "technical_container", "video_codec", "resolution", "pixel_format", "duration_match",
             "av_sync", "frame_sampling", "black_frame_check", "freeze_frame_check", "audio_presence",
@@ -520,6 +552,8 @@ class MediaQAInspector:
         }
         if subtitle["subtitles_expected"]:
             mandatory.add("subtitle_timing")
+        if config.enforce_loudnorm_window:
+            mandatory.add("audio_loudnorm")
         check_statuses["aggregate_mandatory_checks"] = (
             "PASS" if all(check_statuses.get(name) == "PASS" for name in mandatory) else "FAIL"
         )
@@ -553,6 +587,18 @@ class MediaQAInspector:
                 "video_path": str(path), "video_sha256": video_sha256, "file_size_bytes": size,
                 "status": "fail" if critical else "pass",
                 "production_state": "QA_FAILED" if critical else "QA_PASSED",
+                "technical_probe": {
+                    "resolution": resolution, "codec": codec,
+                    "pix_fmt": str(stream_video.get("pix_fmt") or "") if stream_video else "",
+                    "pixel_format_ok": pixel_format_ok,
+                    "fps": fps, "duration_seconds": duration,
+                },
+                "audio_spotcheck": {
+                    "integrated_lufs": audio.get("integrated_lufs"),
+                    "true_peak_dbtp": audio.get("true_peak_dbtp"),
+                    "clipping_detected": clipping_detected,
+                    "unexpected_silence": verified_silence,
+                },
                 "check_statuses": check_statuses, "issues": list(issues),
             }},
         }
@@ -639,6 +685,26 @@ class MediaQAInspector:
                 "video_path": r.video_path, "video_sha256": r.video_sha256,
                 "file_size_bytes": r.technical_probe.get("file_size_bytes", 0),
                 "status": r.status, "production_state": r.production_state,
+                "technical_probe": {
+                    "resolution": r.technical_probe.get("resolution"),
+                    "codec": r.technical_probe.get("codec"),
+                    "pix_fmt": (
+                        r.final_review_artifact.get("metadata", {})
+                        .get("clip_reports", {})
+                        .get(r.candidate_id, {})
+                        .get("technical_probe", {})
+                        .get("pix_fmt")
+                    ),
+                    "pixel_format_ok": r.check_statuses.get("pixel_format") == "PASS",
+                    "fps": r.technical_probe.get("fps"),
+                    "duration_seconds": r.technical_probe.get("duration_seconds"),
+                },
+                "audio_spotcheck": {
+                    "integrated_lufs": r.audio_spotcheck.get("integrated_lufs"),
+                    "true_peak_dbtp": r.audio_spotcheck.get("true_peak_dbtp"),
+                    "clipping_detected": r.audio_spotcheck.get("clipping_detected"),
+                    "unexpected_silence": r.audio_spotcheck.get("unexpected_silence"),
+                },
                 "check_statuses": r.check_statuses, "issues": list(r.issues),
             }
             for r in reports

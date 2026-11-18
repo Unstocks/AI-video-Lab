@@ -149,6 +149,16 @@ class LLMGateway:
                 parsed = extract_json_payload(content)
                 return response_model.model_validate(parsed)
             except Exception as exc:
+                # Fail fast on fatal transport, timeout, or auth errors instead of hanging 3x.
+                cls_name = type(exc).__name__
+                if cls_name in (
+                    "APITimeoutError",
+                    "APIConnectionError",
+                    "AuthenticationError",
+                    "PermissionDeniedError",
+                    "RateLimitError",
+                ) or isinstance(exc, (TimeoutError, ConnectionError)):
+                    raise RuntimeError(f"LLMGateway transport/auth failure ({cls_name}): {exc}") from exc
                 last_error = exc
                 continue
 

@@ -72,6 +72,8 @@ class SmoothedCameraman:
 
     def begin_scene(self) -> None:
         """Forget the previous shot's target and snap to the first detection in the new shot."""
+        self.current_center_x = self.video_width / 2.0
+        self.target_center_x = self.video_width / 2.0
         self._pending_target = None
         self._pending_count = 0
         self._snap_pending = True
@@ -249,3 +251,4 @@ class SpeakerTracker:
         self.last_switch_frame = frame_number
         self.locked_counter = 0
         return best_candidate["box"]
+

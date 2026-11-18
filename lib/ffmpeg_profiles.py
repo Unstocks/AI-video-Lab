@@ -146,7 +146,9 @@ def video_encode_args(
             "-c:v", "libx264", "-preset", preset,
             "-crf", str(effective_crf), "-pix_fmt", "yuv420p",
         ]
-    # Explicit non-H.264 codec passthrough (e.g. libvpx-vp9 / copy tests).
+    if resolved.lower() == "copy":
+        return ["-c:v", "copy"]
+    # Explicit non-H.264 codec passthrough (e.g. libvpx-vp9).
     effective_crf = _X264_PRESETS[tier][1] if crf is None else int(crf)
     return ["-c:v", resolved, "-crf", str(effective_crf), "-pix_fmt", "yuv420p"]
 

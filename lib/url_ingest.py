@@ -701,11 +701,26 @@ class URLIntakeAdapter:
             audio_probe = self.probe_media_file(staged_audio)
             audio_stream = next((item for item in audio_probe.get("streams", []) if item.get("codec_type") == "audio"), {})
             acquired = datetime.now(timezone.utc).isoformat()
+            def _parse_local_fps(rate_str: str) -> float:
+                if "/" in rate_str:
+                    num, den = rate_str.split("/", 1)
+                    try:
+                        return round(float(num) / float(den), 2)
+                    except (ValueError, ZeroDivisionError):
+                        return 0.0
+                try:
+                    return round(float(rate_str), 2)
+                except ValueError:
+                    return 0.0
+
+            local_fps = _parse_local_fps(
+                str(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "0/1")
+            )
             manifest = {
                 "version": "1.0", "project_id": project_id, "source_url": source.as_uri(),
                 "acquired_at": acquired, "duration_seconds": duration,
                 "resolution": [int(video_stream.get("width") or 0), int(video_stream.get("height") or 0)],
-                "fps": video_stream.get("r_frame_rate", "0/1"), "video_codec": codec,
+                "fps": local_fps, "video_codec": codec,
                 "audio_codec": audio_stream.get("codec_name", "pcm_s16le"), "sample_rate": 16000,
                 "channels": 1, "file_size_bytes": staged_video.stat().st_size,
                 "has_native_captions": bool(staged_transcript), "video_path": str(final_video),

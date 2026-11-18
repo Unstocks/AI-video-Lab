@@ -261,7 +261,7 @@ def _probe_video(video_path: Path) -> dict[str, Any]:
         "-show_format", "-show_streams",
         "-of", "json", str(video_path),
     ]
-    out = subprocess.check_output(cmd, text=True, timeout=30)
+    out = subprocess.check_output(cmd, text=True, encoding="utf-8", errors="replace", timeout=30)
     data = json.loads(out)
     streams = data.get("streams") or []
     v_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
@@ -284,12 +284,28 @@ def _probe_video(video_path: Path) -> dict[str, Any]:
     if int(abs(rot)) % 180 == 90:
         w, h = h, w
 
-    rate = str(v_stream.get("r_frame_rate") or "30/1")
-    if "/" in rate:
-        num, den = rate.split("/", 1)
-        fps = float(num) / float(den) if float(den) > 0 else 30.0
+    def _parse_rate(raw: Any) -> float:
+        text = str(raw or "").strip()
+        if not text:
+            return 0.0
+        try:
+            if "/" in text:
+                num, den = text.split("/", 1)
+                d_val = float(den)
+                return float(num) / d_val if d_val > 0 else 0.0
+            return float(text)
+        except (ValueError, ZeroDivisionError):
+            return 0.0
+
+    # Prefer avg_frame_rate on VFR sources so r_frame_rate (e.g. 90000/1) cannot explode durations.
+    avg_fps = _parse_rate(v_stream.get("avg_frame_rate"))
+    raw_fps = _parse_rate(v_stream.get("r_frame_rate"))
+    if 1.0 <= avg_fps <= 240.0:
+        fps = avg_fps
+    elif 1.0 <= raw_fps <= 240.0:
+        fps = raw_fps
     else:
-        fps = float(rate) or 30.0
+        fps = 30.0
 
     duration = float(
         (data.get("format") or {}).get("duration")
@@ -501,14 +517,18 @@ def _run_ffmpeg_with_fallback(
     effective = resolve_video_codec(requested_codec)
     warnings: list[str] = []
     cmd = build_cmd(effective)
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout
+    )
     if proc.returncode == 0:
         return effective, warnings
 
     if effective == "h264_nvenc":
         warnings.append(f"h264_nvenc failed during reframing; retried with libx264: {proc.stderr[:200]}")
         cmd_cpu = build_cmd("libx264")
-        proc2 = subprocess.run(cmd_cpu, capture_output=True, text=True, timeout=timeout)
+        proc2 = subprocess.run(
+            cmd_cpu, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout
+        )
         if proc2.returncode == 0:
             return "libx264", warnings
         raise RuntimeError(f"FFmpeg error (libx264 fallback): {proc2.stderr[:400]}")
@@ -528,6 +548,7 @@ def render_reframe_v2(
     audio_copy: bool = False,
     scrub_metadata: bool = True,
     shot_cuts: Sequence[float] | None = None,
+    forced_layout: str | None = None,
     enable_punch_in: bool = False,
     punch_in_zoom: float | None = None,
     emphasis_times: Sequence[float] | None = None,
@@ -558,10 +579,10 @@ def render_reframe_v2(
     warnings: list[str] = []
 
     # Fast path: vertical source already fits target aspect ratio (no pillarbox downgrade!)
-    if source_already_fits(orig_w, orig_h, aspect_ratio) and not crop_overrides:
+    if source_already_fits(orig_w, orig_h, aspect_ratio) and not crop_overrides and not enable_punch_in:
         vf = f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
         audio_args = (
-            (["-c:a", "copy"] if audio_copy else audio_encode_args(normalize=False))
+            (["-map", "0:a:0?", "-c:a", "copy"] if audio_copy else ["-map", "0:a:0?", *audio_encode_args(normalize=False)])
             if has_audio
             else ["-an"]
         )
@@ -570,7 +591,10 @@ def render_reframe_v2(
         def _build_passthrough(c: str) -> list[str]:
             return [
                 "ffmpeg", "-y", "-i", str(src),
+                "-map", "0:v:0",
                 "-vf", vf,
+                "-r", f"{fps:.6f}",
+                "-fps_mode", "cfr",
                 *video_encode_args(QUALITY_FAST, codec=c, crf=crf),
                 *audio_args,
                 *scrub_args,
@@ -599,24 +623,36 @@ def render_reframe_v2(
     # 1. Scene detection + short-scene merge
     scene_boundaries = _detect_scene_boundaries(src, fps, total_frames, shot_cuts=shot_cuts)
 
-    # 2. Face classification + 2-speaker SPLIT detection
+    # 2. Face classification + 2-speaker SPLIT detection (respecting explicit forced_layout!)
     splits: dict[int, tuple[tuple[float, float, float, float], tuple[float, float, float, float]]] = {}
     with MultiFaceDetector() as detector:
-        strategies = _classify_scenes(src, scene_boundaries, orig_w, detector)
-        found_splits = split_layout.detect_split_scenes(
-            str(src), scene_boundaries, strategies, fps=fps, detector=detector
-        )
-        for idx, centres in found_splits.items():
-            s_f, _e_f = scene_boundaries[idx]
-            splits[s_f] = centres
-            strategies[idx] = "SPLIT"
+        if forced_layout == "single_crop":
+            strategies = ["TRACK"] * len(scene_boundaries)
+        elif forced_layout == "blurred_pillarbox":
+            strategies = ["GENERAL"] * len(scene_boundaries)
+        elif forced_layout == "stacked_split":
+            strategies = ["SPLIT"] * len(scene_boundaries)
+            for s_f, _e_f in scene_boundaries:
+                splits[s_f] = (
+                    (orig_w * 0.25, orig_h * 0.45, orig_w * 0.14, orig_h * 0.24),
+                    (orig_w * 0.75, orig_h * 0.45, orig_w * 0.14, orig_h * 0.24),
+                )
+        else:
+            strategies = _classify_scenes(src, scene_boundaries, orig_w, detector)
+            found_splits = split_layout.detect_split_scenes(
+                str(src), scene_boundaries, strategies, fps=fps, detector=detector
+            )
+            for idx, centres in found_splits.items():
+                s_f, _e_f = scene_boundaries[idx]
+                splits[s_f] = centres
+                strategies[idx] = "SPLIT"
 
         # 3. Active-speaker mouth-motion + audio RMS gating for SPLIT scenes
         alternate_tracks: dict[int, list[int]] = {}
         cameraman_probe = SmoothedCameraman(out_w, out_h, orig_w, orig_h, aspect_ratio=aspect_ratio)
         crop_w, crop_h = cameraman_probe.crop_width, cameraman_probe.crop_height
 
-        if enable_active_speaker and splits:
+        if enable_active_speaker and splits and forced_layout != "stacked_split":
             for idx, (s_f, e_f) in enumerate(scene_boundaries):
                 if strategies[idx] != "SPLIT" or s_f not in splits:
                     continue
@@ -674,6 +710,7 @@ def render_reframe_v2(
 
     # 7. Per-scene native FFmpeg render in neutral ASCII workspace (TRAP-05 safe)
     encoder_used = resolve_video_codec(codec)
+    segment_codecs: set[str] = set()
     with tempfile.TemporaryDirectory(prefix="reframe_v2_") as tmp_str:
         tmp_dir = Path(tmp_str)
         segment_paths: list[Path] = []
@@ -681,7 +718,6 @@ def render_reframe_v2(
 
         for seg_idx, (s_f, e_f, strategy) in enumerate(clamped_ranges):
             seg_start = s_f / float(fps)
-            seg_dur = max(1.0 / float(fps), (e_f - s_f) / float(fps))
             seg_out = tmp_dir / f"seg_{seg_idx:03d}.mp4"
             seg_frames = max(1, e_f - s_f)
 
@@ -722,35 +758,48 @@ def render_reframe_v2(
                     cmd_file.write_text("\n".join(cmd_lines) + "\n", encoding="utf-8")
                     esc = escape_filter_value(cmd_file)
                     vf = (
+                        f"setpts=PTS-STARTPTS,"
                         f"sendcmd=f='{esc}',"
                         f"crop@c=w={init_w}:h={init_h}:x={init_x}:y={init_y},"
                         f"scale={out_w}:{out_h},setsar=1"
                     )
                 else:
                     vf = (
+                        f"setpts=PTS-STARTPTS,"
                         f"crop=w={init_w}:h={init_h}:x={init_x}:y={init_y},"
                         f"scale={out_w}:{out_h},setsar=1"
                     )
                 filter_args = ["-vf", vf]
 
-            def _build_seg(c: str, _s=seg_start, _d=seg_dur, _fa=filter_args, _out=seg_out) -> list[str]:
+            # Exact frame-count output (-frames:v seg_frames after -i) prevents cumulative
+            # +1/+2 frame B-frame drift across multi-scene non-keyframe cuts!
+            def _build_seg(c: str, _s=seg_start, _nf=seg_frames, _fa=filter_args, _out=seg_out) -> list[str]:
                 return [
                     "ffmpeg", "-y",
-                    "-ss", f"{_s:.4f}", "-t", f"{_d:.4f}",
+                    "-ss", f"{_s:.6f}",
                     "-i", str(src),
                     *_fa,
                     "-an",
                     "-r", f"{fps:.6f}",
                     "-fps_mode", "cfr",
+                    "-frames:v", str(_nf),
                     *video_encode_args(QUALITY_FAST, codec=c, crf=crf),
                     str(_out),
                 ]
 
             encoder_used, seg_warn = _run_ffmpeg_with_fallback(_build_seg, encoder_used)
+            segment_codecs.add(encoder_used)
             warnings.extend(seg_warn)
             segment_paths.append(seg_out)
 
-        # 8. Stream-copy concat + map audio + scrub metadata + faststart
+        # 8. Concat + map audio + scrub metadata + faststart
+        # If NVENC fell back to libx264 mid-loop, re-encode cleanly at concat to avoid mismatched SPS/PPS!
+        mixed_codecs = len(segment_codecs) > 1
+        concat_video_args = (
+            video_encode_args(QUALITY_FAST, codec="libx264", crf=crf)
+            if mixed_codecs
+            else ["-c:v", "copy"]
+        )
         audio_args = (
             (["-map", "1:a:0?", "-c:a", "copy"] if audio_copy else ["-map", "1:a:0?", *audio_encode_args(normalize=False)])
             if has_audio
@@ -766,7 +815,6 @@ def render_reframe_v2(
                 "-map", "0:v:0",
                 *audio_args,
                 "-c:v", "copy",
-                "-shortest",
                 *scrub_args,
                 "-movflags", "+faststart",
                 str(dst),
@@ -774,7 +822,10 @@ def render_reframe_v2(
         else:
             concat_file = tmp_dir / "concat.txt"
             concat_file.write_text(
-                "".join(f"file '{p.as_posix()}'\n" for p in segment_paths),
+                "".join(
+                    f"file '{p.as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n"
+                    for p in segment_paths
+                ),
                 encoding="utf-8",
             )
             mux_cmd = [
@@ -783,13 +834,14 @@ def render_reframe_v2(
                 "-i", str(src),
                 "-map", "0:v:0",
                 *audio_args,
-                "-c:v", "copy",
-                "-shortest",
+                *concat_video_args,
                 *scrub_args,
                 "-movflags", "+faststart",
                 str(dst),
             ]
-        proc = subprocess.run(mux_cmd, capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(
+            mux_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300
+        )
         if proc.returncode != 0:
             raise RuntimeError(f"FFmpeg concat/mux error: {proc.stderr[:400]}")
 
@@ -815,3 +867,4 @@ def render_reframe_v2(
         "layout_summary": summary,
         "warnings": warnings,
     }
+

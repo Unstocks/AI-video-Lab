@@ -246,3 +246,4 @@ def detect_split_scenes(
         cap.release()
 
     return found
+

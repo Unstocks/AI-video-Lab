@@ -1,18 +1,20 @@
 """SQLite session, transcript, and crop-draft store for Studio (.studio/sessions.sqlite).
 
 Lives strictly outside ``projects/`` so Backlot's watchfiles observer is never
-spammed by Studio UI session writes.
+spammed by Studio UI session writes. Uses WAL mode + explicit connection closing
+so Windows file handles never leak.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from lib.paths import REPO_ROOT
 
@@ -56,7 +58,7 @@ def _utc_now() -> str:
 
 
 class SessionStore:
-    """Thread-safe SQLite repository for Supervisor sessions, chat messages, and crop drafts."""
+    """Thread-safe SQLite repository with WAL mode and leak-free connection lifecycle."""
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
@@ -64,14 +66,22 @@ class SessionStore:
         self._lock = threading.Lock()
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), timeout=15.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 15000")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
             conn.executescript(_SCHEMA_SQL)
 
     def create_session(
@@ -85,7 +95,7 @@ class SessionStore:
     ) -> dict[str, Any]:
         sid = session_id or f"ses_{uuid.uuid4().hex[:10]}"
         now = _utc_now()
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO sessions (
@@ -95,17 +105,20 @@ class SessionStore:
                 """,
                 (sid, project_id, title, source_input, status, now, now),
             )
-        return self.get_session(sid)  # type: ignore[return-value]
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (sid,)
+            ).fetchone()
+            return dict(row)
 
     def get_session(self, session_id: str) -> Optional[dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             row = conn.execute(
                 "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
             ).fetchone()
             return dict(row) if row is not None else None
 
     def list_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ?", (int(limit),)
             ).fetchall()
@@ -134,19 +147,22 @@ class SessionStore:
                 updates.append(f"{col} = ?")
                 params.append(val)
         params.append(session_id)
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute(
                 f"UPDATE sessions SET {', '.join(updates)} WHERE session_id = ?",
                 params,
             )
-        return self.get_session(session_id)
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            return dict(row) if row is not None else None
 
     def append_message(
         self, session_id: str, role: str, content: dict[str, Any]
     ) -> dict[str, Any]:
         now = _utc_now()
         payload_str = json.dumps(content, ensure_ascii=False, default=str)
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO messages (session_id, role, content_json, created_at)
@@ -168,7 +184,7 @@ class SessionStore:
         }
 
     def list_messages(self, session_id: str, after_id: int = 0) -> list[dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             rows = conn.execute(
                 """
                 SELECT id, session_id, role, content_json, created_at
@@ -198,7 +214,7 @@ class SessionStore:
     ) -> dict[str, Any]:
         now = _utc_now()
         raw = json.dumps(overrides, ensure_ascii=False)
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO crop_drafts (project_id, candidate_id, overrides_json, updated_at)
@@ -216,7 +232,7 @@ class SessionStore:
         }
 
     def get_crop_drafts(self, project_id: str) -> dict[str, dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             rows = conn.execute(
                 "SELECT candidate_id, overrides_json FROM crop_drafts WHERE project_id = ?",
                 (project_id,),

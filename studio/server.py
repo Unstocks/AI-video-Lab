@@ -6,30 +6,36 @@ Unified Top-Supervisor interactive cockpit:
 - Owns ``SupervisorManager`` (driving ``fcc-claude`` via stream-json & ``--resume``)
   and SQLite session persistence in ``.studio/sessions.sqlite``.
 - Enforces hardened loopback-only + ``TrustedHostMiddleware`` + loopback ``Origin``
-  + per-boot ``X-Studio-Token`` CSRF protection on every write route (TRAP-08).
+  + ``Sec-Fetch-Site`` + per-boot ``X-Studio-Token`` CSRF protection (TRAP-08).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from backlot import server as backlot_server
-from backlot.state import PROJECTS_DIR, load_board_state
+from backlot.state import load_board_state
 from lib.face_detector import MultiFaceDetector
 from lib.ffmpeg_profiles import nvenc_available
 from lib.subtitle_styles import SUBTITLE_STYLE_PRESETS, SubtitleStylePreset
-from studio.security import generate_studio_token, require_loopback, require_studio_write
+from studio.security import (
+    generate_studio_token,
+    is_valid_project_id,
+    require_loopback,
+    require_studio_write,
+)
 from studio.session_store import SessionStore
 from studio.supervisor import (
     SessionBusyError,
@@ -42,10 +48,12 @@ from studio.supervisor import (
 STUDIO_UI_DIR = Path(__file__).resolve().parent / "ui"
 BACKLOT_UI_DIR = Path(__file__).resolve().parent.parent / "backlot" / "ui"
 SSE_HEARTBEAT_SECONDS = 15
+VALID_LAYOUT_MODES = ("auto", "single_crop", "blurred_pillarbox", "stacked_split", "speaker_cut")
+LayoutModeLiteral = Literal["auto", "single_crop", "blurred_pillarbox", "stacked_split", "speaker_cut"]
+DEFAULT_ALLOWED_HOSTS = ["127.0.0.1", "localhost", "::1", "[::1]"]
 
 
 def _ass_color_to_hex(ass_color: str) -> str:
-    """Convert ASS ``&HAABBGGRR`` to CSS ``#RRGGBB``."""
     raw = ass_color.strip().upper()
     if raw.startswith("&H") and len(raw) == 10:
         bb, gg, rr = raw[4:6], raw[6:8], raw[8:10]
@@ -114,11 +122,7 @@ def _load_project_transcript_words(
 
     segments: list[dict[str, Any]] = []
     if isinstance(transcript_data, dict):
-        raw_segs = (
-            transcript_data.get("segments")
-            or transcript_data.get("transcript")
-            or []
-        )
+        raw_segs = transcript_data.get("segments") or transcript_data.get("transcript") or []
         if isinstance(raw_segs, list):
             segments = [s for s in raw_segs if isinstance(s, dict)]
     elif isinstance(transcript_data, list):
@@ -165,6 +169,26 @@ def _load_project_transcript_words(
     }
 
 
+def _check_optional_project_id(val: Optional[str]) -> Optional[str]:
+    if val is None:
+        return None
+    cleaned = val.strip()
+    if not cleaned:
+        return None
+    if not is_valid_project_id(cleaned):
+        raise ValueError("project_id must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$")
+    return cleaned
+
+
+def _check_finite_number(val: Any, *, name: str) -> float:
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError(f"{name} must be a finite number (not boolean)")
+    f = float(val)
+    if not math.isfinite(f):
+        raise ValueError(f"{name} must be finite")
+    return f
+
+
 # --- Pydantic request bodies -----------------------------------------------
 
 class StartJobRequest(BaseModel):
@@ -172,8 +196,13 @@ class StartJobRequest(BaseModel):
     project_id: Optional[str] = None
     clip_count: int = Field(default=2, ge=1, le=10)
     style_preset: str = Field(default="hinglish_impact")
-    layout_mode: str = Field(default="auto")
+    layout_mode: LayoutModeLiteral = Field(default="auto")
     enable_punch_in: bool = Field(default=True)
+
+    @field_validator("project_id")
+    @classmethod
+    def _val_pid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_optional_project_id(v)
 
 
 class MessageRequest(BaseModel):
@@ -185,34 +214,85 @@ class ApproveRequest(BaseModel):
     approved_ids: list[str] = Field(default_factory=list)
     rejected_ids: list[str] = Field(default_factory=list)
     style_preset: Optional[str] = None
-    layout_mode: Optional[str] = None
+    layout_mode: Optional[LayoutModeLiteral] = None
     enable_punch_in: Optional[bool] = None
     notes: str = ""
     project_id: Optional[str] = None
+
+    @field_validator("project_id")
+    @classmethod
+    def _val_pid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_optional_project_id(v)
 
 
 class ReframeRequest(BaseModel):
     candidate_id: str = Field(..., min_length=1)
     crop_overrides: dict[str, Any] = Field(default_factory=dict)
     project_id: Optional[str] = None
+    style_preset: Optional[str] = None
+    enable_punch_in: Optional[bool] = None
+
+    @field_validator("project_id")
+    @classmethod
+    def _val_pid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_optional_project_id(v)
 
 
 class RecutRequest(BaseModel):
     candidate_id: str = Field(..., min_length=1)
-    start_seconds: float = Field(..., ge=0.0)
-    end_seconds: float = Field(..., gt=0.0)
+    start_seconds: float
+    end_seconds: float
     project_id: Optional[str] = None
+    style_preset: Optional[str] = None
+    layout_mode: Optional[LayoutModeLiteral] = None
+
+    @field_validator("project_id")
+    @classmethod
+    def _val_pid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_optional_project_id(v)
+
+    @field_validator("start_seconds", mode="before")
+    @classmethod
+    def _val_start(cls, v: Any) -> float:
+        f = _check_finite_number(v, name="start_seconds")
+        if f < 0.0:
+            raise ValueError("start_seconds must be >= 0")
+        return f
+
+    @field_validator("end_seconds", mode="before")
+    @classmethod
+    def _val_end(cls, v: Any) -> float:
+        f = _check_finite_number(v, name="end_seconds")
+        if f <= 0.0:
+            raise ValueError("end_seconds must be > 0")
+        return f
 
 
 class StyleChangeRequest(BaseModel):
     candidate_id: str = Field(..., min_length=1)
     style_preset: str = Field(..., min_length=1)
     project_id: Optional[str] = None
+    layout_mode: Optional[LayoutModeLiteral] = None
+
+    @field_validator("project_id")
+    @classmethod
+    def _val_pid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_optional_project_id(v)
 
 
 class ExportRequest(BaseModel):
     clip_ids: list[str] = Field(..., min_length=1)
     project_id: Optional[str] = None
+
+    @field_validator("project_id")
+    @classmethod
+    def _val_pid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_optional_project_id(v)
+
+
+def _probe_face_backend() -> str:
+    with MultiFaceDetector() as det:
+        return det.backend
 
 
 def create_app(
@@ -221,11 +301,13 @@ def create_app(
     supervisor: Optional[SupervisorManager] = None,
     studio_token: Optional[str] = None,
     enable_watcher: bool = True,
+    allowed_hosts: Optional[list[str]] = None,
 ) -> FastAPI:
     """Create the Studio FastAPI app with isolated dependencies for clean testing."""
     session_store = store or SessionStore()
     mgr = supervisor or SupervisorManager(session_store)
     token = studio_token or generate_studio_token()
+    hosts = list(allowed_hosts) if allowed_hosts is not None else list(DEFAULT_ALLOWED_HOSTS)
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
@@ -247,6 +329,8 @@ def create_app(
 
     def _render_index_html() -> HTMLResponse:
         index_path = STUDIO_UI_DIR / "index.html"
+        if not index_path.is_file():
+            raise HTTPException(status_code=503, detail="Studio UI assets not built yet.")
         html = index_path.read_text(encoding="utf-8")
         html = html.replace("__STUDIO_TOKEN__", token)
         for asset in ("studio.css", "studio.js"):
@@ -261,10 +345,11 @@ def create_app(
     @app.get("/api/studio/health")
     async def studio_health(request: Request) -> dict[str, Any]:
         require_loopback(request)
-        fcc = await asyncio.to_thread(probe_fcc_health)
-        nvenc = await asyncio.to_thread(nvenc_available)
-        with MultiFaceDetector() as det:
-            face_backend = det.backend
+        fcc, nvenc, face_backend = await asyncio.gather(
+            asyncio.to_thread(probe_fcc_health),
+            asyncio.to_thread(nvenc_available),
+            asyncio.to_thread(_probe_face_backend),
+        )
         return {
             "ok": True,
             "app": "studio",
@@ -291,7 +376,7 @@ def create_app(
         require_loopback(request)
         project_dir = backlot_server._safe_project_dir(project_id)
         state = await asyncio.to_thread(load_board_state, project_dir)
-        state["crop_drafts"] = session_store.get_crop_drafts(project_id)
+        state["crop_drafts"] = await asyncio.to_thread(session_store.get_crop_drafts, project_id)
         return state
 
     @app.get("/api/studio/project/{project_id}/transcript")
@@ -341,20 +426,22 @@ def create_app(
     @app.get("/api/studio/sessions")
     async def list_sessions(request: Request) -> list[dict[str, Any]]:
         require_loopback(request)
-        return session_store.list_sessions()
+        return await asyncio.to_thread(session_store.list_sessions)
 
     @app.get("/api/studio/sessions/{session_id}")
     async def get_session(session_id: str, request: Request) -> dict[str, Any]:
         require_loopback(request)
-        session = session_store.get_session(session_id)
+        session = await asyncio.to_thread(session_store.get_session, session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Unknown session")
         pid = session.get("project_id")
+        msgs = await asyncio.to_thread(session_store.list_messages, session_id)
+        drafts = await asyncio.to_thread(session_store.get_crop_drafts, pid) if pid else {}
         return {
             **session,
             "running": mgr.is_running(session_id),
-            "messages": session_store.list_messages(session_id),
-            "crop_drafts": session_store.get_crop_drafts(pid) if pid else {},
+            "messages": msgs,
+            "crop_drafts": drafts,
         }
 
     @app.get("/api/studio/sessions/{session_id}/stream")
@@ -364,16 +451,18 @@ def create_app(
         after_id: int = 0,
     ) -> StreamingResponse:
         require_loopback(request)
-        session = session_store.get_session(session_id)
+        session = await asyncio.to_thread(session_store.get_session, session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Unknown session")
 
         async def stream():
             q = mgr.subscribe(session_id)
+            sent_msg_ids: set[int] = set()
             try:
                 yield _sse({"type": "hello", "session_id": session_id, "status": session["status"]})
-                # Replay any missed persisted messages after cursor
-                for msg in session_store.list_messages(session_id, after_id=after_id):
+                replayed = await asyncio.to_thread(session_store.list_messages, session_id, after_id)
+                for msg in replayed:
+                    sent_msg_ids.add(int(msg["id"]))
                     yield _sse({"type": "replay", "message": msg})
                 while True:
                     if await request.is_disconnected():
@@ -383,6 +472,12 @@ def create_app(
                     except asyncio.TimeoutError:
                         yield _sse({"type": "heartbeat", "ts": time.time()})
                         continue
+                    msg_obj = evt.get("message") if isinstance(evt, dict) else None
+                    if isinstance(msg_obj, dict) and msg_obj.get("id") is not None:
+                        mid = int(msg_obj["id"])
+                        if mid in sent_msg_ids:
+                            continue
+                        sent_msg_ids.add(mid)
                     yield _sse(evt)
             finally:
                 mgr.unsubscribe(session_id, q)
@@ -404,11 +499,14 @@ def create_app(
             return HTTPException(status_code=400, detail=str(exc))
         return HTTPException(status_code=500, detail=str(exc))
 
+    def _validate_preset(preset_name: Optional[str]) -> None:
+        if preset_name is not None and preset_name not in SUBTITLE_STYLE_PRESETS:
+            raise HTTPException(status_code=400, detail=f"Unknown style_preset: {preset_name}")
+
     @app.post("/api/studio/jobs", status_code=201)
     async def create_job(body: StartJobRequest, request: Request) -> dict[str, Any]:
         require_studio_write(request, token)
-        if body.style_preset not in SUBTITLE_STYLE_PRESETS:
-            raise HTTPException(status_code=400, detail=f"Unknown style_preset: {body.style_preset}")
+        _validate_preset(body.style_preset)
         try:
             return await mgr.start_url_job(
                 source_input=body.source_input,
@@ -438,6 +536,7 @@ def create_app(
         session_id: str, body: ApproveRequest, request: Request
     ) -> dict[str, Any]:
         require_studio_write(request, token)
+        _validate_preset(body.style_preset)
         try:
             return await mgr.send_approval(
                 session_id,
@@ -457,12 +556,15 @@ def create_app(
         session_id: str, body: ReframeRequest, request: Request
     ) -> dict[str, Any]:
         require_studio_write(request, token)
+        _validate_preset(body.style_preset)
         try:
             return await mgr.send_reframe_override(
                 session_id,
                 candidate_id=body.candidate_id,
                 crop_overrides=body.crop_overrides,
                 project_id=body.project_id,
+                style_preset=body.style_preset,
+                enable_punch_in=body.enable_punch_in,
             )
         except Exception as exc:
             raise _map_supervisor_errors(exc)
@@ -472,6 +574,7 @@ def create_app(
         session_id: str, body: RecutRequest, request: Request
     ) -> dict[str, Any]:
         require_studio_write(request, token)
+        _validate_preset(body.style_preset)
         try:
             return await mgr.send_recut(
                 session_id,
@@ -479,6 +582,8 @@ def create_app(
                 start_seconds=body.start_seconds,
                 end_seconds=body.end_seconds,
                 project_id=body.project_id,
+                style_preset=body.style_preset,
+                layout_mode=body.layout_mode,
             )
         except Exception as exc:
             raise _map_supervisor_errors(exc)
@@ -488,14 +593,14 @@ def create_app(
         session_id: str, body: StyleChangeRequest, request: Request
     ) -> dict[str, Any]:
         require_studio_write(request, token)
-        if body.style_preset not in SUBTITLE_STYLE_PRESETS:
-            raise HTTPException(status_code=400, detail=f"Unknown style_preset: {body.style_preset}")
+        _validate_preset(body.style_preset)
         try:
             return await mgr.send_style_change(
                 session_id,
                 candidate_id=body.candidate_id,
                 style_preset=body.style_preset,
                 project_id=body.project_id,
+                layout_mode=body.layout_mode,
             )
         except Exception as exc:
             raise _map_supervisor_errors(exc)
@@ -578,7 +683,7 @@ def create_app(
 
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["127.0.0.1", "localhost", "testserver"],
+        allowed_hosts=hosts,
         www_redirect=False,
     )
     return app

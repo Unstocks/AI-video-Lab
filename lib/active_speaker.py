@@ -277,8 +277,19 @@ def decode_activity(
                 bucket = []
     finally:
         if proc.stdout is not None:
-            proc.stdout.close()
-        proc.wait()
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
 
     if bucket:
         activity.append(np.mean(bucket, axis=0).tolist())
@@ -306,3 +317,4 @@ def verdicts_for_scene(
     )
     loudness = audio_envelope(video_path, start_s, duration_s)
     return attribute_windows(normalise_activity(activity), loudness)
+

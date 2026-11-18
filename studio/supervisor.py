@@ -1,44 +1,43 @@
 """Top-Supervisor process manager driving ``fcc-claude`` via stream-json NDJSON & ``--resume``.
 
-Architecture (`MASTER_04` Section 4.3):
-- Spawns ``fcc-claude -p <directive> --output-format stream-json --verbose``
-  with ``cwd = REPO_ROOT`` and ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1``.
-- Captures ``claude_session_id`` on Turn 1 and passes ``--resume <id>`` on all
-  subsequent turns (chat, 1-click Approve, Reframe Override, Recut, Export).
-- Enforces strict 1-active-turn-per-session concurrency via ``asyncio.Lock``
-  (raises ``SessionBusyError`` -> HTTP 409 Conflict on overlap).
-- Parses NDJSON stream into typed Studio SSE events (``session.init``,
-  ``message.text``, ``tool.start``, ``tool.finish``, ``session.linked_project``,
-  ``run.done``) and persists messages in ``SessionStore`` (``.studio/sessions.sqlite``).
-- Auto-links ``session.project_id`` whenever a tool_use argument references
-  ``projects/<id>/`` so the Right Pane Clip Studio switches automatically!
-- Clean Windows process-tree cancellation via ``taskkill /F /T /PID`` fallback.
+Hardened invariants:
+- Per-session ``asyncio.Lock`` serializes start/stop/send cleanly (zero stop/start
+  races, zero ghost sessions, HTTP 409 on concurrent sends).
+- Safe chunked NDJSON line reader (``limit=16 MiB`` + manual chunked scan) so
+  large ``tool_result`` transcripts (>64 KiB) NEVER crash ``StreamReader``.
+- Bounded stderr ring buffer (``deque(maxlen=200)``).
+- Guaranteed subprocess-tree & task cleanup in ``finally:`` on ANY exception
+  (async ``taskkill /F /T`` on Windows — never blocks event loop, zero zombies).
+- Auto-links ``session.project_id`` ONLY when currently unset and validated as a
+  real project slug (never hijacks an explicitly bound project).
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
 import logging
 import os
 import re
 import shutil
-import subprocess
 import sys
-import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from backlot.state import PROJECTS_DIR, load_board_state
 from lib.events import infer_project_dir
 from lib.paths import REPO_ROOT
 from studio import prompts
+from studio.security import is_valid_project_id
 from studio.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
 
-_PROJECT_PATH_RE = re.compile(r"projects[\\/]([A-Za-z0-9][A-Za-z0-9._-]{0,80})")
+_PROJECT_PATH_RE = re.compile(r"projects[\\/]([A-Za-z0-9][A-Za-z0-9_-]{0,80})")
+_STREAM_READER_LIMIT = 16 * 1024 * 1024  # 16 MiB buffer limit
+_MAX_LINE_BYTES = 16 * 1024 * 1024
 
 
 class SessionBusyError(RuntimeError):
@@ -110,19 +109,20 @@ def probe_fcc_health(base_url: str | None = None, timeout: float = 1.5) -> dict[
 
 
 def _extract_project_id_from_inputs(tool_input: Any) -> Optional[str]:
-    """Infer ``project_id`` from a tool_use input dict or text."""
+    """Infer a validated ``project_id`` from a tool_use input dict or text."""
     if isinstance(tool_input, dict):
         pid = tool_input.get("project_id")
-        if isinstance(pid, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,80}", pid):
-            return pid
+        if is_valid_project_id(pid):
+            return str(pid)
         inferred = infer_project_dir(tool_input)
-        if inferred is not None:
+        if inferred is not None and is_valid_project_id(inferred.name):
             return inferred.name
         blob = json.dumps(tool_input, default=str)
     else:
         blob = str(tool_input or "")
     m = _PROJECT_PATH_RE.search(blob)
-    return m.group(1) if m else None
+    cand = m.group(1) if m else None
+    return cand if is_valid_project_id(cand) else None
 
 
 def _summarize_tool_input(tool_input: Any) -> str:
@@ -146,6 +146,43 @@ def _summarize_tool_result(content: Any) -> str:
     return text.strip()[:400]
 
 
+async def _iter_lines_safe(
+    stream: asyncio.StreamReader,
+    *,
+    chunk_size: int = 65536,
+    max_line_bytes: int = _MAX_LINE_BYTES,
+) -> AsyncIterator[str]:
+    """Yield decoded lines from ``stream`` without EVER raising ``LimitOverrunError``."""
+    buf = bytearray()
+    oversized = False
+    while True:
+        chunk = await stream.read(chunk_size)
+        if not chunk:
+            if buf:
+                yield buf.decode("utf-8", errors="replace").rstrip("\r\n")
+            return
+        start = 0
+        while True:
+            nl = chunk.find(b"\n", start)
+            if nl == -1:
+                rem = chunk[start:]
+                if not oversized:
+                    if len(buf) + len(rem) <= max_line_bytes:
+                        buf.extend(rem)
+                    else:
+                        oversized = True
+                        buf.extend(rem[: max(0, max_line_bytes - len(buf))])
+                break
+            piece = chunk[start:nl]
+            if not oversized and len(buf) + len(piece) <= max_line_bytes:
+                buf.extend(piece)
+            if buf:
+                yield buf.decode("utf-8", errors="replace").rstrip("\r")
+            buf.clear()
+            oversized = False
+            start = nl + 1
+
+
 class SupervisorManager:
     """Owns loopback ``fcc-claude`` subprocesses, SSE subscribers, and SQLite persistence."""
 
@@ -162,15 +199,31 @@ class SupervisorManager:
         self._supervisor_args_prefix = list(supervisor_args_prefix or [])
         self.cwd = Path(cwd) if cwd is not None else REPO_ROOT
 
+        self._locks: dict[str, asyncio.Lock] = {}
         self._active_procs: dict[str, asyncio.subprocess.Process] = {}
         self._active_tasks: dict[str, asyncio.Task[Any]] = {}
         self._stopped_sessions: set[str] = set()
         self._subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
         self._seen_op_ids: dict[str, set[str]] = {}
 
-    def _resolve_command(self, directive: str, claude_session_id: str | None) -> list[str]:
+    def _lock_for(self, session_id: str) -> asyncio.Lock:
+        lock = self._locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[session_id] = lock
+        return lock
+
+    def _resolve_command(
+        self, directive: str, claude_session_id: str | None
+    ) -> tuple[list[str], Optional[bytes]]:
+        """Return ``(argv, stdin_bytes)``.
+
+        Windows ``.cmd`` / ``.bat`` shims truncate multiline CLI args and fail
+        past 8 KiB, so for batch shims we pipe the directive cleanly via stdin.
+        """
         if self._supervisor_args_prefix:
             cmd = list(self._supervisor_args_prefix)
+            is_batch_shim = False
         else:
             binary = discover_supervisor_bin(self._supervisor_bin_override)
             if not binary:
@@ -179,10 +232,17 @@ class SupervisorManager:
                     "Install Free Claude Code or set STUDIO_SUPERVISOR_BIN."
                 )
             cmd = [binary]
+            is_batch_shim = Path(binary).suffix.lower() in (".cmd", ".bat")
+
         if claude_session_id:
             cmd.extend(["--resume", claude_session_id])
+
+        if is_batch_shim:
+            cmd.extend(["-p", "--output-format", "stream-json", "--verbose"])
+            return cmd, (directive + "\n").encode("utf-8")
+
         cmd.extend(["-p", directive, "--output-format", "stream-json", "--verbose"])
-        return cmd
+        return cmd, None
 
     def is_running(self, session_id: str) -> bool:
         task = self._active_tasks.get(session_id)
@@ -208,7 +268,6 @@ class SupervisorManager:
                 pass
 
     def _check_and_mark_op(self, session_id: str, client_op_id: str | None) -> bool:
-        """Return True if this ``client_op_id`` was already processed (duplicate click)."""
         if not client_op_id:
             return False
         bucket = self._seen_op_ids.setdefault(session_id, set())
@@ -232,15 +291,9 @@ class SupervisorManager:
         cleaned = source_input.strip()
         if not cleaned:
             raise ValueError("source_input must be a non-empty URL or file path.")
+        if project_id is not None and not is_valid_project_id(project_id):
+            raise ValueError("Invalid project_id.")
 
-        title = project_id or Path(cleaned.rstrip("/\\")).name or cleaned[:48]
-        session = self.store.create_session(
-            title=title[:80],
-            source_input=cleaned,
-            project_id=project_id,
-            status="running",
-        )
-        sid = session["session_id"]
         directive = prompts.build_start_job_prompt(
             source_input=cleaned,
             project_id=project_id,
@@ -249,12 +302,24 @@ class SupervisorManager:
             layout_mode=layout_mode,
             enable_punch_in=enable_punch_in,
         )
+        # Verify CLI executable BEFORE creating a session row (no ghost 'running' rows!)
+        self._resolve_command(directive, None)
+
+        title = project_id or Path(cleaned.rstrip("/\\")).name or cleaned[:48]
+        session = await asyncio.to_thread(
+            self.store.create_session,
+            title=title[:80],
+            source_input=cleaned,
+            project_id=project_id,
+            status="idle",
+        )
+        sid = session["session_id"]
         display_summary = (
             f"Start production: {cleaned} "
-            f"(clips≤{clip_count}, preset={style_preset}, layout={layout_mode}, punch_in={enable_punch_in})"
+            f"(clips<={clip_count}, preset={style_preset}, layout={layout_mode}, punch_in={enable_punch_in})"
         )
         await self._launch_turn(sid, directive, user_display=display_summary)
-        return self.store.get_session(sid) or session
+        return await asyncio.to_thread(self.store.get_session, sid) or session
 
     async def send_message(
         self,
@@ -263,7 +328,7 @@ class SupervisorManager:
         *,
         client_op_id: str | None = None,
     ) -> dict[str, Any]:
-        session = self.store.get_session(session_id)
+        session = await asyncio.to_thread(self.store.get_session, session_id)
         if session is None:
             raise KeyError(f"Unknown session: {session_id}")
         if self._check_and_mark_op(session_id, client_op_id):
@@ -272,7 +337,7 @@ class SupervisorManager:
         if not cleaned:
             raise ValueError("Message text cannot be empty.")
         await self._launch_turn(session_id, cleaned, user_display=cleaned)
-        return self.store.get_session(session_id) or session
+        return await asyncio.to_thread(self.store.get_session, session_id) or session
 
     async def send_approval(
         self,
@@ -286,12 +351,12 @@ class SupervisorManager:
         notes: str = "",
         project_id: str | None = None,
     ) -> dict[str, Any]:
-        session = self.store.get_session(session_id)
+        session = await asyncio.to_thread(self.store.get_session, session_id)
         if session is None:
             raise KeyError(f"Unknown session: {session_id}")
         pid = project_id or session.get("project_id")
-        if not pid:
-            raise ValueError("No project linked to this session yet.")
+        if not pid or not is_valid_project_id(pid):
+            raise ValueError("No valid project linked to this session yet.")
         directive = prompts.build_approval_prompt(
             project_id=pid,
             approved_ids=approved_ids,
@@ -303,7 +368,7 @@ class SupervisorManager:
         )
         label = f"Approved {', '.join(approved_ids) or 'none'} for rendering on RTX 3050"
         await self._launch_turn(session_id, directive, user_display=label)
-        return self.store.get_session(session_id) or session
+        return await asyncio.to_thread(self.store.get_session, session_id) or session
 
     async def send_reframe_override(
         self,
@@ -312,25 +377,30 @@ class SupervisorManager:
         candidate_id: str,
         crop_overrides: dict[str, Any],
         project_id: str | None = None,
+        style_preset: str | None = None,
+        enable_punch_in: bool | None = None,
     ) -> dict[str, Any]:
-        session = self.store.get_session(session_id)
+        session = await asyncio.to_thread(self.store.get_session, session_id)
         if session is None:
             raise KeyError(f"Unknown session: {session_id}")
         pid = project_id or session.get("project_id")
-        if not pid:
-            raise ValueError("No project linked to this session yet.")
-        self.store.save_crop_draft(pid, candidate_id, crop_overrides)
+        if not pid or not is_valid_project_id(pid):
+            raise ValueError("No valid project linked to this session yet.")
         directive = prompts.build_reframe_prompt(
             project_id=pid,
             candidate_id=candidate_id,
             crop_overrides=crop_overrides,
+            style_preset=style_preset,
+            enable_punch_in=enable_punch_in,
         )
+        # Launch turn FIRST (acquires lock & verifies not busy) before persisting draft
         await self._launch_turn(
             session_id,
             directive,
             user_display=f"Apply Reframe overrides on {candidate_id} ({len(crop_overrides)} scene(s))",
+            pre_commit=lambda: self.store.save_crop_draft(pid, candidate_id, crop_overrides),
         )
-        return self.store.get_session(session_id) or session
+        return await asyncio.to_thread(self.store.get_session, session_id) or session
 
     async def send_recut(
         self,
@@ -340,13 +410,15 @@ class SupervisorManager:
         start_seconds: float,
         end_seconds: float,
         project_id: str | None = None,
+        style_preset: str | None = None,
+        layout_mode: str | None = None,
     ) -> dict[str, Any]:
-        session = self.store.get_session(session_id)
+        session = await asyncio.to_thread(self.store.get_session, session_id)
         if session is None:
             raise KeyError(f"Unknown session: {session_id}")
         pid = project_id or session.get("project_id")
-        if not pid:
-            raise ValueError("No project linked to this session yet.")
+        if not pid or not is_valid_project_id(pid):
+            raise ValueError("No valid project linked to this session yet.")
         if end_seconds <= start_seconds or start_seconds < 0:
             raise ValueError("Invalid recut window: end_seconds must exceed start_seconds >= 0.")
         directive = prompts.build_recut_prompt(
@@ -354,13 +426,15 @@ class SupervisorManager:
             candidate_id=candidate_id,
             start_seconds=start_seconds,
             end_seconds=end_seconds,
+            style_preset=style_preset,
+            layout_mode=layout_mode,
         )
         await self._launch_turn(
             session_id,
             directive,
             user_display=f"Recut {candidate_id} to {start_seconds:.2f}s–{end_seconds:.2f}s",
         )
-        return self.store.get_session(session_id) or session
+        return await asyncio.to_thread(self.store.get_session, session_id) or session
 
     async def send_style_change(
         self,
@@ -369,24 +443,26 @@ class SupervisorManager:
         candidate_id: str,
         style_preset: str,
         project_id: str | None = None,
+        layout_mode: str | None = None,
     ) -> dict[str, Any]:
-        session = self.store.get_session(session_id)
+        session = await asyncio.to_thread(self.store.get_session, session_id)
         if session is None:
             raise KeyError(f"Unknown session: {session_id}")
         pid = project_id or session.get("project_id")
-        if not pid:
-            raise ValueError("No project linked to this session yet.")
+        if not pid or not is_valid_project_id(pid):
+            raise ValueError("No valid project linked to this session yet.")
         directive = prompts.build_style_change_prompt(
             project_id=pid,
             candidate_id=candidate_id,
             style_preset=style_preset,
+            layout_mode=layout_mode,
         )
         await self._launch_turn(
             session_id,
             directive,
             user_display=f"Change subtitle preset on {candidate_id} -> {style_preset}",
         )
-        return self.store.get_session(session_id) or session
+        return await asyncio.to_thread(self.store.get_session, session_id) or session
 
     async def send_export(
         self,
@@ -395,41 +471,47 @@ class SupervisorManager:
         clip_ids: list[str],
         project_id: str | None = None,
     ) -> dict[str, Any]:
-        session = self.store.get_session(session_id)
+        session = await asyncio.to_thread(self.store.get_session, session_id)
         if session is None:
             raise KeyError(f"Unknown session: {session_id}")
         pid = project_id or session.get("project_id")
-        if not pid:
-            raise ValueError("No project linked to this session yet.")
+        if not pid or not is_valid_project_id(pid):
+            raise ValueError("No valid project linked to this session yet.")
         directive = prompts.build_export_prompt(project_id=pid, clip_ids=clip_ids)
         await self._launch_turn(
             session_id,
             directive,
             user_display=f"Export approved clips: {', '.join(clip_ids)}",
         )
-        return self.store.get_session(session_id) or session
+        return await asyncio.to_thread(self.store.get_session, session_id) or session
 
     async def stop_run(self, session_id: str) -> dict[str, Any]:
-        session = self.store.get_session(session_id)
-        if session is None:
-            raise KeyError(f"Unknown session: {session_id}")
-        self._stopped_sessions.add(session_id)
-        proc = self._active_procs.get(session_id)
-        if proc is not None and proc.returncode is None:
-            await self._terminate_process_tree(proc)
-        task = self._active_tasks.get(session_id)
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                pass
-        updated = self.store.update_session(session_id, status="stopped")
-        msg = self.store.append_message(
-            session_id, "system", {"text": "Supervisor run stopped by user."}
-        )
-        self._publish(session_id, {"type": "run.done", "status": "stopped", "message": msg})
-        return updated or session
+        async with self._lock_for(session_id):
+            session = await asyncio.to_thread(self.store.get_session, session_id)
+            if session is None:
+                raise KeyError(f"Unknown session: {session_id}")
+            self._stopped_sessions.add(session_id)
+            proc = self._active_procs.get(session_id)
+            if proc is not None and proc.returncode is None:
+                await self._terminate_process_tree(proc)
+            task = self._active_tasks.get(session_id)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+            updated = await asyncio.to_thread(
+                self.store.update_session, session_id, status="stopped"
+            )
+            msg = await asyncio.to_thread(
+                self.store.append_message,
+                session_id,
+                "system",
+                {"text": "Supervisor run stopped by user."},
+            )
+            self._publish(session_id, {"type": "run.done", "status": "stopped", "message": msg})
+            return updated or session
 
     async def shutdown(self) -> None:
         """Terminate all running Supervisor subprocesses on server shutdown."""
@@ -444,12 +526,12 @@ class SupervisorManager:
             return
         if sys.platform == "win32":
             try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=5,
+                killer = await asyncio.create_subprocess_exec(
+                    "taskkill", "/F", "/T", "/PID", str(proc.pid),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
                 )
+                await asyncio.wait_for(killer.wait(), timeout=5.0)
             except Exception:
                 pass
         try:
@@ -462,64 +544,84 @@ class SupervisorManager:
             except Exception:
                 pass
 
-    async def _launch_turn(self, session_id: str, directive: str, *, user_display: str) -> None:
-        if self.is_running(session_id):
-            raise SessionBusyError(f"Session {session_id} already has an active Supervisor turn.")
+    async def _launch_turn(
+        self,
+        session_id: str,
+        directive: str,
+        *,
+        user_display: str,
+        pre_commit: Any = None,
+    ) -> None:
+        async with self._lock_for(session_id):
+            if self.is_running(session_id):
+                raise SessionBusyError(f"Session {session_id} already has an active Supervisor turn.")
 
-        session = self.store.get_session(session_id)
-        if session is None:
-            raise KeyError(f"Unknown session: {session_id}")
+            session = await asyncio.to_thread(self.store.get_session, session_id)
+            if session is None:
+                raise KeyError(f"Unknown session: {session_id}")
 
-        # Validate executable availability up front before transitioning state
-        cmd = self._resolve_command(directive, session.get("claude_session_id"))
+            cmd, stdin_bytes = self._resolve_command(directive, session.get("claude_session_id"))
 
-        self._stopped_sessions.discard(session_id)
-        user_msg = self.store.append_message(
-            session_id, "user", {"text": user_display, "directive": directive}
-        )
-        self.store.update_session(session_id, status="running", last_error=None)
-        self._publish(session_id, {"type": "message.user", "message": user_msg})
-        self._publish(session_id, {"type": "run.start", "session_id": session_id})
+            if pre_commit is not None:
+                await asyncio.to_thread(pre_commit)
 
-        task = asyncio.create_task(self._run_turn(session_id, cmd))
-        self._active_tasks[session_id] = task
+            self._stopped_sessions.discard(session_id)
+            user_msg = await asyncio.to_thread(
+                self.store.append_message,
+                session_id,
+                "user",
+                {"text": user_display, "directive": directive},
+            )
+            await asyncio.to_thread(
+                self.store.update_session, session_id, status="running", last_error=None
+            )
+            self._publish(session_id, {"type": "message.user", "message": user_msg})
+            self._publish(session_id, {"type": "run.start", "session_id": session_id})
 
-    async def _run_turn(self, session_id: str, cmd: list[str]) -> None:
+            task = asyncio.create_task(self._run_turn(session_id, cmd, stdin_bytes))
+            self._active_tasks[session_id] = task
+
+    async def _run_turn(
+        self, session_id: str, cmd: list[str], stdin_bytes: Optional[bytes] = None
+    ) -> None:
         child_env = os.environ.copy()
         child_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
         child_env.setdefault("PYTHONIOENCODING", "utf-8")
 
         proc: Optional[asyncio.subprocess.Process] = None
-        stderr_chunks: list[str] = []
+        stderr_task: Optional[asyncio.Task[Any]] = None
+        stderr_chunks: deque[str] = deque(maxlen=200)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=str(self.cwd),
+                stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=_STREAM_READER_LIMIT,
                 env=child_env,
             )
             self._active_procs[session_id] = proc
 
+            if stdin_bytes is not None and proc.stdin is not None:
+                proc.stdin.write(stdin_bytes)
+                await proc.stdin.drain()
+                proc.stdin.close()
+
             async def _drain_stderr() -> None:
                 assert proc is not None and proc.stderr is not None
-                while True:
-                    line = await proc.stderr.readline()
-                    if not line:
-                        break
-                    stderr_chunks.append(line.decode("utf-8", errors="replace").rstrip())
+                async for line_str in _iter_lines_safe(proc.stderr, max_line_bytes=256 * 1024):
+                    if line_str:
+                        stderr_chunks.append(line_str)
 
             stderr_task = asyncio.create_task(_drain_stderr())
 
             assert proc.stdout is not None
-            while True:
-                raw_line = await proc.stdout.readline()
-                if not raw_line:
-                    break
-                line_str = raw_line.decode("utf-8", errors="replace").strip()
-                if not line_str:
+            async for line_str in _iter_lines_safe(proc.stdout):
+                cleaned = line_str.strip()
+                if not cleaned:
                     continue
-                self._handle_stream_line(session_id, line_str)
+                await asyncio.to_thread(self._handle_stream_line, session_id, cleaned)
 
             await proc.wait()
             await stderr_task
@@ -528,45 +630,63 @@ class SupervisorManager:
                 return
 
             if proc.returncode == 0:
-                next_status = self._infer_post_turn_status(session_id)
-                self.store.update_session(session_id, status=next_status, last_error=None)
+                next_status = await asyncio.to_thread(self._infer_post_turn_status, session_id)
+                await asyncio.to_thread(
+                    self.store.update_session, session_id, status=next_status, last_error=None
+                )
                 self._publish(
                     session_id,
                     {"type": "run.done", "status": next_status, "exit_code": 0},
                 )
             else:
-                err_tail = "\n".join(stderr_chunks[-10:]) or f"Supervisor exited with code {proc.returncode}"
-                self.store.update_session(session_id, status="error", last_error=err_tail[:500])
-                err_msg = self.store.append_message(
-                    session_id, "system", {"text": err_tail[:500], "is_error": True}
+                err_tail = "\n".join(list(stderr_chunks)[-10:]) or f"Supervisor exited with code {proc.returncode}"
+                await asyncio.to_thread(
+                    self.store.update_session, session_id, status="error", last_error=err_tail[:500]
+                )
+                err_msg = await asyncio.to_thread(
+                    self.store.append_message,
+                    session_id,
+                    "system",
+                    {"text": err_tail[:500], "is_error": True},
                 )
                 self._publish(
                     session_id,
                     {"type": "run.done", "status": "error", "error": err_tail[:500], "message": err_msg},
                 )
         except asyncio.CancelledError:
-            if proc is not None and proc.returncode is None:
-                await self._terminate_process_tree(proc)
             raise
         except Exception as exc:
             logger.exception("Supervisor turn crashed for %s", session_id)
             err = str(exc)
-            self.store.update_session(session_id, status="error", last_error=err[:500])
-            err_msg = self.store.append_message(
-                session_id, "system", {"text": err[:500], "is_error": True}
+            await asyncio.to_thread(
+                self.store.update_session, session_id, status="error", last_error=err[:500]
+            )
+            err_msg = await asyncio.to_thread(
+                self.store.append_message,
+                session_id,
+                "system",
+                {"text": err[:500], "is_error": True},
             )
             self._publish(
                 session_id,
                 {"type": "run.done", "status": "error", "error": err[:500], "message": err_msg},
             )
         finally:
+            if proc is not None and proc.returncode is None:
+                await self._terminate_process_tree(proc)
+            if stderr_task is not None and not stderr_task.done():
+                stderr_task.cancel()
+                try:
+                    await asyncio.wait_for(stderr_task, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
             self._active_procs.pop(session_id, None)
             self._active_tasks.pop(session_id, None)
 
     def _infer_post_turn_status(self, session_id: str) -> str:
         session = self.store.get_session(session_id) or {}
         pid = session.get("project_id")
-        if pid:
+        if pid and is_valid_project_id(pid):
             proj_dir = PROJECTS_DIR / pid
             if proj_dir.is_dir():
                 try:
@@ -581,30 +701,34 @@ class SupervisorManager:
                     pass
         return "idle"
 
-    def _maybe_link_project(self, session_id: str, project_id: str | None) -> None:
-        if not project_id:
+    def _maybe_link_project(
+        self, session_id: str, project_id: str | None, *, from_intake_tool: bool = False
+    ) -> None:
+        """Auto-bind ``session.project_id`` ONLY when currently unset (never hijack existing binding)."""
+        if not project_id or not is_valid_project_id(project_id):
             return
         session = self.store.get_session(session_id)
-        if session and session.get("project_id") != project_id:
-            self.store.update_session(session_id, project_id=project_id)
-            self._publish(
-                session_id,
-                {"type": "session.linked_project", "project_id": project_id},
-            )
+        if not session or session.get("project_id"):
+            return
+        if not from_intake_tool and not (PROJECTS_DIR / project_id).is_dir():
+            return
+        self.store.update_session(session_id, project_id=project_id)
+        self._publish(
+            session_id,
+            {"type": "session.linked_project", "project_id": project_id},
+        )
 
     def _handle_stream_line(self, session_id: str, line_str: str) -> None:
         try:
             evt = json.loads(line_str)
         except json.JSONDecodeError:
-            # Non-JSON line (e.g. plain diagnostic text) -> surface cleanly as assistant text
-            msg = self.store.append_message(session_id, "assistant", {"text": line_str})
+            msg = self.store.append_message(session_id, "assistant", {"text": line_str[:4000]})
             self._publish(session_id, {"type": "message.text", "message": msg})
             return
 
         if not isinstance(evt, dict):
             return
 
-        # Persist claude_session_id whenever reported (system init or result)
         csid = evt.get("session_id")
         if isinstance(csid, str) and csid.strip():
             self.store.update_session(session_id, claude_session_id=csid.strip())
@@ -638,7 +762,12 @@ class SupervisorManager:
                     tool_id = str(block.get("id") or "")
                     name = str(block.get("name") or "tool")
                     tool_input = block.get("input") or {}
-                    self._maybe_link_project(session_id, _extract_project_id_from_inputs(tool_input))
+                    is_intake = name in ("url_intake", "local_media_intake")
+                    self._maybe_link_project(
+                        session_id,
+                        _extract_project_id_from_inputs(tool_input),
+                        from_intake_tool=is_intake,
+                    )
                     payload = {
                         "tool_id": tool_id,
                         "name": name,

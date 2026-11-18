@@ -181,3 +181,4 @@ def remap(
             entry["content"] = list(item["content"])
         remapped.append(entry)
     return normalise(remapped)
+

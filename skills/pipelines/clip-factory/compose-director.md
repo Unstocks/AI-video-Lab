@@ -23,7 +23,7 @@ This pipeline uses the approved Remotion or FFmpeg routes. For vertical clip pro
 
 Before rendering approved clip sections, require `verify_script_plan_sync(..., require_approved=True)` to pass. Prefer a valid `proxy_video_path` from `source_manifest.json` while preserving the master file. Generate clip-rebased subtitles with `subtitle_gen` and burn them via FFmpeg's `ass` or `subtitles` filter. Render each clip independently, probe its final dimensions/codec/duration, and continue after a per-clip failure.
 
-For clip-factory vertical batches, invoke `vertical_clip_composer` in `approved_batch` mode with the approved script and plan. Then invoke `media_qa` in `batch` mode with every render result, the locked runtime, and the plan. Persist its schema-valid `final_review` as `artifacts/final_review.json`. Never mark unchecked QA checks as passing.
+For clip-factory vertical batches, invoke `vertical_clip_composer` in `approved_batch` mode with the approved script and plan (`codec="auto"`, `layout_mode="auto"`, `normalize_audio=True`, `scrub_metadata=True`, and the approved `style_preset`). This writes both the rendered `1080x1920` `yuv420p` MP4 and its `<clip>.mp4.layout.json` sidecar while applying `Style: Seam` automatically on `SPLIT` ranges. Then invoke `media_qa` in `batch` mode with every render result, `locked_runtime="ffmpeg"`, `enforce_loudnorm_window=True`, `verify_metadata_scrubbed=True`, and the plan. Persist its schema-valid `final_review` (including per-clip `metadata.clip_reports` with `integrated_lufs` and `true_peak_dbtp`) as `artifacts/final_review.json`. Never mark unchecked QA checks as passing.
 
 ## Process
 
