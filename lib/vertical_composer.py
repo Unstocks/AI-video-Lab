@@ -20,8 +20,10 @@ from lib.subtitle_styles import get_subtitle_style
 from lib.ffmpeg_utils import escape_ffmpeg_filter_path
 from lib import layout_ranges as _layout_ranges
 from lib.ffmpeg_profiles import (
+    COLOR_METADATA_BT709,
     METADATA_SCRUB,
     QUALITY,
+    build_clarity_filtergraph,
     resolve_video_codec,
     video_encode_args,
 )
@@ -58,9 +60,13 @@ class VerticalRenderConfig:
     enable_active_speaker: bool = True
     speaker_cut_mode: bool = False
     crop_overrides: Optional[dict[str, Any]] = None
+    clarity_percent: int = 45
+    conform_to_master: bool = True
 
     def __post_init__(self) -> None:
         get_profile(self.profile_name)
+        if not isinstance(self.clarity_percent, int) or not 0 <= self.clarity_percent <= 100:
+            raise ValueError("clarity_percent must be an integer from 0 to 100")
         if self.layout_mode not in ("auto", "single_crop", "blurred_pillarbox", "stacked_split", "speaker_cut"):
             raise ValueError("unsupported layout_mode")
         if self.subtitle_format not in ("ass", "srt"):
@@ -125,14 +131,21 @@ class VerticalClipComposer:
 
     @staticmethod
     def select_editing_source(
-        source_video_path: str | Path, *, source_manifest: Optional[dict[str, Any] | str | Path] = None,
+        source_video_path: str | Path,
+        *,
+        source_manifest: Optional[dict[str, Any] | str | Path] = None,
+        prefer_master: bool = False,
     ) -> Path:
         if isinstance(source_manifest, (str, Path)):
             loaded = json.loads(Path(source_manifest).expanduser().read_text(encoding="utf-8"))
             if not isinstance(loaded, dict):
                 raise ValueError("source_manifest JSON must contain an object")
             source_manifest = loaded
-        if source_manifest:
+        if source_manifest and prefer_master:
+            master_prop = source_manifest.get("master_video_path")
+            if isinstance(master_prop, str) and master_prop.strip() and Path(master_prop).is_file():
+                return Path(master_prop)
+        if source_manifest and not prefer_master:
             proxy = source_manifest.get("proxy_video_path")
             if isinstance(proxy, str) and proxy.strip() and Path(proxy).is_file():
                 return Path(proxy)
@@ -255,7 +268,11 @@ class VerticalClipComposer:
                     f"clip duration {duration:.3f}s exceeds {profile.name} maximum "
                     f"{profile.max_duration_seconds:.0f}s"
                 )
-            source = self.select_editing_source(source_video_path, source_manifest=source_manifest)
+            source = self.select_editing_source(
+                source_video_path,
+                source_manifest=source_manifest,
+                prefer_master=config.conform_to_master,
+            )
             source_used = str(source)
             destination = Path(output_dir)
             destination.mkdir(parents=True, exist_ok=True)
@@ -403,18 +420,26 @@ class VerticalClipComposer:
                 elif config.burn_subtitles:
                     warnings.append("no transcript segments supplied; subtitle burn skipped")
 
-                if config.burn_subtitles and cue_count > 0 and staged_subtitle.is_file():
+                has_subs = config.burn_subtitles and cue_count > 0 and staged_subtitle.is_file()
+                clarity_filters = build_clarity_filtergraph(config.clarity_percent) if config.clarity_percent > 0 else []
+                needs_filter_pass = has_subs or bool(clarity_filters)
+
+                if needs_filter_pass:
                     # Stage in neutral system temp dir (not inside destination) so apostrophes
                     # or non-ASCII chars in output_dir never touch FFmpeg's ass= filter option.
-                    with tempfile.TemporaryDirectory(prefix="om_sub_") as sub_tmp:
-                        burn_sub = Path(sub_tmp) / f"subs_burn.{config.subtitle_format}"
-                        shutil.copy2(staged_subtitle, burn_sub)
-                        escaped_subtitle = self._escape_filter_path(burn_sub)
-                        filter_name = "ass" if config.subtitle_format == "ass" else "subtitles"
-                        vf = f"{filter_name}='{escaped_subtitle}'"
-                        if fonts_directory is not None and config.subtitle_format == "ass":
-                            escaped_fonts = self._escape_filter_path(fonts_directory)
-                            vf = f"ass='{escaped_subtitle}':fontsdir='{escaped_fonts}'"
+                    with tempfile.TemporaryDirectory(prefix="om_flt_") as sub_tmp:
+                        vf_elements: list[str] = list(clarity_filters)
+                        if has_subs:
+                            burn_sub = Path(sub_tmp) / f"subs_burn.{config.subtitle_format}"
+                            shutil.copy2(staged_subtitle, burn_sub)
+                            escaped_subtitle = self._escape_filter_path(burn_sub)
+                            filter_name = "ass" if config.subtitle_format == "ass" else "subtitles"
+                            sub_vf = f"{filter_name}='{escaped_subtitle}'"
+                            if fonts_directory is not None and config.subtitle_format == "ass":
+                                escaped_fonts = self._escape_filter_path(fonts_directory)
+                                sub_vf = f"ass='{escaped_subtitle}':fontsdir='{escaped_fonts}'"
+                            vf_elements.append(sub_vf)
+                        vf = ",".join(vf_elements)
 
                         def _build_burn_cmd(codec_choice: str) -> list[str]:
                             return [
@@ -422,6 +447,7 @@ class VerticalClipComposer:
                                 "-map", "0:v:0", "-map", "0:a?", "-vf", vf,
                                 "-fps_mode", "cfr",
                                 *video_encode_args(QUALITY, codec=codec_choice, crf=config.crf),
+                                *COLOR_METADATA_BT709,
                                 "-c:a", "copy",
                                 *(METADATA_SCRUB if config.scrub_metadata else ()),
                                 "-movflags", "+faststart", str(render_tmp),
@@ -430,12 +456,12 @@ class VerticalClipComposer:
                         try:
                             self._run_ffmpeg(_build_burn_cmd(effective_codec), timeout=600)
                         except Exception:
-                            if effective_codec != "h264_nvenc":
+                            if effective_codec not in ("h264_nvenc", "hevc_nvenc", "hevc"):
                                 raise
-                            warnings.append("h264_nvenc failed during subtitle encoding; retried with libx264")
+                            warnings.append(f"{effective_codec} failed during filter encoding; retried with libx264")
                             self._run_ffmpeg(_build_burn_cmd("libx264"), timeout=600)
                     if not render_tmp.is_file() or render_tmp.stat().st_size <= 0:
-                        raise RuntimeError("subtitle burn produced no output file")
+                        raise RuntimeError("filter encoding produced no output file")
                 else:
                     shutil.copy2(reframed_source, render_tmp)
 
@@ -450,8 +476,9 @@ class VerticalClipComposer:
                 if video.get("pix_fmt") != "yuv420p":
                     raise RuntimeError(f"unexpected pixel format {video.get('pix_fmt')!r}; expected 'yuv420p'")
                 video_codec = video.get("codec_name")
-                if video_codec != "h264":
-                    raise RuntimeError(f"unexpected video codec {video_codec!r}; expected h264")
+                expected_codecs = {"h264", "hevc"} if config.codec == "hevc" else {"h264"}
+                if video_codec not in expected_codecs:
+                    raise RuntimeError(f"unexpected video codec {video_codec!r}; expected one of {expected_codecs}")
                 media_duration = float(probe.get("format", {}).get("duration", 0))
                 if not math.isfinite(media_duration) or media_duration <= 0:
                     raise RuntimeError("ffprobe returned an invalid output duration")

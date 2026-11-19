@@ -89,3 +89,4 @@ class TestSpeakerTracker:
         tr.reset()
         box = tr.get_target([right], frame_number=2, width=1920)
         assert box == right["box"]
+

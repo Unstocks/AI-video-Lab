@@ -506,6 +506,9 @@ class SupervisorManager:
         *,
         clip_ids: list[str],
         project_id: str | None = None,
+        target_resolution: str = "1440p",
+        codec: str = "auto",
+        clarity_percent: int = 45,
     ) -> dict[str, Any]:
         session = await asyncio.to_thread(self.store.get_session, session_id)
         if session is None:
@@ -513,11 +516,17 @@ class SupervisorManager:
         pid = project_id or session.get("project_id")
         if not pid or not is_valid_project_id(pid):
             raise ValueError("No valid project linked to this session yet.")
-        directive = prompts.build_export_prompt(project_id=pid, clip_ids=clip_ids)
+        directive = prompts.build_export_prompt(
+            project_id=pid,
+            clip_ids=clip_ids,
+            target_resolution=target_resolution,
+            codec=codec,
+            clarity_percent=clarity_percent,
+        )
         await self._launch_turn(
             session_id,
             directive,
-            user_display=f"Export approved clips: {', '.join(clip_ids)}",
+            user_display=f"Export approved clips in {target_resolution.upper()}: {', '.join(clip_ids)}",
         )
         return await asyncio.to_thread(self.store.get_session, session_id) or session
 

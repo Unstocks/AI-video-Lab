@@ -67,6 +67,36 @@ YOUTUBE_SHORTS = MediaProfile(
     notes="YouTube Shorts (max 180s, vertical)",
 )
 
+YOUTUBE_SHORTS_1080P = MediaProfile(
+    name="youtube_shorts_1080p",
+    width=1080, height=1920,
+    aspect_ratio=AspectRatio.PORTRAIT_9_16,
+    fps=30, codec="hevc_nvenc", audio_codec="aac", crf=22,
+    max_duration_seconds=180,
+    caption_format="srt",
+    notes="YouTube Shorts 1080p Mobile HD (vertical)",
+)
+
+YOUTUBE_SHORTS_1440P = MediaProfile(
+    name="youtube_shorts_1440p",
+    width=1440, height=2560,
+    aspect_ratio=AspectRatio.PORTRAIT_9_16,
+    fps=30, codec="hevc_nvenc", audio_codec="aac", crf=20,
+    max_duration_seconds=180,
+    caption_format="srt",
+    notes="YouTube Shorts 2K QHD (vertical) - Triggers YouTube/TikTok VP9/AV1 high-retention transcode ladder",
+)
+
+YOUTUBE_SHORTS_4K = MediaProfile(
+    name="youtube_shorts_4k",
+    width=2160, height=3840,
+    aspect_ratio=AspectRatio.PORTRAIT_9_16,
+    fps=30, codec="hevc_nvenc", audio_codec="aac", crf=18,
+    max_duration_seconds=180,
+    caption_format="srt",
+    notes="YouTube Shorts 4K UHD Master Archive (vertical)",
+)
+
 INSTAGRAM_REELS = MediaProfile(
     name="instagram_reels",
     width=1080, height=1920,
@@ -133,6 +163,7 @@ GENERIC_HD = MediaProfile(
 ALL_PROFILES: dict[str, MediaProfile] = {
     p.name: p for p in [
         YOUTUBE_LANDSCAPE, YOUTUBE_4K, YOUTUBE_SHORTS,
+        YOUTUBE_SHORTS_1080P, YOUTUBE_SHORTS_1440P, YOUTUBE_SHORTS_4K,
         INSTAGRAM_REELS, INSTAGRAM_FEED,
         TIKTOK, LINKEDIN, CINEMATIC, GENERIC_HD,
     ]

@@ -484,6 +484,11 @@ class StyleChangeRequest(BaseModel):
 class ExportRequest(BaseModel):
     clip_ids: list[str] = Field(..., min_length=1)
     project_id: Optional[str] = None
+    target_resolution: Literal["1080p", "1440p", "2160p", "4k"] = "1440p"
+    codec: Literal["auto", "hevc", "h264", "hevc_nvenc", "h264_nvenc"] = "auto"
+    clarity_percent: int = Field(default=45, ge=0, le=100)
+    audio_bitrate: str = "256k"
+    normalize_audio: bool = True
 
     @field_validator("project_id")
     @classmethod
@@ -1382,6 +1387,9 @@ def create_app(
                 session_id,
                 clip_ids=body.clip_ids,
                 project_id=body.project_id,
+                target_resolution=body.target_resolution,
+                codec=body.codec,
+                clarity_percent=body.clarity_percent,
             )
         except Exception as exc:
             raise _map_supervisor_errors(exc)

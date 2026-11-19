@@ -69,3 +69,4 @@ def test_merge_emphasis_times_prioritizes_editorial_beats_and_enforces_gap():
         min_gap=18.0,
     )
     assert merged2 == [3.0, 22.0, 50.0]
+

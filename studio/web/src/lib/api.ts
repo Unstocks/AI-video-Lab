@@ -381,7 +381,18 @@ export const studioApi = {
         body: JSON.stringify(payload),
       },
     ),
-  exportClips: (sessionId: string, payload: { clip_ids: string[]; project_id?: string }) =>
+  exportClips: (
+    sessionId: string,
+    payload: {
+      clip_ids: string[];
+      project_id?: string;
+      target_resolution?: '1080p' | '1440p' | '2160p' | '4k';
+      codec?: 'auto' | 'hevc' | 'h264';
+      clarity_percent?: number;
+      audio_bitrate?: string;
+      normalize_audio?: boolean;
+    },
+  ) =>
     requestJson<SupervisorSession>(
       `/api/studio/sessions/${encodeURIComponent(sessionId)}/export`,
       {

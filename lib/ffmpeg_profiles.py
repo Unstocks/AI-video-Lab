@@ -62,20 +62,28 @@ METADATA_SCRUB: tuple[str, ...] = (
     "-map_metadata:s:a", "-1",
 )
 
+# Standard Rec.709 color atom tags preventing Apple/QuickTime gamma shift.
+COLOR_METADATA_BT709: tuple[str, ...] = (
+    "-colorspace", "bt709",
+    "-color_primaries", "bt709",
+    "-color_trc", "bt709",
+)
+
 # -14 LUFS matches Shorts/Reels/TikTok playback targets; -2.0 dBTP leaves headroom
 # for AAC inter-sample peaks so delivered clips do not clip above -1.0 dBTP.
 LOUDNORM_FILTER: str = "loudnorm=I=-14:TP=-2.0:LRA=11"
 
 _probe_lock = threading.Lock()
 _nvenc_ok: bool | None = None
+_hevc_nvenc_ok: bool | None = None
 
 
-def _probe_nvenc() -> bool:
-    """Run a tiny 256x256 lavfi encode to confirm h264_nvenc works end-to-end."""
+def _probe_nvenc(codec: str = "h264_nvenc") -> bool:
+    """Run a tiny 256x256 lavfi encode to confirm nvenc codec works end-to-end."""
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "lavfi", "-i", "color=black:s=256x256:d=0.1",
-        "-c:v", "h264_nvenc", "-pix_fmt", "yuv420p", "-f", "null", "-",
+        "-c:v", codec, "-pix_fmt", "yuv420p", "-f", "null", "-",
     ]
     try:
         proc = subprocess.run(
@@ -92,15 +100,26 @@ def nvenc_available() -> bool:
     if _nvenc_ok is None:
         with _probe_lock:
             if _nvenc_ok is None:
-                _nvenc_ok = _probe_nvenc()
+                _nvenc_ok = _probe_nvenc("h264_nvenc")
     return _nvenc_ok
+
+
+def nvenc_hevc_available() -> bool:
+    """Probe hevc_nvenc once and cache the result thread-safely."""
+    global _hevc_nvenc_ok
+    if _hevc_nvenc_ok is None:
+        with _probe_lock:
+            if _hevc_nvenc_ok is None:
+                _hevc_nvenc_ok = _probe_nvenc("hevc_nvenc")
+    return _hevc_nvenc_ok
 
 
 def reset_encoder_cache() -> None:
     """Test hook: clear cached NVENC probe status."""
-    global _nvenc_ok
+    global _nvenc_ok, _hevc_nvenc_ok
     with _probe_lock:
         _nvenc_ok = None
+        _hevc_nvenc_ok = None
 
 
 def resolve_video_codec(requested: str = "auto") -> Literal["h264_nvenc", "libx264"] | str:
@@ -146,6 +165,20 @@ def video_encode_args(
             "-c:v", "libx264", "-preset", preset,
             "-crf", str(effective_crf), "-pix_fmt", "yuv420p",
         ]
+    if resolved in ("hevc", "hevc_nvenc", "h265"):
+        if nvenc_hevc_available():
+            cq = 20 if crf is None else max(1, min(51, int(crf) + 5))
+            return [
+                "-c:v", "hevc_nvenc", "-preset", "p5", "-tune", "hq",
+                "-rc", "vbr", "-cq", str(cq), "-b:v", "0",
+                "-spatial-aq", "1", "-bf", "0", "-surfaces", "2",
+                "-tag:v", "hvc1", "-pix_fmt", "yuv420p",
+            ]
+        effective_crf = 20 if crf is None else int(crf)
+        return [
+            "-c:v", "libx265", "-preset", "fast",
+            "-crf", str(effective_crf), "-tag:v", "hvc1", "-pix_fmt", "yuv420p",
+        ]
     if resolved.lower() == "copy":
         return ["-c:v", "copy"]
     # Explicit non-H.264 codec passthrough (e.g. libvpx-vp9).
@@ -185,3 +218,80 @@ def blurred_backdrop(out_w: int, out_h: int, sigma: float = 12.0) -> str:
 def escape_filter_value(value: str | Path) -> str:
     """Escape a filesystem path for use inside a quoted FFmpeg filtergraph value."""
     return escape_ffmpeg_filter_path(value)
+
+
+def build_clarity_filtergraph(strength_percent: int = 45) -> list[str]:
+    """Emit FFmpeg filter string for AMD FidelityFX CAS + mild luma denoising.
+
+    0%: natural passthrough (no filter applied).
+    45%: balanced detail recovery (hqdn3d + cas=0.45).
+    100%: max recovery.
+    """
+    if strength_percent <= 0:
+        return []
+    clamped = max(0, min(100, int(strength_percent)))
+    from lib.ffmpeg_sanitizer import build_denoise_cas_chain
+    from lib.filter_prober import GLOBAL_PROBER
+
+    caps = GLOBAL_PROBER.probe()
+    cas_strength = round(0.10 + (clamped / 100.0) * 0.75, 4)
+    chain = build_denoise_cas_chain(
+        cas_strength=cas_strength,
+        denoise=True,
+        cas_available=caps.has_cas,
+    )
+    return [chain]
+
+
+def export_encode_args(
+    resolution_tier: str = "1440p",
+    *,
+    codec: str = "auto",
+    cq: int | None = None,
+    clarity_percent: int = 0,
+) -> list[str]:
+    """Comprehensive export arguments enforcing container FourCC and color tags.
+
+    Supports '1080p', '1440p', and '4k'/'2160p'.
+    Enforces -tag:v hvc1 on HEVC outputs for universal Apple/Safari playback.
+    Enforces Rec.709 color atom tags to eliminate Apple QuickTime gamma shift.
+    """
+    tier_norm = resolution_tier.lower().strip()
+    req_codec = (codec or "auto").lower().strip()
+
+    can_hevc = nvenc_hevc_available()
+    prefer_hevc = req_codec in ("auto", "hevc", "hevc_nvenc", "h265")
+
+    args: list[str] = []
+    if prefer_hevc and can_hevc:
+        default_cq = 18 if ("4k" in tier_norm or "2160" in tier_norm) else (20 if "1440" in tier_norm else 22)
+        effective_cq = default_cq if cq is None else max(1, min(51, int(cq)))
+        args.extend([
+            "-c:v", "hevc_nvenc",
+            "-preset", "p5",
+            "-tune", "hq",
+            "-rc", "vbr",
+            "-cq", str(effective_cq),
+            "-spatial-aq", "1",
+            "-bf", "0",
+            "-surfaces", "2",
+            "-tag:v", "hvc1",
+            "-pix_fmt", "yuv420p",
+        ])
+    elif nvenc_available():
+        args.extend(video_encode_args(QUALITY, codec="h264_nvenc", crf=cq))
+    else:
+        # Software fallback with CPU thread capping
+        cpu_threads = str(max(1, min(4, (os.cpu_count() or 4) // 2)))
+        preset, default_crf = _X264_PRESETS[QUALITY]
+        effective_crf = default_crf if cq is None else int(cq)
+        args.extend([
+            "-threads", cpu_threads,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", str(effective_crf),
+            "-pix_fmt", "yuv420p",
+        ])
+
+    args.extend(COLOR_METADATA_BT709)
+    return args

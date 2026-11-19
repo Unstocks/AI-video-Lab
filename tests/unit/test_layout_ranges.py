@@ -59,3 +59,4 @@ def test_missing_or_corrupt_sidecar_fails_soft(tmp_path: Path):
     corrupt_clip = tmp_path / "bad.mp4"
     layout_ranges.sidecar_path(corrupt_clip).write_text("{not valid json", encoding="utf-8")
     assert layout_ranges.read(corrupt_clip) == []
+

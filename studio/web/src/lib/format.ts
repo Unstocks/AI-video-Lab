@@ -66,3 +66,34 @@ export function stripMediaPrefix(urlOrPath: string | null | undefined, projectId
   if (clean.startsWith(prefix)) return clean.slice(prefix.length);
   return clean;
 }
+
+export function estimateExportSizeBytes(
+  durationSeconds: number,
+  resolution: '1080p' | '1440p' | '2160p' | '4k',
+  codec: 'hevc' | 'h264' | 'auto',
+  qualityTier: 'draft' | 'balanced' | 'master' = 'balanced',
+  audioBitrateKbps: number = 256,
+): number {
+  const normRes = resolution === '4k' ? '2160p' : resolution;
+  const normCodec = codec === 'auto' || codec === 'hevc' ? 'hevc' : 'h264';
+  const bitrateTable: Record<string, Record<string, Record<string, number>>> = {
+    '1080p': {
+      hevc: { draft: 5_000_000, balanced: 8_500_000, master: 14_000_000 },
+      h264: { draft: 7_500_000, balanced: 12_000_000, master: 18_000_000 },
+    },
+    '1440p': {
+      hevc: { draft: 10_000_000, balanced: 18_000_000, master: 26_000_000 },
+      h264: { draft: 14_000_000, balanced: 24_000_000, master: 35_000_000 },
+    },
+    '2160p': {
+      hevc: { draft: 22_000_000, balanced: 36_000_000, master: 55_000_000 },
+      h264: { draft: 32_000_000, balanced: 48_000_000, master: 75_000_000 },
+    },
+  };
+
+  const videoBps = bitrateTable[normRes]?.[normCodec]?.[qualityTier] ?? 18_000_000;
+  const audioBps = audioBitrateKbps * 1000;
+  const totalBps = videoBps + audioBps;
+
+  return Math.round((totalBps * Math.max(1, durationSeconds)) / 8);
+}

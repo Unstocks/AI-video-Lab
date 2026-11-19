@@ -72,3 +72,4 @@ def test_speaker_xs_produces_clamped_hard_cut_positions():
     # First 20 frames (0.0..0.8s) -> speaker 0; next 20 frames -> speaker 1
     assert all(x == 97 for x in xs[:20])
     assert all(x == 1197 for x in xs[20:])
+

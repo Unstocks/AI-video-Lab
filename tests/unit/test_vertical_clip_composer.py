@@ -95,3 +95,4 @@ def test_approved_batch_mode_forwards_shot_cuts_and_speaker_tracks(monkeypatch, 
     assert captured["shot_cuts"] == [4.0, 9.0]
     assert len(captured["speaker_tracks"]) == 1
     assert result.data["succeeded_count"] == 1
+

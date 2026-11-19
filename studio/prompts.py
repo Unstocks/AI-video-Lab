@@ -187,11 +187,22 @@ def build_export_prompt(
     *,
     project_id: str,
     clip_ids: Sequence[str],
+    target_resolution: str = "1440p",
+    codec: str = "auto",
+    clarity_percent: int = 45,
 ) -> str:
     """Build hard-gated export_bundle directive for approved QA_PASSED clips."""
+    res_profile = (
+        "youtube_shorts_1440p"
+        if "1440" in target_resolution
+        else ("youtube_shorts_4k" if ("4k" in target_resolution or "2160" in target_resolution) else "youtube_shorts_1080p")
+    )
     return (
         f"Export requested from Studio UI for project `{project_id}`:\n"
-        f"- Target clip_ids: {json.dumps(list(clip_ids))}\n\n"
+        f"- Target clip_ids: {json.dumps(list(clip_ids))}\n"
+        f"- Target resolution profile: `{res_profile}` ({target_resolution})\n"
+        f"- Codec preference: `{codec}` (using hardware HEVC/H264 NVENC with Apple hvc1 and Rec.709 color tags)\n"
+        f"- Detail recovery: `{clarity_percent}%` (AMD FidelityFX CAS + luma denoise)\n\n"
         f"## Execute Now\n"
         f"1. Verify every requested clip has `review_state=\"HUMAN_APPROVED\"` and `production_state=\"QA_PASSED\"` "
         f"in `projects/{project_id}/artifacts/final_review.json`.\n"

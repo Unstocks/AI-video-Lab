@@ -351,6 +351,32 @@ class URLIntakeAdapter:
 
         return target_audio_wav
 
+    @staticmethod
+    def _transcode_editing_proxy(input_path: Path, output_path: Path) -> None:
+        """Create high-performance H.264 proxy with hardware NVENC if available, falling back to libx264."""
+        from lib.ffmpeg_profiles import nvenc_available
+
+        if nvenc_available():
+            nvenc_cmd = [
+                "ffmpeg", "-y", "-i", str(input_path),
+                "-c:v", "h264_nvenc", "-preset", "p1", "-cq", "28",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", str(output_path),
+            ]
+            proc = subprocess.run(nvenc_cmd, capture_output=True, text=True, timeout=600)
+            if proc.returncode == 0 and output_path.is_file():
+                return
+
+        cpu_cmd = [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", str(output_path),
+        ]
+        proc = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=600)
+        if proc.returncode != 0 or not output_path.is_file():
+            raise MediaIngestionError(f"H.264 editing proxy creation failed: {proc.stderr}")
+
     def ingest_url(
         self,
         url: str,
@@ -553,10 +579,7 @@ class URLIntakeAdapter:
             proxy_path = None
             if v_stream.get("codec_name") != "h264":
                 proxy_path = staging_dir / "source_video_h264.mp4"
-                proxy_cmd = ["ffmpeg", "-y", "-i", str(staging_video_mp4), "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(proxy_path)]
-                proc = subprocess.run(proxy_cmd, capture_output=True, text=True, timeout=600)
-                if proc.returncode or not proxy_path.is_file():
-                    raise MediaIngestionError(f"H.264 editing proxy creation failed: {proc.stderr}")
+                self._transcode_editing_proxy(staging_video_mp4, proxy_path)
 
             # 8. Atomic Finalization into projects/<project-id>/source/
             final_video = source_dir / "source_video.mp4"
@@ -671,12 +694,7 @@ class URLIntakeAdapter:
             staged_proxy = None
             if codec != "h264":
                 staged_proxy = staging_dir / "source_video_h264.mp4"
-                process = subprocess.run([
-                    "ffmpeg", "-y", "-i", str(staged_video), "-c:v", "libx264", "-preset", "fast",
-                    "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(staged_proxy),
-                ], capture_output=True, text=True, timeout=600)
-                if process.returncode != 0 or not staged_proxy.is_file():
-                    raise MediaIngestionError(f"H.264 editing proxy creation failed: {process.stderr}")
+                self._transcode_editing_proxy(staged_video, staged_proxy)
 
             sidecar = Path(transcript_path).expanduser() if transcript_path else next(
                 (source.with_suffix(suffix) for suffix in (".json", ".srt", ".vtt") if source.with_suffix(suffix).is_file()), None

@@ -68,3 +68,4 @@ def test_split_filtergraph_uses_vstack_and_pad():
     assert "[top][bot]vstack=inputs=2,pad=1080:1920:0:0,setsar=1[v]" in fg
     assert "scale=1080:960[top]" in fg
     assert "scale=1080:960[bot]" in fg
+

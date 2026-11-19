@@ -14,6 +14,7 @@ import { buildMediaUrl, studioApi } from '@/lib/api';
 import { cn, formatTimecode, lufsStatus } from '@/lib/format';
 import { toast, useProjectStore, useSupervisorStore } from '@/stores/useStudioStore';
 import { Badge, Button, EmptyState, Panel } from '@/components/ui/Primitives';
+import { ExportModal, type ExportConfig } from '@/components/modals/ExportModal';
 
 function LoudnessBar({ lufs, truePeak }: { lufs?: number | null; truePeak?: number | null }) {
   const status = lufsStatus(lufs);
@@ -71,6 +72,7 @@ export function BroadcastQaWorkspace() {
   const { ensureSessionForProject, setRunning } = useSupervisorStore();
   const [selectedForExport, setSelectedForExport] = useState<Record<string, boolean>>({});
   const [exporting, setExporting] = useState(false);
+  const [exportModalOpen, setExportModalOpen] = useState(false);
 
   const clips = useMemo(() => boardState?.clip_studio?.clips ?? [], [boardState]);
   const planSynced = boardState?.clip_studio?.plan_sha256_synced;
@@ -92,14 +94,29 @@ export function BroadcastQaWorkspace() {
     [clips, planSynced, selectedForExport],
   );
 
-  const handleExport = async () => {
+  const totalDurationSeconds = useMemo(() => {
+    return clips
+      .filter((c) => selectedForExport[c.candidate_id])
+      .reduce((acc, c) => acc + (c.duration_seconds || 15), 0);
+  }, [clips, selectedForExport]);
+
+  const handleConfirmExport = async (config: ExportConfig) => {
     if (!projectId || projectId === 'demo' || eligibleIds.length === 0) return;
     setExporting(true);
     try {
       const sid = await ensureSessionForProject(projectId);
-      await studioApi.exportClips(sid, { clip_ids: eligibleIds, project_id: projectId });
+      await studioApi.exportClips(sid, {
+        clip_ids: eligibleIds,
+        project_id: projectId,
+        target_resolution: config.resolution,
+        codec: config.codec,
+        clarity_percent: config.clarityPercent,
+      });
       setRunning(true);
-      toast.success('Export bundle dispatched', `Bundling ${eligibleIds.length} QA-verified clip(s).`);
+      toast.success(
+        'Export bundle dispatched',
+        `Bundling ${eligibleIds.length} QA-verified clip(s) in ${config.resolution.toUpperCase()} (${config.codec.toUpperCase()}).`,
+      );
     } catch (e) {
       toast.error('Export failed', String(e));
     } finally {
@@ -127,7 +144,7 @@ export function BroadcastQaWorkspace() {
         <Button
           variant="primary"
           disabled={exporting || eligibleIds.length === 0}
-          onClick={() => void handleExport()}
+          onClick={() => setExportModalOpen(true)}
           className="rounded-full"
         >
           {exporting ? (
@@ -328,6 +345,14 @@ export function BroadcastQaWorkspace() {
           </pre>
         </Panel>
       )}
+
+      <ExportModal
+        isOpen={exportModalOpen}
+        onClose={() => setExportModalOpen(false)}
+        onConfirmExport={handleConfirmExport}
+        clipCount={eligibleIds.length}
+        totalDurationSeconds={totalDurationSeconds}
+      />
     </div>
   );
 }

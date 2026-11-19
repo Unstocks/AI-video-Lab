@@ -523,15 +523,16 @@ def _run_ffmpeg_with_fallback(
     if proc.returncode == 0:
         return effective, warnings
 
-    if effective == "h264_nvenc":
-        warnings.append(f"h264_nvenc failed during reframing; retried with libx264: {proc.stderr[:200]}")
-        cmd_cpu = build_cmd("libx264")
+    if effective in ("h264_nvenc", "hevc_nvenc", "hevc"):
+        fallback_codec = "libx265" if "hevc" in effective else "libx264"
+        warnings.append(f"{effective} failed during reframing; retried with {fallback_codec}: {proc.stderr[:200]}")
+        cmd_cpu = build_cmd(fallback_codec)
         proc2 = subprocess.run(
             cmd_cpu, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout
         )
         if proc2.returncode == 0:
-            return "libx264", warnings
-        raise RuntimeError(f"FFmpeg error (libx264 fallback): {proc2.stderr[:400]}")
+            return fallback_codec, warnings
+        raise RuntimeError(f"FFmpeg error ({fallback_codec} fallback): {proc2.stderr[:400]}")
 
     raise RuntimeError(f"FFmpeg error ({effective}): {proc.stderr[:400]}")
 
