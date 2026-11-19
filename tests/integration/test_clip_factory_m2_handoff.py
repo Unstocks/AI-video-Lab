@@ -149,6 +149,8 @@ def test_real_checkpoint_backlot_and_clip_selector_human_gate(tmp_path):
          "end_seconds": section["end_seconds"], "script_section_id": section["id"]}
         for section in approved["sections"]
     ]}
+    write_checkpoint(pipeline_dir, project_id, "scene_plan", "awaiting_human", {"scene_plan": scene_plan},
+                     pipeline_type="clip-factory")
     write_checkpoint(pipeline_dir, project_id, "scene_plan", "completed", {"scene_plan": scene_plan},
                      pipeline_type="clip-factory", human_approved=True)
     board = load_board_state(project_dir)

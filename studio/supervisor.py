@@ -58,16 +58,16 @@ def discover_supervisor_bin(override: str | None = None) -> Optional[str]:
         if found:
             return found
 
-    for name in ("fcc-claude", "fcc-claude.exe", "fcc-claude.cmd", "claude"):
-        found = shutil.which(name)
-        if found:
-            return found
-
     local_bin = Path.home() / ".local" / "bin"
     for name in ("fcc-claude.exe", "fcc-claude.cmd", "fcc-claude"):
         p = local_bin / name
         if p.is_file():
             return str(p)
+
+    for name in ("fcc-claude", "fcc-claude.exe", "fcc-claude.cmd", "claude"):
+        found = shutil.which(name)
+        if found:
+            return found
     return None
 
 
